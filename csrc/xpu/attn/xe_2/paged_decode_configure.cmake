@@ -50,7 +50,7 @@ function(_paged_decode_parse_config CONFIG_FILE OUT_TUPLES OUT_IS_FULL)
   endif()
 
   file(STRINGS "${CONFIG_FILE}" _lines)
-  foreach(_line ${_lines})
+  foreach(_line IN LISTS _lines)
     # Strip whitespace
     string(STRIP "${_line}" _line)
     # Skip empty lines and comments
