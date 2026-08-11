@@ -3,6 +3,12 @@
 #include "core/registration.h"
 #include "xpu/attn/attn_interface.h"
 #include "xpu/attn/paged_kv_utils.h"
+#ifdef VLLM_XPU_ENABLE_XE2
+  #include "xpu/attn/xe_2/kvarn_decode_xe2.h"
+  #include "xpu/attn/xe_2/kvarn_dequant_xe2.h"
+  #include "xpu/attn/xe_2/kvarn_hadamard_xe2.h"
+  #include "xpu/attn/xe_2/kvarn_hadamard_scatter_xe2.h"
+#endif
 #include "utils.h"
 #include <torch/all.h>
 
@@ -441,6 +447,45 @@ std::vector<at::Tensor> mha_varlen_fwd(
 }  // namespace FLASH_NAMESPACE
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#ifdef VLLM_XPU_ENABLE_XE2
+  ops.def("kvarn_fragment_coords(Tensor device_anchor) -> (Tensor, Tensor)");
+  ops.impl("kvarn_fragment_coords", torch::kXPU, &kvarn_fragment_coords_xe2);
+  ops.def(
+      "kvarn_decode(Tensor query, Tensor packed_cache, Tensor block_table, "
+      "Tensor seq_lens, Tensor block_to_slot, Tensor tail_key, Tensor "
+      "tail_value, "
+      "Tensor! output, int max_seq_len, float softmax_scale) -> ()");
+  ops.impl("kvarn_decode", torch::kXPU, &kvarn_decode_xe2);
+  ops.def(
+      "kvarn_decode_with_scratch(Tensor query, Tensor packed_cache, Tensor "
+      "block_table, "
+      "Tensor seq_lens, Tensor block_to_slot, Tensor tail_key, Tensor "
+      "tail_value, "
+      "Tensor(a!) temp_output, Tensor(b!) exp_sums, Tensor(c!) max_logits, "
+      "Tensor(d!) output, "
+      "int max_seq_len, float softmax_scale) -> ()");
+  ops.impl(
+      "kvarn_decode_with_scratch", torch::kXPU, &kvarn_decode_with_scratch_xe2);
+  ops.def(
+      "kvarn_dequant(Tensor packed_cache, Tensor! key_out, Tensor! value_out) "
+      "-> ()");
+  ops.impl("kvarn_dequant", torch::kXPU, &kvarn_dequant_xe2);
+  ops.def(
+      "kvarn_hadamard_scatter(Tensor key, Tensor value, Tensor slot_mapping, "
+      "Tensor block_to_slot, Tensor! tail_key, Tensor! tail_value, int group) "
+      "-> ()");
+  ops.impl("kvarn_hadamard_scatter", torch::kXPU, &kvarn_hadamard_scatter_xe2);
+  ops.def(
+      "kvarn_hadamard_query_scatter(Tensor query, Tensor key, Tensor value, "
+      "Tensor slot_mapping, Tensor block_to_slot, Tensor! query_out, "
+      "Tensor! tail_key, Tensor! tail_value, int group) -> ()");
+  ops.impl(
+      "kvarn_hadamard_query_scatter",
+      torch::kXPU,
+      &kvarn_hadamard_query_scatter_xe2);
+  ops.def("kvarn_hadamard(Tensor input, Tensor! output) -> ()");
+  ops.impl("kvarn_hadamard", torch::kXPU, &kvarn_hadamard_xe2);
+#endif
   ops.def(
       "varlen_fwd(Tensor q, Tensor k, Tensor v, Tensor!? out, Tensor "
       "cu_seqlens_q, "
