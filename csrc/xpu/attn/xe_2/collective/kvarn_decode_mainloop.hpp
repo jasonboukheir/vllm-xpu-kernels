@@ -1,0 +1,648 @@
+#pragma once
+
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#include <cutlass/cutlass.h>
+#include <cute/tensor.hpp>
+
+#include "chunk_prefill_mainloop.hpp"
+
+namespace cutlass::fmha::collective {
+
+using namespace cute;
+
+/** Runtime description of one KVarN K4V4 cache record.
+ *
+ * Offsets are deliberately supplied by KVarNConfig.  In particular, the
+ * historical 17,920-byte D=128 layout must never be baked into a D=256
+ * kernel.  All offsets and strides below are bytes.
+ */
+struct KVarNK4V4Layout {
+  std::uint8_t const* cache;
+  std::int64_t block_stride;
+  std::int64_t head_stride;
+  int batch_size;
+  int k_packed_offset;
+  int k_s_col_offset;
+  int k_zp_offset;
+  int k_s_row_offset;
+  int v_packed_offset;
+  int v_s_col_offset;
+  int v_s_row_offset;
+  int v_zp_offset;
+};
+
+/** Optional full-precision pool for pages which must not be quantized.
+ *
+ * `block_to_slot[physical_block]` is -1 for a KVarN record and otherwise
+ * indexes contiguous [slot, token, kv_head, dim] fp16 K/V storage.  Both
+ * pools contain values in the same rotated frame as the packed cache.
+ */
+struct KVarNHybridTailLayout {
+  int const* block_to_slot;
+  cutlass::half_t const* key;
+  cutlass::half_t const* value;
+  std::int64_t slot_stride;
+  std::int64_t token_stride;
+  std::int64_t head_stride;
+};
+
+/** Register-fragment loader for the first native KVarN decode prototype.
+ *
+ * Logical cache geometry is fixed to D=256, G=128 and K4V4.  The enclosing
+ * attention mainloop uses a K tile of 64, so each physical page is visited as
+ * two consecutive tiles.  `CoordFragment` must be produced by partitioning a
+ * CUTE identity tensor with the same MMA thread slice as `Fragment`; this is
+ * what makes the register assignment independent of undocumented fragment
+ * linear order.
+ */
+template <bool DpasPacked = false>
+struct KVarNK4V4FragmentLoader {
+  static constexpr int kHeadDim = 256;
+  static constexpr int kGroup = 128;
+  static constexpr int kTileK = 64;
+  static constexpr int kValuesPerWord = 8;
+  static constexpr int kKRowBytes = kGroup / 2;
+  static constexpr int kVRowBytes = kHeadDim / 2;
+
+  KVarNK4V4Layout layout;
+  KVarNHybridTailLayout tail;
+  int const* page_table;
+  int max_pages_per_seq;
+
+  CUTLASS_DEVICE std::uint8_t const*
+  record(int batch, int kv_head, int logical_tile) const {
+    int const page = logical_tile / 2;
+    int const block = page_table[batch * max_pages_per_seq + page];
+    return layout.cache + std::int64_t(block) * layout.block_stride +
+           std::int64_t(kv_head) * layout.head_stride;
+  }
+
+  CUTLASS_DEVICE int physical_block(int batch, int logical_tile) const {
+    int const page = logical_tile / 2;
+    return page_table[batch * max_pages_per_seq + page];
+  }
+
+  CUTLASS_DEVICE int tail_slot(int batch, int logical_tile) const {
+    return tail.block_to_slot[physical_block(batch, logical_tile)];
+  }
+
+  CUTLASS_DEVICE float load_tail(
+      cutlass::half_t const* pool,
+      int slot,
+      int token,
+      int kv_head,
+      int dim) const {
+    auto offset = std::int64_t(slot) * tail.slot_stride +
+                  std::int64_t(token) * tail.token_stride +
+                  std::int64_t(kv_head) * tail.head_stride + dim;
+    return static_cast<float>(pool[offset]);
+  }
+
+  CUTLASS_DEVICE static float load_f16(std::uint8_t const* ptr) {
+    // KVarNConfig guarantees every fp16 field is two-byte aligned.
+    auto bits = *reinterpret_cast<std::uint16_t const*>(ptr);
+    return static_cast<float>(sycl::bit_cast<sycl::half>(bits));
+  }
+
+  CUTLASS_DEVICE static std::uint32_t load_u32(std::uint8_t const* ptr) {
+    return *reinterpret_cast<std::uint32_t const*>(ptr);
+  }
+
+  CUTLASS_DEVICE static int unpack_nibble(std::uint32_t word, int index) {
+    return int((word >> (4 * index)) & 0xfu);
+  }
+
+  CUTLASS_DEVICE float
+  load_k_quantized(std::uint8_t const* rec, int token, int dim) const {
+    auto word = load_u32(
+        rec + layout.k_packed_offset + dim * kKRowBytes + (token / 8) * 4);
+    return float(unpack_nibble(word, token & 7));
+  }
+
+  CUTLASS_DEVICE float
+  load_v_quantized(std::uint8_t const* rec, int token, int dim) const {
+    auto word = load_u32(
+        rec + layout.v_packed_offset + token * kVRowBytes + (dim / 8) * 4);
+    return float(unpack_nibble(word, dim & 7));
+  }
+
+  template <class Fragment>
+  CUTLASS_DEVICE void fill_k_fragment(
+      Fragment& dst,
+      std::uint8_t const* rec,
+      int slot,
+      int kv_head,
+      int logical_tile,
+      int token_sg,
+      int dim_tile) const {
+    int token_base = (logical_tile & 1) * kTileK;
+    int lane =
+        sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+    if constexpr (DpasPacked) {
+      if (slot < 0) {
+        int const subgroup = token_sg / 16;
+        int const half = logical_tile & 1;
+        auto const* lane_bytes =
+            rec + layout.k_packed_offset +
+            (((half * 4 + dim_tile / 64) * 4 + subgroup) * 16 + lane) * 32;
+        CUTLASS_PRAGMA_UNROLL
+        for (int word_index = 0; word_index < 8; ++word_index) {
+          auto word = load_u32(lane_bytes + word_index * 4);
+          CUTLASS_PRAGMA_UNROLL
+          for (int nibble = 0; nibble < 8; ++nibble) {
+            dst(word_index * 8 + nibble) =
+                static_cast<typename Fragment::value_type>(
+                    unpack_nibble(word, nibble));
+          }
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < dst.size(); ++i) {
+          auto coord = dst.tv_layout()(lane, i);
+          int token = token_base + token_sg + int(get<0>(coord));
+          int dim = dim_tile + int(get<1>(coord));
+          dst(i) = static_cast<typename Fragment::value_type>(
+              load_tail(tail.key, slot, token, kv_head, dim));
+        }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < dst.size(); ++i) {
+        auto coord = dst.tv_layout()(lane, i);
+        int token = token_base + token_sg + int(get<0>(coord));
+        int dim = dim_tile + int(get<1>(coord));
+        float value = slot < 0 ? load_k_quantized(rec, token, dim)
+                               : load_tail(tail.key, slot, token, kv_head, dim);
+        dst(i) = static_cast<typename Fragment::value_type>(value);
+      }
+    }
+  }
+
+  template <class Fragment>
+  CUTLASS_DEVICE void fill_v_fragment(
+      Fragment& dst,
+      std::uint8_t const* rec,
+      int slot,
+      int kv_head,
+      int logical_tile,
+      int token_sg,
+      int value_tile) const {
+    int token_base = (logical_tile & 1) * kTileK;
+    int lane =
+        sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+    if constexpr (DpasPacked) {
+      if (slot < 0) {
+        int const subgroup = token_sg / 16;
+        int const half = logical_tile & 1;
+        auto const* lane_bytes =
+            rec + layout.v_packed_offset +
+            (((half * 8 + value_tile / 32) * 4 + subgroup) * 16 + lane) * 16;
+        CUTLASS_PRAGMA_UNROLL
+        for (int word_index = 0; word_index < 4; ++word_index) {
+          auto word = load_u32(lane_bytes + word_index * 4);
+          CUTLASS_PRAGMA_UNROLL
+          for (int nibble = 0; nibble < 8; ++nibble) {
+            dst(word_index * 8 + nibble) =
+                static_cast<typename Fragment::value_type>(
+                    unpack_nibble(word, nibble));
+          }
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < dst.size(); ++i) {
+          auto coord = dst.tv_layout()(lane, i);
+          int token = token_base + token_sg + int(get<1>(coord));
+          int dim = value_tile + int(get<0>(coord));
+          dst(i) = static_cast<typename Fragment::value_type>(
+              load_tail(tail.value, slot, token, kv_head, dim));
+        }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < dst.size(); ++i) {
+        auto coord = dst.tv_layout()(lane, i);
+        int token = token_base + token_sg + int(get<1>(coord));
+        int dim = value_tile + int(get<0>(coord));
+        float value = slot < 0
+                          ? load_v_quantized(rec, token, dim)
+                          : load_tail(tail.value, slot, token, kv_head, dim);
+        dst(i) = static_cast<typename Fragment::value_type>(value);
+      }
+    }
+  }
+};
+
+/** D256/G128/K4V4 specialization of the Xe decode collective.
+ *
+ * The base collective is inherited only for its public fragment contract and
+ * tested online-softmax implementation.  This operator never dereferences its
+ * K_2D/V_2D arguments: K and V MMA-B fragments are reconstructed directly
+ * from the packed KVarN record.
+ */
+template <
+    class TiledMMAQK_,
+    class TiledMMAPV_,
+    int VTiles_,
+    class TensorQ_,
+    class TensorK_,
+    class TensorV_,
+    bool DpasPacked_ = false>
+struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
+                                    XeDefault<1>,
+                                    true,
+                                    false,
+                                    TiledMMAQK_,
+                                    TiledMMAPV_,
+                                    VTiles_,
+                                    TensorQ_,
+                                    TensorK_,
+                                    TensorV_,
+                                    void,
+                                    void,
+                                    void,
+                                    false> {
+  using Base = DecodeFwdMainloop<
+      XeDefault<1>,
+      true,
+      false,
+      TiledMMAQK_,
+      TiledMMAPV_,
+      VTiles_,
+      TensorQ_,
+      TensorK_,
+      TensorV_,
+      void,
+      void,
+      void,
+      false>;
+
+  using typename Base::ElementA;
+  using typename Base::ElementS;
+  using typename Base::FragA;
+  using typename Base::FragARow;
+  using typename Base::FragS;
+  using typename Base::FragSCol;
+  using typename Base::SGPerWG;
+  using typename Base::SingleFragA;
+  using typename Base::SubgroupLayoutQK;
+  using typename Base::TensorK;
+  using typename Base::TensorK2D;
+  using typename Base::TensorQ;
+  using typename Base::TensorQ2D;
+  using typename Base::TensorV;
+  using typename Base::TensorV2D;
+  using typename Base::TiledMMAPV;
+  using typename Base::TiledMMAQK;
+  using typename Base::TileShapePV;
+  using typename Base::TileShapeQK;
+
+  static constexpr int VTiles = VTiles_;
+  static constexpr bool PagedKV = true;
+  static constexpr bool CausalMask = false;
+  static constexpr bool LocalMask = false;
+
+  struct Arguments {
+    typename Base::Arguments base;
+    KVarNK4V4Layout kvarn;
+    KVarNHybridTailLayout tail;
+    int const* seq_lens;
+  };
+
+  struct Params {
+    typename Base::Params base;
+    KVarNK4V4Layout kvarn;
+    KVarNHybridTailLayout tail;
+    int const* seq_lens;
+    // XeFMHAFwdSplitKVKernel reads these two scheduling fields directly from
+    // the collective params. Keep them mirrored from the wrapped base params.
+    int total_seqlen_kv;
+    int window_size_left;
+  };
+
+  struct SharedStorage {
+    typename Base::SharedStorage base;
+  };
+
+  Params params;
+
+  KVarNDecodeFwdMainloop(Params const& params_, SharedStorage& storage)
+      : Base(params_.base, storage.base), params(params_) {}
+
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    return args.kvarn.cache != nullptr && args.seq_lens != nullptr &&
+           args.tail.block_to_slot != nullptr && args.tail.key != nullptr &&
+           args.tail.value != nullptr && args.base.ptr_page_table != nullptr &&
+           args.base.page_size == KVarNK4V4FragmentLoader<>::kGroup;
+  }
+
+  static constexpr Params
+  to_underlying_arguments(Arguments const& args, void* workspace) {
+    return Params{
+        Base::to_underlying_arguments(args.base, workspace),
+        args.kvarn,
+        args.tail,
+        args.seq_lens,
+        args.base.total_seqlen_kv,
+        args.base.window_size_left};
+  }
+
+  template <bool has_large_surface, typename QVCoord>
+  CUTLASS_DEVICE void operator()(
+      TensorQ2D const& Q_2D,
+      TensorK2D const&,
+      TensorV2D const&,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      QVCoord blk_qv,
+      int const& idx_b,
+      int blk_k0,
+      int blk_k1,
+      int,
+      int thr_id,
+      int seq_len,
+      int,
+      int) {
+    // The generic kernel instantiates both surface branches. Packed K/V do
+    // not use either surface path, and Q is always a small one-token surface.
+    static_assert(get<1>(TileShapeQK{}) == 64);
+    static_assert(get<2>(TileShapeQK{}) == 64);
+    static_assert(get<2>(TileShapePV{}) == 64);
+
+    Tensor cQ = make_identity_tensor(Q_2D.shape());
+    Tensor cK = make_identity_tensor(select<1, 2>(TileShapeQK{}));  // (k,d)
+    Tensor cV = make_identity_tensor(select<1, 2>(TileShapePV{}));  // (v,k)
+    Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));
+
+    Tensor gQ =
+        local_tile(cQ, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});
+
+    typename Base::TiledCopyQ copy_q{Q_2D};
+    TiledMMAQK mma_qk{};
+    TiledMMAPV mma_pv{};
+    auto thr_copy_q = copy_q.get_slice(thr_id);
+    auto thr_mma_qk = mma_qk.get_slice(thr_id);
+    auto thr_mma_pv = mma_pv.get_slice(thr_id);
+    auto qk_thr_coord = mma_qk.get_thr_layout_vmnk().get_flat_coord(thr_id);
+    auto pv_thr_coord = mma_pv.get_thr_layout_vmnk().get_flat_coord(thr_id);
+    int qk_token_sg = int(get<2>(qk_thr_coord)) * 16;
+    int pv_token_sg = int(get<3>(pv_thr_coord)) * 16;
+
+    auto tQgQ = thr_copy_q.partition_S(gQ);
+    auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
+    auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
+    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
+    auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+
+    auto tSrK = thr_mma_qk.partition_sg_fragment_B(cK);
+    auto tArV = thr_mma_pv.partition_sg_fragment_B(cV(_, _));
+
+    auto prefetch_q = make_block_2d_prefetch(copy_q);
+    auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
+    for (int d = 0; d < size<3>(pQgQ); ++d) {
+      prefetch(prefetch_q, pQgQ(_, _, _, d));
+    }
+
+    clear(tArA);
+    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+    clear(tA_sum);
+
+    KVarNK4V4FragmentLoader<DpasPacked_> loader{
+        params.kvarn,
+        params.tail,
+        params.base.ptr_page_table,
+        params.base.max_pages_per_seq};
+    int const actual_seq_len = params.seq_lens[idx_b];
+    // Legacy single-split scheduler orders grid.z batch-major:
+    //   flat = batch * num_kv_heads + kv_head.
+    int kv_head = int(BlockIdxZ()) % 4;
+
+    for (int k_tile = blk_k0; k_tile < blk_k1; ++k_tile) {
+      // The scheduler tiles to the batch maximum.  A workgroup owns exactly
+      // one batch row, so this exit is uniform across all of its subgroups and
+      // cannot strand a subgroup at the barrier below.  Besides avoiding
+      // useless DPAS work, exiting before fragment materialization is
+      // essential: padded block-table entries are not required to name valid
+      // physical pages.
+      if (k_tile * 64 >= actual_seq_len) {
+        break;
+      }
+      int const physical = loader.physical_block(idx_b, k_tile);
+      int const slot = params.tail.block_to_slot[physical];
+      auto const* rec =
+          slot < 0 ? params.kvarn.cache +
+                         std::int64_t(physical) * params.kvarn.block_stride +
+                         std::int64_t(kv_head) * params.kvarn.head_stride
+                   : nullptr;
+      clear(tSrS);
+      float k_zp_bias[8] = {};
+      CUTLASS_PRAGMA_UNROLL
+      for (int d_tile = 0; d_tile < 256; d_tile += 64) {
+        copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
+        reorder(tQrQ, tSrQ);
+        using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
+        KDimFragment k_dim_scale;
+        if (slot < 0) {
+          int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                               .get_local_id()[0];
+          KDimFragment k_dim_zp;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < k_dim_scale.size(); ++i) {
+            int const dim = d_tile + lane + i * intel::sg_size;
+            k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.k_s_col_offset + 2 * dim);
+            k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.k_zp_offset + 2 * dim);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrQ.size(); ++i) {
+            auto coord = tSrQ.tv_layout()(lane, i);
+            int const query_row = int(get<0>(coord));
+            float const query_value = static_cast<float>(tSrQ(i));
+            float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
+            k_zp_bias[query_row] += query_value * dim_zp;
+          }
+        }
+        loader.fill_k_fragment(
+            tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+        if (slot < 0) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrK.size(); ++i) {
+            float const dim_scale = broadcast<1>(k_dim_scale, tSrK, i);
+            tSrK(i) = static_cast<typename decltype(tSrK)::value_type>(
+                static_cast<float>(tSrK(i)) * dim_scale);
+          }
+        }
+        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      }
+
+      if (slot < 0) {
+        auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+        CUTLASS_PRAGMA_UNROLL
+        for (int query_row = 0; query_row < 8; ++query_row) {
+          k_zp_bias[query_row] = sycl::reduce_over_group(
+              subgroup, k_zp_bias[query_row], sycl::plus<float>());
+        }
+        int const lane = subgroup.get_local_id()[0];
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          auto coord = tSrS.tv_layout()(lane, i);
+          tSrS(i) += k_zp_bias[int(get<0>(coord))];
+        }
+
+        FragSCol k_row_scale;
+        int token = (k_tile & 1) * 64 + qk_token_sg + lane;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(k_row_scale); ++i, token += intel::sg_size) {
+          k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+              rec + params.kvarn.k_s_row_offset + 2 * token);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          tSrS(i) *= broadcast<1>(k_row_scale, tSrS, i);
+        }
+      }
+
+      // The generic scheduler deliberately visits tiles up to max_seq_len.
+      // Mask against this row's actual length on every tile, including tiles
+      // wholly beyond the row, so a padded page table cannot contribute.
+      if ((k_tile + 1) * 64 > actual_seq_len) {
+        FragSCol mask;
+        int token = k_tile * 64 + qk_token_sg +
+                    sycl::ext::oneapi::this_work_item::get_sub_group()
+                        .get_local_id()[0];
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(mask); ++i, token += intel::sg_size) {
+          mask(i) = token < actual_seq_len ? ElementS(sycl::nan(0u))
+                                           : ElementS(-INFINITY);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(mask, tSrS, i));
+        }
+      }
+
+      this->softmax(
+          params.base.scale, k_tile == blk_k0, tSrS, tA_max, tA_sum, tArA);
+      reorder(tSrS, tArP);
+
+      if (slot < 0) {
+        bool const enter_v_scale_frame = (k_tile & 1) == 0 || k_tile == blk_k0;
+        bool const leave_v_scale_frame = (k_tile & 1) == 1 ||
+                                         k_tile + 1 == blk_k1 ||
+                                         (k_tile + 1) * 64 >= actual_seq_len;
+        float v_zp_bias[8] = {};
+        int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                             .get_local_id()[0];
+        using VTokenFragment = decltype(reduce<0>(tArP, sycl::plus<void>{}));
+        VTokenFragment v_token_scale;
+        VTokenFragment v_token_zp;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < v_token_scale.size(); ++i) {
+          int const token =
+              (k_tile & 1) * 64 + pv_token_sg + lane + i * intel::sg_size;
+          v_token_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+              rec + params.kvarn.v_s_row_offset + 2 * token);
+          v_token_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+              rec + params.kvarn.v_zp_offset + 2 * token);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tArP.size(); ++i) {
+          auto coord = tArP.tv_layout()(lane, i);
+          int const query_row = int(get<0>(coord));
+          float const probability = static_cast<float>(tArP(i));
+          float const token_scale = broadcast<1>(v_token_scale, tArP, i);
+          float const token_zp = broadcast<1>(v_token_zp, tArP, i);
+          v_zp_bias[query_row] += probability * token_zp;
+          tArP(i) = static_cast<typename decltype(tArP)::value_type>(
+              probability * token_scale);
+        }
+        auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+        CUTLASS_PRAGMA_UNROLL
+        for (int query_row = 0; query_row < 8; ++query_row) {
+          v_zp_bias[query_row] = sycl::reduce_over_group(
+              subgroup, v_zp_bias[query_row], sycl::plus<float>());
+        }
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int vv = 0; vv < VTiles; ++vv) {
+          loader.fill_v_fragment(
+              tArV,
+              rec,
+              slot,
+              kv_head,
+              k_tile,
+              pv_token_sg,
+              vv * get<1>(TileShapePV{}));
+          SingleFragA fragment_shape;
+          auto output_tile = tArA(_, _, _, vv);
+          using VDimFragment =
+              decltype(reduce<0>(fragment_shape, sycl::plus<void>{}));
+          VDimFragment v_dim_scale;
+          if (enter_v_scale_frame || leave_v_scale_frame) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < v_dim_scale.size(); ++i) {
+              int const dim =
+                  vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
+              v_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.v_s_col_offset + 2 * dim);
+            }
+          }
+          // Accumulate directly into the online-softmax output fragment. Put
+          // its existing value in this page's column-scale frame, add the raw
+          // DPAS and zero-point contributions for both 64-token halves, then
+          // restore the scale at the 128-token page (or split) boundary.
+          // Online-softmax rescaling is linear, so it is valid in this frame.
+          // For a single contribution the algebra is
+          //   s * (old / s + q_acc + zp) = old + s * (q_acc + zp),
+          // while avoiding a second full SingleFragA register fragment.
+          if (enter_v_scale_frame) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < output_tile.size(); ++i) {
+              float const dim_scale =
+                  broadcast<1>(v_dim_scale, fragment_shape, i);
+              output_tile(i) /= dim_scale;
+            }
+          }
+          cute::gemm(mma_pv, tArP, tArV, output_tile);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < output_tile.size(); ++i) {
+            auto coord = fragment_shape.tv_layout()(lane, i);
+            int const query_row = int(get<0>(coord));
+            output_tile(i) += v_zp_bias[query_row];
+          }
+          if (leave_v_scale_frame) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < output_tile.size(); ++i) {
+              float const dim_scale =
+                  broadcast<1>(v_dim_scale, fragment_shape, i);
+              output_tile(i) *= dim_scale;
+            }
+          }
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int vv = 0; vv < VTiles; ++vv) {
+          loader.fill_v_fragment(
+              tArV,
+              rec,
+              slot,
+              kv_head,
+              k_tile,
+              pv_token_sg,
+              vv * get<1>(TileShapePV{}));
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
+        }
+      }
+      // Packed K/V fragments and online-softmax accumulators are subgroup-
+      // local registers. Unlike the generic surface mainloop, this path has
+      // no shared-memory stage to publish before the next tile, so a
+      // workgroup-wide barrier here only serializes independent query-head
+      // subgroups.
+    }
+  }
+};
+
+}  // namespace cutlass::fmha::collective
