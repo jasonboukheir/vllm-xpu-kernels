@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU contracts for compact and padded KVarN K4V4 records.
 
 These tests deliberately use the independent benchmark oracle.  They freeze
@@ -14,17 +15,11 @@ from pathlib import Path
 import pytest
 import torch
 
-
 REPO_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from benchmark.kvarn_utils import (  # noqa: E402
-    KVarNLayout,
-    dequant_record,
-    pack_dpas_k4v4,
-    swizzle_record_dpas_k4v4,
-    unpack_dpas_k4v4,
-)
-
+from benchmark.kvarn_utils import (KVarNLayout, dequant_record,  # noqa: E402
+                                   pack_dpas_k4v4, swizzle_record_dpas_k4v4,
+                                   unpack_dpas_k4v4)
 
 COMPACT_STRIDE = 35072
 PADDED_STRIDE = 65536

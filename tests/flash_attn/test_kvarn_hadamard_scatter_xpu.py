@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import math
 import os
 
@@ -131,6 +132,47 @@ def test_kvarn_hadamard_scatter_repeated_is_deterministic():
     for candidate in outputs[1:]:
         assert torch.equal(candidate[0], outputs[0][0])
         assert torch.equal(candidate[1], outputs[0][1])
+
+
+def test_kvarn_hadamard_scatter_survives_input_allocator_reuse():
+    """Temporary inputs must remain live until the async kernel completes."""
+    _load_op()
+    generator = torch.Generator().manual_seed(20260812)
+    key_cpu = torch.randn(128, 4, 256, generator=generator).bfloat16()
+    value_cpu = torch.randn(128, 4, 256, generator=generator).bfloat16()
+    slots_cpu = torch.arange(128, dtype=torch.int64)
+    lookup_cpu = torch.tensor([0], dtype=torch.int32)
+    h = _hadamard_256("xpu").half()
+    key_ref = torch.matmul(key_cpu.xpu().half(), h).cpu()
+    value_ref = torch.matmul(value_cpu.xpu().half(), h).cpu()
+
+    for _ in range(8):
+        tail_key = torch.empty(
+            1, 128, 4, 256, dtype=torch.float16, device="xpu"
+        )
+        tail_value = torch.empty_like(tail_key)
+        torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+            key_cpu.xpu(),
+            value_cpu.xpu(),
+            slots_cpu.xpu(),
+            lookup_cpu.xpu(),
+            tail_key,
+            tail_value,
+            128,
+        )
+        # Drop every temporary input immediately, then pressure the caching
+        # allocator with matching allocations before synchronizing.
+        for _ in range(8):
+            torch.empty(
+                128, 4, 256, dtype=torch.bfloat16, device="xpu"
+            ).fill_(37)
+        torch.xpu.synchronize()
+        torch.testing.assert_close(
+            tail_key.cpu(), key_ref.unsqueeze(0), atol=2e-3, rtol=2e-3
+        )
+        torch.testing.assert_close(
+            tail_value.cpu(), value_ref.unsqueeze(0), atol=2e-3, rtol=2e-3
+        )
 
 
 def test_kvarn_hadamard_query_scatter_accepts_fp16_query_bf16_kv():

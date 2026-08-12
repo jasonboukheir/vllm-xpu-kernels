@@ -1,11 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU-only validation for ragged native KVarN benchmark accounting."""
 
 import pytest
 
-from benchmark.benchmark_kvarn_decode import (
-    nonempty_split_workgroups,
-    parse_seq_lens,
-)
+from benchmark.benchmark_kvarn_decode import (nonempty_split_workgroups,
+                                              parse_seq_lens)
 
 
 def test_parse_ragged_lengths() -> None:

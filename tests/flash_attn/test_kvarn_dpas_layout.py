@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import sys
@@ -6,14 +7,9 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from benchmark.kvarn_utils import (  # noqa: E402
-    KVarNLayout,
-    _k_dpas_coord,
-    _v_dpas_coord,
-    dequant_record,
-    pack_dpas_k4v4,
-    unpack_dpas_k4v4,
-)
+from benchmark.kvarn_utils import (KVarNLayout, _k_dpas_coord,  # noqa: E402
+                                   _v_dpas_coord, dequant_record,
+                                   pack_dpas_k4v4, unpack_dpas_k4v4)
 
 
 def _canonical_record(q_k: torch.Tensor, q_v: torch.Tensor) -> torch.Tensor:

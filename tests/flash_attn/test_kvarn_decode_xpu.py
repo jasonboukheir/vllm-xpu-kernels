@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Parametrized runtime tests for the narrow native Xe2 KVarN decoder.
 
 Set ``VLLM_XPU_KERNELS_LIBRARY`` to the freshly built ``_vllm_fa2_C`` shared
@@ -14,21 +15,13 @@ from pathlib import Path
 import pytest
 import torch
 
-
 REPO_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from benchmark.check_kvarn_decode import (  # noqa: E402
-    _put_half,
-    expected_value,
-    make_cache,
-    make_random_cache,
-    reference_decode,
-)
-from benchmark.kvarn_utils import (  # noqa: E402
-    _k_dpas_coord,
-    _v_dpas_coord,
-    swizzle_record_dpas_k4v4,
-)
+from benchmark.check_kvarn_decode import (_put_half,  # noqa: E402
+                                          expected_value, make_cache,
+                                          make_random_cache, reference_decode)
+from benchmark.kvarn_utils import (_k_dpas_coord, _v_dpas_coord,  # noqa: E402
+                                   swizzle_record_dpas_k4v4)
 
 
 @pytest.fixture(scope="module", autouse=True)

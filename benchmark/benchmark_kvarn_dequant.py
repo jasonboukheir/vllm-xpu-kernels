@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Correctness and XPU-event microbenchmark for native KVarN dequantization."""
 
 from __future__ import annotations
@@ -9,7 +10,6 @@ import sys
 from pathlib import Path
 
 import torch
-
 
 REPO_ROOT = Path(__file__).parents[1]
 sys.path.append(str(REPO_ROOT))
