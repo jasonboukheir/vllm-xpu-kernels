@@ -9,6 +9,7 @@
 #include <limits>
 
 #include "kvarn_decode.hpp"
+#include "kvarn_chunk_prefill.hpp"
 
 namespace {
 
@@ -335,4 +336,286 @@ void kvarn_decode_xe2(
       exp_sums.storage().data_ptr(), current_stream);
   c10::xpu::XPUCachingAllocator::recordStream(
       max_logits.storage().data_ptr(), current_stream);
+}
+
+void kvarn_chunk_prefill_xe2(
+    const at::Tensor& query,
+    const at::Tensor& packed_cache,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& block_to_slot,
+    const at::Tensor& tail_key,
+    const at::Tensor& tail_value,
+    at::Tensor& output,
+    int64_t max_query_len,
+    int64_t max_seq_len,
+    double softmax_scale) {
+  check_xpu(query, "query");
+  check_xpu(packed_cache, "packed_cache");
+  check_xpu(block_table, "block_table");
+  check_xpu(seq_lens, "seq_lens");
+  check_xpu(cu_seqlens_q, "cu_seqlens_q");
+  check_xpu(block_to_slot, "block_to_slot");
+  check_xpu(tail_key, "tail_key");
+  check_xpu(tail_value, "tail_value");
+  check_xpu(output, "output");
+  TORCH_CHECK(
+      query.device() == packed_cache.device() &&
+          query.device() == block_table.device() &&
+          query.device() == seq_lens.device() &&
+          query.device() == cu_seqlens_q.device() &&
+          query.device() == block_to_slot.device() &&
+          query.device() == tail_key.device() &&
+          query.device() == tail_value.device() &&
+          query.device() == output.device(),
+      "all KVarN chunk-prefill tensors must be on the same XPU");
+  TORCH_CHECK(
+      query.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf,
+      "query and output must have dtype float16");
+  TORCH_CHECK(
+      packed_cache.scalar_type() == at::kByte,
+      "packed_cache must have dtype uint8");
+  TORCH_CHECK(
+      block_table.scalar_type() == at::kInt &&
+          seq_lens.scalar_type() == at::kInt &&
+          cu_seqlens_q.scalar_type() == at::kInt &&
+          block_to_slot.scalar_type() == at::kInt,
+      "block_table, seq_lens, cu_seqlens_q, and block_to_slot must be int32");
+  TORCH_CHECK(
+      tail_key.scalar_type() == at::kHalf &&
+          tail_value.scalar_type() == at::kHalf,
+      "tail_key and tail_value must have dtype float16");
+  TORCH_CHECK(
+      query.dim() == 3 && query.size(1) == kQueryHeads &&
+          query.size(2) == kHeadDim && query.is_contiguous(),
+      "query must be contiguous [total_q, 24, 256]");
+  TORCH_CHECK(
+      output.sizes() == query.sizes() && output.is_contiguous() &&
+          !output.is_alias_of(query),
+      "output must be a non-aliasing contiguous tensor matching query");
+  int64_t const batch = seq_lens.numel();
+  TORCH_CHECK(batch >= 1, "seq_lens must contain at least one request");
+  TORCH_CHECK(
+      seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
+          cu_seqlens_q.dim() == 1 && cu_seqlens_q.numel() == batch + 1 &&
+          cu_seqlens_q.is_contiguous(),
+      "seq_lens must be [B] and cu_seqlens_q must be contiguous [B+1]");
+  TORCH_CHECK(
+      block_table.dim() == 2 && block_table.size(0) == batch &&
+          block_table.size(1) > 0 && block_table.is_contiguous(),
+      "block_table must be contiguous [B, max_pages_per_seq]");
+  TORCH_CHECK(
+      packed_cache.dim() == 3 && packed_cache.size(1) == kKVHeads &&
+          packed_cache.size(2) >= kRecordBytes && packed_cache.is_contiguous(),
+      "packed_cache must be contiguous [num_blocks, 4, record_bytes]");
+  TORCH_CHECK(
+      block_to_slot.dim() == 1 && block_to_slot.is_contiguous() &&
+          block_to_slot.size(0) >= packed_cache.size(0),
+      "block_to_slot must cover every physical cache block");
+  TORCH_CHECK(
+      tail_key.dim() == 4 && tail_value.sizes() == tail_key.sizes() &&
+          tail_key.size(0) > 0 && tail_key.size(1) == kGroup &&
+          tail_key.size(2) == kKVHeads && tail_key.size(3) == kHeadDim &&
+          tail_key.is_contiguous() && tail_value.is_contiguous(),
+      "tail pools must be contiguous [slots, 128, 4, 256]");
+  TORCH_CHECK(
+      max_query_len >= 1 && max_query_len <= query.size(0) &&
+          max_seq_len >= max_query_len &&
+          max_seq_len <= block_table.size(1) * kGroup &&
+          max_query_len <= std::numeric_limits<int>::max() &&
+          max_seq_len <= std::numeric_limits<int>::max() &&
+          batch <= std::numeric_limits<int>::max() &&
+          query.size(0) <= std::numeric_limits<int>::max(),
+      "invalid chunk-prefill query or KV extent");
+  TORCH_CHECK(
+      std::isfinite(softmax_scale) && softmax_scale > 0.0,
+      "softmax_scale must be finite and positive");
+
+  cutlass::fmha::collective::KVarNK4V4Layout layout{
+      static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
+      packed_cache.stride(0),
+      packed_cache.stride(1),
+      static_cast<int>(batch),
+      0,
+      kKSColOffset,
+      kKZpOffset,
+      kKSRowOffset,
+      kVPackedOffset,
+      kVSColOffset,
+      kVSRowOffset,
+      kVZpOffset};
+  kvarn_chunk_prefill_args_t args{
+      query.const_data_ptr(),
+      static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
+      output.data_ptr(),
+      block_table.const_data_ptr<int>(),
+      seq_lens.const_data_ptr<int>(),
+      cu_seqlens_q.const_data_ptr<int>(),
+      block_to_slot.const_data_ptr<int>(),
+      tail_key.const_data_ptr(),
+      tail_value.const_data_ptr(),
+      static_cast<int>(batch),
+      static_cast<int>(query.size(0)),
+      static_cast<int>(max_query_len),
+      static_cast<int>(max_seq_len),
+      static_cast<int>(block_table.size(1)),
+      static_cast<float>(softmax_scale),
+      layout};
+  auto& queue = c10::xpu::getCurrentXPUStream().queue();
+  auto const* dpas_layout = std::getenv("KVARN_NATIVE_XPU_DPAS_LAYOUT");
+  auto status = dpas_layout != nullptr && std::atoi(dpas_layout) == 1
+                    ? KVarNChunkPrefillD256G128DpasConfig::run(queue, args)
+                    : KVarNChunkPrefillD256G128Config::run(queue, args);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "native KVarN chunk prefill rejected the validated problem");
+}
+
+void kvarn_materialize_packed_kv_xe2(
+    const at::Tensor& packed_cache,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const at::Tensor& cu_seqlens_k,
+    const at::Tensor& block_to_slot,
+    const at::Tensor& tail_key,
+    const at::Tensor& tail_value,
+    at::Tensor& key_output,
+    at::Tensor& value_output,
+    int64_t max_seq_len) {
+  for (auto const& item : {
+           std::pair<at::Tensor const*, char const*>{&packed_cache, "packed_cache"},
+           {&block_table, "block_table"},
+           {&seq_lens, "seq_lens"},
+           {&cu_seqlens_k, "cu_seqlens_k"},
+           {&block_to_slot, "block_to_slot"},
+           {&tail_key, "tail_key"},
+           {&tail_value, "tail_value"},
+           {&key_output, "key_output"},
+           {&value_output, "value_output"}}) {
+    check_xpu(*item.first, item.second);
+    TORCH_CHECK(item.first->device() == packed_cache.device(),
+                item.second, " must be on the packed-cache device");
+  }
+  int64_t const batch = seq_lens.numel();
+  TORCH_CHECK(
+      packed_cache.scalar_type() == at::kByte && packed_cache.dim() == 3 &&
+          packed_cache.size(1) == kKVHeads &&
+          packed_cache.size(2) >= kRecordBytes && packed_cache.is_contiguous(),
+      "packed_cache must be contiguous uint8 [num_blocks, 4, record_bytes]");
+  TORCH_CHECK(
+      block_table.scalar_type() == at::kInt && block_table.dim() == 2 &&
+          block_table.size(0) == batch && block_table.is_contiguous(),
+      "block_table must be contiguous int32 [B, max_blocks]");
+  TORCH_CHECK(
+      seq_lens.scalar_type() == at::kInt && seq_lens.dim() == 1 &&
+          seq_lens.is_contiguous() && cu_seqlens_k.scalar_type() == at::kInt &&
+          cu_seqlens_k.dim() == 1 && cu_seqlens_k.numel() == batch + 1 &&
+          cu_seqlens_k.is_contiguous(),
+      "seq_lens and cu_seqlens_k must be contiguous int32 [B] and [B+1]");
+  TORCH_CHECK(
+      block_to_slot.scalar_type() == at::kInt && block_to_slot.dim() == 1 &&
+          block_to_slot.size(0) >= packed_cache.size(0) &&
+          block_to_slot.is_contiguous(),
+      "block_to_slot must cover every physical block");
+  TORCH_CHECK(
+      tail_key.scalar_type() == at::kHalf && tail_value.sizes() == tail_key.sizes() &&
+          tail_key.dim() == 4 && tail_key.size(1) == kGroup &&
+          tail_key.size(2) == kKVHeads && tail_key.size(3) == kHeadDim &&
+          tail_key.is_contiguous() && tail_value.is_contiguous(),
+      "tail pools must be contiguous fp16 [slots, 128, 4, 256]");
+  TORCH_CHECK(
+      key_output.scalar_type() == at::kHalf &&
+          value_output.sizes() == key_output.sizes() &&
+          key_output.dim() == 3 && key_output.size(1) == kKVHeads &&
+          key_output.size(2) == kHeadDim && key_output.is_contiguous() &&
+          value_output.is_contiguous(),
+      "outputs must be contiguous fp16 [tokens, 4, 256]");
+  TORCH_CHECK(
+      max_seq_len >= 1 && max_seq_len <= block_table.size(1) * kGroup &&
+          batch <= std::numeric_limits<int>::max() &&
+          block_table.size(1) <= std::numeric_limits<int>::max(),
+      "invalid materialization extent");
+
+  cutlass::fmha::collective::KVarNK4V4Layout layout{
+      static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
+      packed_cache.stride(0), packed_cache.stride(1), static_cast<int>(batch),
+      0, kKSColOffset, kKZpOffset, kKSRowOffset, kVPackedOffset,
+      kVSColOffset, kVSRowOffset, kVZpOffset};
+  cutlass::fmha::collective::KVarNHybridTailLayout tail{
+      block_to_slot.const_data_ptr<int>(),
+      static_cast<cutlass::half_t const*>(tail_key.const_data_ptr()),
+      static_cast<cutlass::half_t const*>(tail_value.const_data_ptr()),
+      static_cast<int>(tail_key.stride(0)),
+      static_cast<int>(tail_key.stride(1)),
+      static_cast<int>(tail_key.stride(2))};
+  auto const* page_table = block_table.const_data_ptr<int>();
+  auto const* lengths = seq_lens.const_data_ptr<int>();
+  auto const* cumulative = cu_seqlens_k.const_data_ptr<int>();
+  auto* key = static_cast<cutlass::half_t*>(key_output.data_ptr());
+  auto* value = static_cast<cutlass::half_t*>(value_output.data_ptr());
+  int const max_blocks = static_cast<int>((max_seq_len + kGroup - 1) / kGroup);
+  int const table_stride = static_cast<int>(block_table.stride(0));
+  bool const dpas = [] {
+    auto const* text = std::getenv("KVARN_NATIVE_XPU_DPAS_LAYOUT");
+    return text != nullptr && std::atoi(text) == 1;
+  }();
+  auto& queue = c10::xpu::getCurrentXPUStream().queue();
+  queue.parallel_for(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(batch) * max_blocks * kKVHeads * 256),
+          sycl::range<1>(256)),
+      [=](sycl::nd_item<1> item) {
+        int const group_id = static_cast<int>(item.get_group_linear_id());
+        int const kv_head = group_id % kKVHeads;
+        int const logical_block = (group_id / kKVHeads) % max_blocks;
+        int const request = group_id / (kKVHeads * max_blocks);
+        int const seq_len = lengths[request];
+        int const token_base = logical_block * kGroup;
+        if (token_base >= seq_len) return;
+        int const physical = page_table[request * table_stride + logical_block];
+        int const slot = tail.block_to_slot[physical];
+        auto const* rec = slot < 0
+                              ? layout.cache + std::int64_t(physical) * layout.block_stride +
+                                    std::int64_t(kv_head) * layout.head_stride
+                              : nullptr;
+        cutlass::fmha::collective::KVarNK4V4FragmentLoader<> loader{
+            layout, tail, page_table, table_stride};
+        int const local_id = static_cast<int>(item.get_local_linear_id());
+        for (int linear = local_id; linear < kGroup * kHeadDim; linear += 256) {
+          int const token = linear / kHeadDim;
+          int const dim = linear % kHeadDim;
+          if (token_base + token >= seq_len) continue;
+          float kval;
+          float vval;
+          if (slot < 0) {
+            float const kq = dpas ? loader.load_k_dpas_quantized(rec, token, dim)
+                                  : loader.load_k_quantized(rec, token, dim);
+            float const vq = dpas ? loader.load_v_dpas_quantized(rec, token, dim)
+                                  : loader.load_v_quantized(rec, token, dim);
+            float const kcol = decltype(loader)::load_f16(
+                rec + layout.k_s_col_offset + 2 * dim);
+            float const kzp = decltype(loader)::load_f16(
+                rec + layout.k_zp_offset + 2 * dim);
+            float const krow = decltype(loader)::load_f16(
+                rec + layout.k_s_row_offset + 2 * token);
+            float const vcol = decltype(loader)::load_f16(
+                rec + layout.v_s_col_offset + 2 * dim);
+            float const vrow = decltype(loader)::load_f16(
+                rec + layout.v_s_row_offset + 2 * token);
+            float const vzp = decltype(loader)::load_f16(
+                rec + layout.v_zp_offset + 2 * token);
+            kval = (kq * kcol + kzp) * krow;
+            vval = (vq * vrow + vzp) * vcol;
+          } else {
+            kval = loader.load_tail(tail.key, slot, token, kv_head, dim);
+            vval = loader.load_tail(tail.value, slot, token, kv_head, dim);
+          }
+          std::int64_t const out_token = cumulative[request] + token_base + token;
+          std::int64_t const out_index =
+              (out_token * kKVHeads + kv_head) * kHeadDim + dim;
+          key[out_index] = static_cast<cutlass::half_t>(kval);
+          value[out_index] = static_cast<cutlass::half_t>(vval);
+        }
+      });
 }

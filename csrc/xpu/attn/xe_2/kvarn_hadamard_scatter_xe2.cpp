@@ -1,6 +1,7 @@
 #include "kvarn_hadamard_scatter_xe2.h"
 
 #include <ATen/xpu/XPUContext.h>
+#include <c10/xpu/XPUCachingAllocator.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
@@ -350,6 +351,14 @@ void kvarn_hadamard_scatter_xe2(
         reinterpret_cast<const bf16*>(key.data_ptr<at::BFloat16>()),
         reinterpret_cast<const bf16*>(value.data_ptr<at::BFloat16>()));
   }
+  const auto current_stream =
+      c10::xpu::getCurrentXPUStream(key.device().index());
+  const at::Tensor* tensors[] = {
+      &key, &value, &slot_mapping, &block_to_slot, &tail_key, &tail_value};
+  for (const at::Tensor* tensor : tensors) {
+    c10::xpu::XPUCachingAllocator::recordStream(
+        tensor->storage().data_ptr(), current_stream);
+  }
 }
 
 void kvarn_hadamard_query_scatter_xe2(
@@ -425,5 +434,19 @@ void kvarn_hadamard_query_scatter_xe2(
     launch_kv(reinterpret_cast<const sycl::half*>(query.data_ptr<at::Half>()));
   } else {
     launch_kv(reinterpret_cast<const bf16*>(query.data_ptr<at::BFloat16>()));
+  }
+  const auto current_stream =
+      c10::xpu::getCurrentXPUStream(query.device().index());
+  const at::Tensor* tensors[] = {&query,
+                                 &key,
+                                 &value,
+                                 &slot_mapping,
+                                 &block_to_slot,
+                                 &query_out,
+                                 &tail_key,
+                                 &tail_value};
+  for (const at::Tensor* tensor : tensors) {
+    c10::xpu::XPUCachingAllocator::recordStream(
+        tensor->storage().data_ptr(), current_stream);
   }
 }

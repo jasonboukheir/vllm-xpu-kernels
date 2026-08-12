@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Runtime correctness smoke test for the narrow native KVarN decode op."""
 
 from __future__ import annotations

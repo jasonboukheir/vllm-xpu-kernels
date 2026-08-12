@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Independent KVarN packed-record helpers for tests and microbenchmarks.
 
 This module intentionally does not import vLLM's KVarN implementation. It is

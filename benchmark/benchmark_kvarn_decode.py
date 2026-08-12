@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Benchmark the narrow native KVarN Xe2 decode kernel and emit JSON."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """XPU-event benchmark for fused KVarN H256 rotation and tail scatter."""
 
 from __future__ import annotations
@@ -7,6 +8,7 @@ import json
 import math
 import os
 import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -42,6 +44,20 @@ def _stats(values: list[float]) -> dict[str, float]:
     }
 
 
+def _enqueue_times(callable_, warmup: int, iterations: int) -> list[float]:
+    """Measure host submission cost separately from XPU execution time."""
+    for _ in range(warmup):
+        callable_()
+    torch.xpu.synchronize()
+    elapsed_us = []
+    for _ in range(iterations):
+        start_ns = time.perf_counter_ns()
+        callable_()
+        elapsed_us.append((time.perf_counter_ns() - start_ns) / 1000)
+    torch.xpu.synchronize()
+    return elapsed_us
+
+
 def benchmark(
     tokens: int, dtype: torch.dtype, warmup: int, iterations: int
 ) -> dict:
@@ -75,13 +91,17 @@ def benchmark(
 
     fused_times = _times(fused, warmup, iterations)
     dense_times = _times(dense_rotation_only, warmup, iterations)
+    fused_enqueue_times = _enqueue_times(fused, warmup, iterations)
+    dense_enqueue_times = _enqueue_times(dense_rotation_only, warmup, iterations)
     return {
         "tokens": tokens,
         "dtype": str(dtype),
         "warmup": warmup,
         "iterations": iterations,
         "fused": _stats(fused_times),
+        "fused_host_enqueue": _stats(fused_enqueue_times),
         "dense_rotation_only_no_scatter": _stats(dense_times),
+        "dense_rotation_host_enqueue": _stats(dense_enqueue_times),
         "correct": True,
     }
 

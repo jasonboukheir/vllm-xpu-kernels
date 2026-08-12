@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Event-timed native H256 FWHT versus torch.mm for decode query rows."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Independent KVarN K4V4 packed-layout tests for native XPU decode."""
 
 import struct
@@ -7,11 +8,9 @@ from pathlib import Path
 import pytest
 import torch
 
-
 REPO_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 from benchmark.kvarn_utils import KVarNLayout, dequant_record  # noqa: E402
-
 
 HEAD_DIM = 256
 GROUP = 128

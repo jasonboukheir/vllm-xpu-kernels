@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Measure the steady-decode Q/output Hadamard rotation tax on XPU."""
 
 from __future__ import annotations

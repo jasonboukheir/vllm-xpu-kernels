@@ -57,7 +57,7 @@ struct KVarNHybridTailLayout {
  * what makes the register assignment independent of undocumented fragment
  * linear order.
  */
-template <bool DpasPacked = false>
+template <bool DpasPacked = false, bool DirectDpasLogical = false>
 struct KVarNK4V4FragmentLoader {
   static constexpr int kHeadDim = 256;
   static constexpr int kGroup = 128;
@@ -128,6 +128,39 @@ struct KVarNK4V4FragmentLoader {
     return float(unpack_nibble(word, dim & 7));
   }
 
+  CUTLASS_DEVICE float
+  load_k_dpas_quantized(std::uint8_t const* rec, int token, int dim) const {
+    int const half = token / 64;
+    int const token16 = token % 16;
+    int const subgroup = (token % 64) / 16;
+    int const dim_tile = dim / 64;
+    int const dim64 = dim % 64;
+    int const lane = 2 * (token16 % 8) + dim64 % 2;
+    int const slot = 2 * (dim64 / 2) + token16 / 8;
+    auto const* lane_bytes =
+        rec + layout.k_packed_offset +
+        (((half * 4 + dim_tile) * 4 + subgroup) * 16 + lane) * 32;
+    auto const word = load_u32(lane_bytes + (slot / 8) * 4);
+    return float(unpack_nibble(word, slot % 8));
+  }
+
+  CUTLASS_DEVICE float
+  load_v_dpas_quantized(std::uint8_t const* rec, int token, int dim) const {
+    int const half = token / 64;
+    int const token16 = token % 16;
+    int const subgroup = (token % 64) / 16;
+    int const value_tile = dim / 32;
+    int const dim32 = dim % 32;
+    int const lane = 2 * (dim32 % 8) + token16 % 2;
+    int const inner = 2 * (token16 / 2) + (dim32 % 16) / 8;
+    int const slot = 16 * (dim32 / 16) + inner;
+    auto const* lane_bytes =
+        rec + layout.v_packed_offset +
+        (((half * 8 + value_tile) * 4 + subgroup) * 16 + lane) * 16;
+    auto const word = load_u32(lane_bytes + (slot / 8) * 4);
+    return float(unpack_nibble(word, slot % 8));
+  }
+
   template <class Fragment>
   CUTLASS_DEVICE void fill_k_fragment(
       Fragment& dst,
@@ -140,7 +173,7 @@ struct KVarNK4V4FragmentLoader {
     int token_base = (logical_tile & 1) * kTileK;
     int lane =
         sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
-    if constexpr (DpasPacked) {
+    if constexpr (DpasPacked && !DirectDpasLogical) {
       if (slot < 0) {
         int const subgroup = token_sg / 16;
         int const half = logical_tile & 1;
@@ -173,8 +206,10 @@ struct KVarNK4V4FragmentLoader {
         auto coord = dst.tv_layout()(lane, i);
         int token = token_base + token_sg + int(get<0>(coord));
         int dim = dim_tile + int(get<1>(coord));
-        float value = slot < 0 ? load_k_quantized(rec, token, dim)
-                               : load_tail(tail.key, slot, token, kv_head, dim);
+        float value = slot < 0
+                          ? (DpasPacked ? load_k_dpas_quantized(rec, token, dim)
+                                        : load_k_quantized(rec, token, dim))
+                          : load_tail(tail.key, slot, token, kv_head, dim);
         dst(i) = static_cast<typename Fragment::value_type>(value);
       }
     }
@@ -192,7 +227,7 @@ struct KVarNK4V4FragmentLoader {
     int token_base = (logical_tile & 1) * kTileK;
     int lane =
         sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
-    if constexpr (DpasPacked) {
+    if constexpr (DpasPacked && !DirectDpasLogical) {
       if (slot < 0) {
         int const subgroup = token_sg / 16;
         int const half = logical_tile & 1;
@@ -226,7 +261,8 @@ struct KVarNK4V4FragmentLoader {
         int token = token_base + token_sg + int(get<1>(coord));
         int dim = value_tile + int(get<0>(coord));
         float value = slot < 0
-                          ? load_v_quantized(rec, token, dim)
+                          ? (DpasPacked ? load_v_dpas_quantized(rec, token, dim)
+                                        : load_v_quantized(rec, token, dim))
                           : load_tail(tail.value, slot, token, kv_head, dim);
         dst(i) = static_cast<typename Fragment::value_type>(value);
       }
@@ -248,11 +284,13 @@ template <
     class TensorQ_,
     class TensorK_,
     class TensorV_,
-    bool DpasPacked_ = false>
+    bool DpasPacked_ = false,
+    bool CausalMask_ = false,
+    bool DirectDpasLogical_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
-                                    false,
+                                    CausalMask_,
                                     TiledMMAQK_,
                                     TiledMMAPV_,
                                     VTiles_,
@@ -266,7 +304,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   using Base = DecodeFwdMainloop<
       XeDefault<1>,
       true,
-      false,
+      CausalMask_,
       TiledMMAQK_,
       TiledMMAPV_,
       VTiles_,
@@ -300,7 +338,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
 
   static constexpr int VTiles = VTiles_;
   static constexpr bool PagedKV = true;
-  static constexpr bool CausalMask = false;
+  static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask = false;
 
   struct Arguments {
@@ -319,16 +357,31 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     // the collective params. Keep them mirrored from the wrapped base params.
     int total_seqlen_kv;
     int window_size_left;
+    // Names consumed by XeFMHAFwdKernel's chunk scheduler. KVarN does not
+    // implement a local window, but these inert mirrors let the compact
+    // collective run under both decode and chunk-prefill kernels.
+    int local_left;
+    int local_right;
   };
 
-  struct SharedStorage {
+  struct SharedStorageNone {
     typename Base::SharedStorage base;
   };
+  struct SharedStorageChunk {
+    typename Base::SharedStorage base;
+    cutlass::half_t key[64 * 256];
+    cutlass::half_t value[64 * 256];
+  };
+  using SharedStorage = conditional_t<
+      CausalMask,
+      SharedStorageChunk,
+      SharedStorageNone>;
 
   Params params;
+  SharedStorage& shared;
 
   KVarNDecodeFwdMainloop(Params const& params_, SharedStorage& storage)
-      : Base(params_.base, storage.base), params(params_) {}
+      : Base(params_.base, storage.base), params(params_), shared(storage) {}
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
     return args.kvarn.cache != nullptr && args.seq_lens != nullptr &&
@@ -345,7 +398,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         args.tail,
         args.seq_lens,
         args.base.total_seqlen_kv,
-        args.base.window_size_left};
+        args.base.window_size_left,
+        args.base.window_size_left,
+        args.base.window_size_right};
   }
 
   template <bool has_large_surface, typename QVCoord>
@@ -360,10 +415,10 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       int const& idx_b,
       int blk_k0,
       int blk_k1,
-      int,
+      int blk_k1_causal,
       int thr_id,
       int seq_len,
-      int,
+      int full_tile_offset,
       int) {
     // The generic kernel instantiates both surface branches. Packed K/V do
     // not use either surface path, and Q is always a small one-token surface.
@@ -389,6 +444,11 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     auto pv_thr_coord = mma_pv.get_thr_layout_vmnk().get_flat_coord(thr_id);
     int qk_token_sg = int(get<2>(qk_thr_coord)) * 16;
     int pv_token_sg = int(get<3>(pv_thr_coord)) * 16;
+    int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                         .get_local_id()[0];
+    constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
+    int const row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) +
+                         (thr_id / intel::sg_size) * sg_tile_q;
 
     auto tQgQ = thr_copy_q.partition_S(gQ);
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
@@ -409,15 +469,21 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
-    KVarNK4V4FragmentLoader<DpasPacked_> loader{
+    KVarNK4V4FragmentLoader<DpasPacked_, DirectDpasLogical_> loader{
         params.kvarn,
         params.tail,
         params.base.ptr_page_table,
         params.base.max_pages_per_seq};
     int const actual_seq_len = params.seq_lens[idx_b];
-    // Legacy single-split scheduler orders grid.z batch-major:
-    //   flat = batch * num_kv_heads + kv_head.
-    int kv_head = int(BlockIdxZ()) % 4;
+    // Decode schedules grid.z over KV heads, whereas chunk prefill schedules
+    // it over query heads. Qwen3.6 has six query heads per KV head.
+    int kv_head;
+    if constexpr (CausalMask) {
+      int const query_head = int(BlockIdxZ()) % 24;
+      kv_head = query_head / 6;
+    } else {
+      kv_head = int(BlockIdxZ()) % 4;
+    }
 
     for (int k_tile = blk_k0; k_tile < blk_k1; ++k_tile) {
       // The scheduler tiles to the batch maximum.  A workgroup owns exactly
@@ -436,6 +502,52 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                          std::int64_t(physical) * params.kvarn.block_stride +
                          std::int64_t(kv_head) * params.kvarn.head_stride
                    : nullptr;
+      if constexpr (CausalMask) {
+        constexpr int kElements = 64 * 256;
+        constexpr int kThreads = SGPerWG::value * intel::sg_size;
+        int const token_base = (k_tile & 1) * 64;
+        for (int linear = thr_id; linear < kElements; linear += kThreads) {
+          int const token = linear / 256;
+          int const dim = linear % 256;
+          if (slot < 0) {
+            int const page_token = token_base + token;
+            float const k_q = DpasPacked_
+                                  ? loader.load_k_dpas_quantized(
+                                        rec, page_token, dim)
+                                  : loader.load_k_quantized(
+                                        rec, page_token, dim);
+            float const k_col =
+                KVarNK4V4FragmentLoader<>::load_f16(
+                    rec + params.kvarn.k_s_col_offset + 2 * dim);
+            float const k_zp = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.k_zp_offset + 2 * dim);
+            float const k_row = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.k_s_row_offset + 2 * page_token);
+            float const v_q = DpasPacked_
+                                  ? loader.load_v_dpas_quantized(
+                                        rec, page_token, dim)
+                                  : loader.load_v_quantized(
+                                        rec, page_token, dim);
+            float const v_col = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_s_col_offset + 2 * dim);
+            float const v_row = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_s_row_offset + 2 * page_token);
+            float const v_zp = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_zp_offset + 2 * page_token);
+            shared.key[linear] =
+                static_cast<cutlass::half_t>((k_q * k_col + k_zp) * k_row);
+            shared.value[linear] =
+                static_cast<cutlass::half_t>((v_q * v_row + v_zp) * v_col);
+          } else {
+            shared.key[linear] = static_cast<cutlass::half_t>(loader.load_tail(
+                params.tail.key, slot, token_base + token, kv_head, dim));
+            shared.value[linear] = static_cast<cutlass::half_t>(loader.load_tail(
+                params.tail.value, slot, token_base + token, kv_head, dim));
+          }
+        }
+        sycl::group_barrier(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+      }
       clear(tSrS);
       float k_zp_bias[8] = {};
       CUTLASS_PRAGMA_UNROLL
@@ -444,7 +556,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         reorder(tQrQ, tSrQ);
         using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
         KDimFragment k_dim_scale;
-        if (slot < 0) {
+        if (slot < 0 && !CausalMask) {
           int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
                                .get_local_id()[0];
           KDimFragment k_dim_zp;
@@ -465,9 +577,20 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
             k_zp_bias[query_row] += query_value * dim_zp;
           }
         }
-        loader.fill_k_fragment(
-            tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
-        if (slot < 0) {
+        if constexpr (CausalMask) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrK.size(); ++i) {
+            auto coord = tSrK.tv_layout()(lane, i);
+            int const token = qk_token_sg + int(get<0>(coord));
+            int const dim = d_tile + int(get<1>(coord));
+            tSrK(i) = static_cast<typename decltype(tSrK)::value_type>(
+                shared.key[token * 256 + dim]);
+          }
+        } else {
+          loader.fill_k_fragment(
+              tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+        }
+        if (slot < 0 && !CausalMask) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrK.size(); ++i) {
             float const dim_scale = broadcast<1>(k_dim_scale, tSrK, i);
@@ -478,7 +601,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
-      if (slot < 0) {
+      if (slot < 0 && !CausalMask) {
         auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
         CUTLASS_PRAGMA_UNROLL
         for (int query_row = 0; query_row < 8; ++query_row) {
@@ -524,11 +647,35 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         }
       }
 
+      // Bottom-right causal alignment for a cached-prefill continuation:
+      // query row r may attend through full_tile_offset + r. The existing
+      // decode instantiations keep CausalMask=false, so this branch and its
+      // index arithmetic disappear from their generated kernels.
+      if constexpr (CausalMask) {
+        if (k_tile >= blk_k1_causal) {
+          constexpr int kTileK = 64;
+          constexpr int n_reps = kTileK / intel::sg_size;
+          constexpr int elems_per_n = tSrS.size() / n_reps;
+          int const k_base = k_tile * kTileK;
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < n_reps; ++n) {
+            int const col = k_base + n * intel::sg_size + lane;
+            int const causal_bound = col - full_tile_offset - row_base;
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < elems_per_n; ++j) {
+              if (j < causal_bound) {
+                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+              }
+            }
+          }
+        }
+      }
+
       this->softmax(
           params.base.scale, k_tile == blk_k0, tSrS, tA_max, tA_sum, tArA);
       reorder(tSrS, tArP);
 
-      if (slot < 0) {
+      if (slot < 0 && !CausalMask) {
         bool const enter_v_scale_frame = (k_tile & 1) == 0 || k_tile == blk_k0;
         bool const leave_v_scale_frame = (k_tile & 1) == 1 ||
                                          k_tile + 1 == blk_k1 ||
@@ -625,14 +772,25 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int vv = 0; vv < VTiles; ++vv) {
-          loader.fill_v_fragment(
-              tArV,
-              rec,
-              slot,
-              kv_head,
-              k_tile,
-              pv_token_sg,
-              vv * get<1>(TileShapePV{}));
+          if constexpr (CausalMask) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArV.size(); ++i) {
+              auto coord = tArV.tv_layout()(lane, i);
+              int const token = pv_token_sg + int(get<1>(coord));
+              int const dim = vv * get<1>(TileShapePV{}) + int(get<0>(coord));
+              tArV(i) = static_cast<typename decltype(tArV)::value_type>(
+                  shared.value[token * 256 + dim]);
+            }
+          } else {
+            loader.fill_v_fragment(
+                tArV,
+                rec,
+                slot,
+                kv_head,
+                k_tile,
+                pv_token_sg,
+                vv * get<1>(TileShapePV{}));
+          }
           cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
         }
       }
@@ -641,7 +799,50 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       // no shared-memory stage to publish before the next tile, so a
       // workgroup-wide barrier here only serializes independent query-head
       // subgroups.
+      if constexpr (CausalMask) {
+        sycl::group_barrier(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+      }
     }
+  }
+
+  // XeFMHAFwdKernel supplies separate left/right local-mask bounds. The
+  // compact specialization is causal but non-local, so discard the extra
+  // right bound and reuse the implementation above.
+  template <bool has_large_surface, typename QVCoord>
+  CUTLASS_DEVICE void operator()(
+      TensorQ2D const& q,
+      TensorK2D const& k,
+      TensorV2D const& v,
+      FragA& out,
+      FragARow& row_max,
+      FragARow& row_sum,
+      QVCoord blk_qv,
+      int const& batch,
+      int blk_k0,
+      int blk_k1,
+      int blk_k1_causal,
+      int thr_id,
+      int seq_len,
+      int full_tile_offset,
+      int blk_local_l_safe,
+      int) {
+    operator()<has_large_surface>(
+        q,
+        k,
+        v,
+        out,
+        row_max,
+        row_sum,
+        blk_qv,
+        batch,
+        blk_k0,
+        blk_k1,
+        blk_k1_causal,
+        thr_id,
+        seq_len,
+        full_tile_offset,
+        blk_local_l_safe);
   }
 };
 
