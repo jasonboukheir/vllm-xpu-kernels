@@ -1695,19 +1695,35 @@ def test_qwen38_gdn_fresh_state_replay_is_exact(num_actual_tokens):
     )
 
 
+@pytest.mark.parametrize(
+    "sequence_lengths,projection_groups",
+    [
+        pytest.param(
+            (162, 107, 104, 131),
+            (0, 1, 2, 3),
+            id="service-short-ragged",
+        ),
+        pytest.param(
+            (127, 4095, 4095, 127),
+            (0, 1, 1, 0),
+            id="service-abba-127-4095",
+        ),
+    ],
+)
 @torch.inference_mode()
-def test_qwen38_gdn_fresh_state_is_batch_separable():
+def test_qwen38_gdn_fresh_state_is_batch_separable(
+        sequence_lengths, projection_groups):
     """One ragged B4 prefill must equal four independent B1 prefills.
 
     The sequence lengths and K16/V48/D128 geometry match the service isolation
     failure. Distinct, poisoned cache slots verify that fresh-state handling
-    neither aliases requests nor reads a prior occupant.
+    neither aliases requests nor reads a prior occupant. The ABBA case also
+    reuses identical projections for each matching fixture pair.
     """
     device = "xpu"
     dtype = torch.bfloat16
     torch.manual_seed(20260830)
 
-    sequence_lengths = (162, 107, 104, 131)
     num_actual_tokens = sum(sequence_lengths)
     num_k_heads, num_v_heads = 16, 48
     head_k_dim = head_v_dim = 128
@@ -1723,10 +1739,26 @@ def test_qwen38_gdn_fresh_state_is_batch_separable():
         2 * head_k_dim
         + head_v_dim * num_v_heads // num_k_heads)
 
-    projected_states_qkvz = torch.randn(
-        (num_actual_tokens, mixed_qkvz_size), dtype=dtype, device=device)
-    projected_states_ba = torch.randn(
-        (num_actual_tokens, mixed_ba_size), dtype=dtype, device=device)
+    def make_projected_states(feature_size):
+        projected = torch.empty(
+            (num_actual_tokens, feature_size), dtype=dtype, device=device)
+        group_slices = {}
+        start = 0
+        for length, group_id in zip(
+                sequence_lengths, projection_groups, strict=True):
+            end = start + length
+            if group_id in group_slices:
+                source_start, source_end = group_slices[group_id]
+                assert source_end - source_start == length
+                projected[start:end].copy_(projected[source_start:source_end])
+            else:
+                projected[start:end].normal_()
+                group_slices[group_id] = (start, end)
+            start = end
+        return projected
+
+    projected_states_qkvz = make_projected_states(mixed_qkvz_size)
+    projected_states_ba = make_projected_states(mixed_ba_size)
     conv_weights = torch.randn(
         (mixed_qkv_size, width), dtype=dtype, device=device)
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
