@@ -2027,7 +2027,7 @@ def test_qwen38_gdn_state_carry_is_exact_on_canonical_boundaries():
 
 @torch.inference_mode()
 def test_qwen38_gdn_cached_decode_is_exact_in_mixed_prefill():
-    """A cached decode must be independent of a fresh prefill peer.
+    """A decode and fresh prefill must be separable in a mixed call.
 
     Production ``split_decodes_and_prefills`` packs the one-token decode first
     and the 127-token fresh prefill second. With no speculative requests,
@@ -2076,7 +2076,7 @@ def test_qwen38_gdn_cached_decode_is_exact_in_mixed_prefill():
 
     def run_non_spec(
             qkvz, ba, query_start_loc, state_ids, has_initial_state,
-            num_prefills, num_decodes):
+            num_prefills, num_decodes, split_mixed_non_spec=False):
         num_actual_tokens = qkvz.shape[0]
         conv_state = initial_conv_state.clone()
         ssm_state = initial_ssm_state.clone()
@@ -2123,13 +2123,28 @@ def test_qwen38_gdn_cached_decode_is_exact_in_mixed_prefill():
             num_actual_tokens=num_actual_tokens,
             tp_size=tp_size,
             reorder_input=True,
+            split_mixed_non_spec=split_mixed_non_spec,
         )
         torch.xpu.synchronize()
         return {
-            "core_attn_out": core_attn_out[0].cpu(),
-            "z": z[0].cpu(),
-            "conv_state": conv_state[decode_state_id].cpu(),
-            "ssm_state": ssm_state[decode_state_id].cpu(),
+            "core_attn_out": core_attn_out.cpu(),
+            "z": z.cpu(),
+            "conv_state": {
+                state_id: conv_state[state_id].cpu()
+                for state_id in state_ids
+            },
+            "ssm_state": {
+                state_id: ssm_state[state_id].cpu()
+                for state_id in state_ids
+            },
+        }
+
+    def request_snapshot(result, token_slice, state_id):
+        return {
+            "core_attn_out": result["core_attn_out"][token_slice],
+            "z": result["z"][token_slice],
+            "conv_state": result["conv_state"][state_id],
+            "ssm_state": result["ssm_state"][state_id],
         }
 
     decode_alone = run_non_spec(
@@ -2141,6 +2156,15 @@ def test_qwen38_gdn_cached_decode_is_exact_in_mixed_prefill():
         num_prefills=0,
         num_decodes=1,
     )
+    prefill_alone = run_non_spec(
+        projected_states_qkvz[1:],
+        projected_states_ba[1:],
+        (0, prefill_tokens),
+        (prefill_state_id, ),
+        (False, ),
+        num_prefills=1,
+        num_decodes=0,
+    )
     decode_with_prefill = run_non_spec(
         projected_states_qkvz,
         projected_states_ba,
@@ -2149,19 +2173,38 @@ def test_qwen38_gdn_cached_decode_is_exact_in_mixed_prefill():
         (True, False),
         num_prefills=1,
         num_decodes=1,
+        split_mixed_non_spec=True,
     )
 
-    for name, expected in decode_alone.items():
-        actual = decode_with_prefill[name]
-        if torch.equal(actual, expected):
-            continue
-        mismatch = actual != expected
-        max_abs_diff = (
-            (actual.float() - expected.float()).abs().max().item())
-        pytest.fail(
-            f"cached decode {name} changed in mixed prefill route: "
-            f"mismatches={mismatch.sum().item()}, "
-            f"max_abs_diff={max_abs_diff}")
+    comparisons = (
+        (
+            "cached decode",
+            request_snapshot(decode_alone, slice(None), decode_state_id),
+            request_snapshot(decode_with_prefill, slice(0, 1),
+                             decode_state_id),
+        ),
+        (
+            "fresh prefill",
+            request_snapshot(prefill_alone, slice(None), prefill_state_id),
+            request_snapshot(decode_with_prefill, slice(1, None),
+                             prefill_state_id),
+        ),
+    )
+    failures = []
+    for request_name, expected_snapshot, actual_snapshot in comparisons:
+        for field_name, expected in expected_snapshot.items():
+            actual = actual_snapshot[field_name]
+            if torch.equal(actual, expected):
+                continue
+            mismatch = actual != expected
+            max_abs_diff = (
+                (actual.float() - expected.float()).abs().max().item())
+            failures.append(
+                f"{request_name} {field_name} changed in mixed route: "
+                f"mismatches={mismatch.sum().item()}, "
+                f"max_abs_diff={max_abs_diff}")
+    if failures:
+        pytest.fail("\n".join(failures))
 
 
 @torch.inference_mode()

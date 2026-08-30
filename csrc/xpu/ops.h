@@ -306,7 +306,8 @@ void gdn_attention(
     const std::optional<torch::Tensor>& num_accepted_tokens,
     const int64_t num_actual_tokens,
     const int64_t tp_size,
-    const bool reorder_input);
+    const bool reorder_input,
+    const bool split_mixed_non_spec);
 #endif
 
 bool is_bmg_g21(int64_t device_index);
