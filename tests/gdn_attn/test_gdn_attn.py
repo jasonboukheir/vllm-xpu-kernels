@@ -1879,8 +1879,7 @@ def test_qwen38_gdn_fresh_state_is_batch_separable(
 
 
 @torch.inference_mode()
-def test_qwen38_gdn_state_carry_is_exact_on_canonical_boundaries(
-        record_property):
+def test_qwen38_gdn_state_carry_is_exact_on_canonical_boundaries():
     """A canonical 64-token split must reproduce a one-shot T=4095 prefill.
 
     The service's 8192-token budget can split two concurrent 4095-token
@@ -2021,10 +2020,6 @@ def test_qwen38_gdn_state_carry_is_exact_on_canonical_boundaries(
             .max()
             .item()
         )
-        record_property(
-            f"noncanonical_{name}_mismatches", mismatch_count)
-        record_property(
-            f"noncanonical_{name}_max_abs_diff", max_abs_diff)
         print(
             f"noncanonical 3970+125 {name}: mismatches={mismatch_count}, "
             f"max_abs_diff={max_abs_diff}")
