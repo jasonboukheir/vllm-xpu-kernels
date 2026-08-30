@@ -1157,7 +1157,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
 
           // Barrier: ensure U_new[dv] is visible across all subgroups
           // before O2U reads it via U_tensor_T.
-          item.barrier(sycl::access::fence_space::local_space);
+          item.barrier(sycl::access::fence_space::global_space);
 
           // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
           gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
@@ -1210,6 +1210,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           copy(copy_S_d, tCrS_d, tCgS_d);
         }
       }
+
+      // Fence global writes before they are consumed later in this work-group.
+      // This orders S for the next chunk and, on the first chunk without an
+      // initial state, O2 before the output GEMM below.
+      item.barrier(sycl::access::fence_space::global_space);
 
       if (!has_prev_state) {
         for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
