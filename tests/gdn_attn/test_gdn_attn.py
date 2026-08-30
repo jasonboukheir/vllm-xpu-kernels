@@ -1337,7 +1337,6 @@ def test_gdn_attention_gqa_ratio3_prefill(dtype, reorder_input):
     mixed_ba_size = num_k_heads * (2 * num_v_heads // num_k_heads)
     mixed_qkv_size = num_k_heads * (
         2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
-
     projected_states_qkvz = torch.randn((num_actual_tokens, mixed_qkvz_size),
                                         dtype=dtype, device=device)
     projected_states_ba = torch.randn((num_actual_tokens, mixed_ba_size),
@@ -1494,7 +1493,7 @@ def test_chunk_prepare_vhead_oob_guard(dtype):
                                rtol=rtol)
 
 
-@pytest.mark.parametrize("num_actual_tokens", [63, 64, 65, 104, 162])
+@pytest.mark.parametrize("num_actual_tokens", [63, 64, 65, 104, 107, 162])
 @torch.inference_mode()
 def test_qwen38_gdn_fresh_state_replay_is_exact(num_actual_tokens):
     """Repeated Qwen3.8 prefills from fresh state must be bitwise stable.
@@ -1694,6 +1693,254 @@ def test_qwen38_gdn_fresh_state_replay_is_exact(num_actual_tokens):
         atol=atol,
         rtol=rtol,
     )
+
+
+@torch.inference_mode()
+def test_qwen38_gdn_t107_async_chain_is_exact():
+    """Queued T=107 fresh-state prefills must remain bitwise repeatable.
+
+    Unlike the synchronized replay test above, this queues independent fused
+    calls without a host barrier between them.  This catches temporary-storage
+    or event-lifetime bugs that only appear while several service-shaped GDN
+    prefills are outstanding on the XPU queue.
+    """
+    device = "xpu"
+    dtype = torch.bfloat16
+    torch.manual_seed(20260829)
+
+    num_actual_tokens = 107
+    num_k_heads, num_v_heads = 16, 48
+    head_k_dim = head_v_dim = 128
+    width, tp_size = 4, 1
+    cache_batch_size, state_id = 4, 3
+    repeats = 24
+
+    mixed_qkvz_size = num_k_heads * (
+        2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
+    mixed_ba_size = 2 * num_v_heads
+    mixed_qkv_size = num_k_heads * (
+        2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
+    gdn_output_size = num_v_heads * head_v_dim
+
+    hidden_size = 5120
+    group_size = 128
+
+    def packed_int4_weight(k, n):
+        packed_bytes = torch.randint(
+            -128,
+            128,
+            (k * n // 2,),
+            dtype=torch.int8,
+            device=device,
+        )
+        weight = packed_bytes.view(torch.int32).reshape(k // 8, n)
+        return weight.transpose(0, 1).contiguous().transpose(0, 1)
+
+    hidden_states = torch.randn(
+        (num_actual_tokens, hidden_size), dtype=dtype, device=device)
+    qkvz_weight = packed_int4_weight(hidden_size, mixed_qkvz_size)
+    qkvz_scales = torch.rand(
+        (hidden_size // group_size, mixed_qkvz_size),
+        dtype=dtype,
+        device=device,
+    ).mul_(0.05)
+    ba_weight = packed_int4_weight(hidden_size, mixed_ba_size)
+    ba_scales = torch.rand(
+        (hidden_size // group_size, mixed_ba_size),
+        dtype=dtype,
+        device=device,
+    ).mul_(0.05)
+    out_weight = packed_int4_weight(gdn_output_size, hidden_size)
+    out_scales = torch.rand(
+        (gdn_output_size // group_size, hidden_size),
+        dtype=dtype,
+        device=device,
+    ).mul_(0.05)
+    zero_points = torch.tensor([8], dtype=torch.int8, device=device)
+    conv_weights = torch.randn(
+        (mixed_qkv_size, width), dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_v_heads, dtype=dtype, device=device)
+    query_start_loc = torch.tensor(
+        [0, num_actual_tokens], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([False], dtype=torch.bool, device=device)
+    state_indices = torch.tensor([state_id], dtype=torch.int32, device=device)
+
+    # Model execution may use a non-default stream. Finish creating the shared
+    # immutable inputs before beginning the deliberately unsynchronized chain.
+    torch.xpu.synchronize()
+    gdn_stream = torch.xpu.Stream()
+    runs = []
+    allocation_anchors = []
+    for repeat in range(repeats):
+        # Keep differently sized allocations live across the chain so each
+        # call gets distinct state/output placement.
+        anchor = torch.empty(
+            ((repeat + 1) * 131071,), dtype=torch.uint8, device=device)
+        anchor.fill_(repeat + 1)
+        allocation_anchors.append(anchor)
+
+        with torch.xpu.stream(gdn_stream):
+            projected_states_qkvz = torch.ops._xpu_C.int4_gemm_w4a16(
+                hidden_states,
+                qkvz_weight,
+                None,
+                qkvz_scales,
+                zero_points,
+                group_size,
+                None,
+            )
+            projected_states_ba = torch.ops._xpu_C.int4_gemm_w4a16(
+                hidden_states,
+                ba_weight,
+                None,
+                ba_scales,
+                zero_points,
+                group_size,
+                None,
+            )
+            conv_state = torch.zeros(
+                (cache_batch_size, width - 1, mixed_qkv_size),
+                dtype=dtype,
+                device=device,
+            )
+            ssm_state = torch.zeros(
+                (cache_batch_size, num_v_heads, head_v_dim, head_k_dim),
+                dtype=dtype,
+                device=device,
+            )
+            core_attn_out = torch.empty(
+                (num_actual_tokens, num_v_heads, head_v_dim),
+                dtype=dtype,
+                device=device,
+            )
+            z = torch.empty_like(core_attn_out)
+
+            torch.ops._xpu_C.gdn_attention(
+                core_attn_out,
+                z,
+                projected_states_qkvz,
+                projected_states_ba,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                conv_weights=conv_weights,
+                conv_bias=None,
+                activation="silu",
+                A_log=A_log,
+                dt_bias=dt_bias,
+                num_prefills=1,
+                num_decodes=0,
+                num_spec_decodes=0,
+                has_initial_state=has_initial_state,
+                non_spec_query_start_loc=query_start_loc,
+                non_spec_token_indx=None,
+                non_spec_state_indices_tensor=state_indices,
+                spec_query_start_loc=None,
+                spec_token_indx=None,
+                spec_state_indices_tensor=None,
+                num_accepted_tokens=None,
+                num_actual_tokens=num_actual_tokens,
+                tp_size=tp_size,
+                reorder_input=True,
+            )
+            gated_output = core_attn_out * F.silu(z)
+            layer_output = torch.ops._xpu_C.int4_gemm_w4a16(
+                gated_output.reshape(num_actual_tokens, gdn_output_size),
+                out_weight,
+                None,
+                out_scales,
+                zero_points,
+                group_size,
+                None,
+            )
+
+        # The fused wrapper releases q/k/v/b/a plus its A/w/u workspaces as it
+        # returns, even though their kernels are asynchronous. Immediately
+        # allocate and write every exact T=107 shape so the caching allocator
+        # cannot avoid this test merely because generic pressure landed in a
+        # different size bin. Keep the replacements live through the chain.
+        padded_tokens = num_actual_tokens + 63
+        released_shape_churn = [
+            torch.empty(
+                (padded_tokens, num_k_heads, head_k_dim),
+                dtype=dtype,
+                device=device,
+            ),
+            torch.empty(
+                (padded_tokens, num_k_heads, head_k_dim),
+                dtype=dtype,
+                device=device,
+            ),
+            torch.empty(
+                (padded_tokens, num_v_heads, head_v_dim),
+                dtype=dtype,
+                device=device,
+            ),
+            torch.empty(
+                (num_v_heads, padded_tokens),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.empty(
+                (num_v_heads, padded_tokens),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.empty(
+                (num_v_heads, padded_tokens, 64),
+                dtype=dtype,
+                device=device,
+            ),
+            torch.empty(
+                (num_v_heads, padded_tokens, head_k_dim),
+                dtype=dtype,
+                device=device,
+            ),
+            torch.empty(
+                (num_v_heads, padded_tokens, head_v_dim),
+                dtype=dtype,
+                device=device,
+            ),
+        ]
+        for tensor in released_shape_churn:
+            tensor.fill_(repeat + 17)
+        allocation_anchors.extend(released_shape_churn)
+
+        runs.append({
+            "core_attn_out": core_attn_out,
+            "z": z,
+            "conv_state": conv_state[state_id],
+            "ssm_state": ssm_state[state_id],
+            "layer_output": layer_output,
+        })
+
+        trailing_pressure = torch.empty(
+            ((repeat % 4 + 1) * 65537,), dtype=torch.uint8, device=device)
+        trailing_pressure.fill_(repeats - repeat)
+        del trailing_pressure
+
+    # This is deliberately the only synchronization in the enqueue chain.
+    torch.xpu.synchronize()
+
+    expected = {name: tensor.cpu() for name, tensor in runs[0].items()}
+    for repeat, run in enumerate(runs[1:], start=1):
+        for name, expected_tensor in expected.items():
+            actual_tensor = run[name].cpu()
+            if torch.equal(actual_tensor, expected_tensor):
+                continue
+            mismatch = actual_tensor != expected_tensor
+            max_abs_diff = (
+                actual_tensor.float() - expected_tensor.float()
+            ).abs().max().item()
+            pytest.fail(
+                f"{name} changed on queued T=107 repeat {repeat}/"
+                f"{repeats - 1}: mismatches={mismatch.sum().item()}, "
+                f"max_abs_diff={max_abs_diff}"
+            )
 
 
 # chunk_update_states_kernel conv_elems guard coverage. When total conv_elems

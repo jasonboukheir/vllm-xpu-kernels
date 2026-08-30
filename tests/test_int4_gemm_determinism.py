@@ -7,13 +7,17 @@ import torch
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 
 
-K = 5120
 GROUP_SIZE = 128
 SHAPES = [
-    pytest.param(1, 8192, id="decode-attention"),
-    pytest.param(162, 8192, id="prefill-attention"),
-    pytest.param(1, 16384, id="decode-gdn-qkvz"),
-    pytest.param(162, 16384, id="prefill-gdn-qkvz"),
+    pytest.param(1, 5120, 8192, id="decode-attention"),
+    pytest.param(162, 5120, 8192, id="prefill-attention"),
+    pytest.param(1, 5120, 16384, id="decode-gdn-qkvz"),
+    pytest.param(162, 5120, 16384, id="prefill-gdn-qkvz"),
+    pytest.param(107, 5120, 16384, id="gdn-qkvz-t107"),
+    pytest.param(107, 5120, 96, id="gdn-ba-t107"),
+    pytest.param(107, 6144, 5120, id="gdn-out-t107"),
+    pytest.param(107, 5120, 34816, id="mlp-gate-up-t107"),
+    pytest.param(107, 17408, 5120, id="mlp-down-t107"),
 ]
 
 
@@ -31,21 +35,21 @@ def _packed_int4_weight(k, n, device):
     return weight.transpose(0, 1).contiguous().transpose(0, 1)
 
 
-@pytest.mark.parametrize("m,n", SHAPES)
+@pytest.mark.parametrize("m,k,n", SHAPES)
 @torch.inference_mode()
-def test_int4_gemm_w4a16_bf16_exact_shape_is_deterministic(m, n):
+def test_int4_gemm_w4a16_bf16_exact_shape_is_deterministic(m, k, n):
     """Production BF16 W4 group-128 GEMMs must be bitwise repeatable."""
     device = "xpu"
     dtype = torch.bfloat16
     torch.manual_seed(20260829 + n + m)
 
-    input_tensor = torch.randn((m, K), dtype=dtype, device=device)
-    weight = _packed_int4_weight(K, n, device)
-    scales = torch.rand((K // GROUP_SIZE, n), dtype=dtype, device=device).mul_(
+    input_tensor = torch.randn((m, k), dtype=dtype, device=device)
+    weight = _packed_int4_weight(k, n, device)
+    scales = torch.rand((k // GROUP_SIZE, n), dtype=dtype, device=device).mul_(
         0.05
     )
     decoy_input = torch.randn_like(input_tensor)
-    decoy_weight = _packed_int4_weight(K, n, device)
+    decoy_weight = _packed_int4_weight(k, n, device)
     decoy_scales = torch.rand_like(scales).mul_(0.05)
     # compressed-tensors symmetric INT4 uses a scalar packed-domain zero point.
     zero_points = torch.tensor([8], dtype=torch.int8, device=device)
@@ -95,7 +99,7 @@ def test_int4_gemm_w4a16_bf16_exact_shape_is_deterministic(m, n):
                 (snapshot.float() - expected.float()).abs().max().item()
             )
             pytest.fail(
-                f"BF16 W4 GEMM changed at M={m}, N={n}, K={K}, "
+                f"BF16 W4 GEMM changed at M={m}, N={n}, K={k}, "
                 f"repeat={repeat}: mismatches={mismatch.sum().item()}, "
                 f"max_abs_diff={max_abs_diff}"
             )
