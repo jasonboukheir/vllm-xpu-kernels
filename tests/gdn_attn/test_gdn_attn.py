@@ -1494,6 +1494,208 @@ def test_chunk_prepare_vhead_oob_guard(dtype):
                                rtol=rtol)
 
 
+@pytest.mark.parametrize("num_actual_tokens", [63, 64, 65, 104, 162])
+@torch.inference_mode()
+def test_qwen38_gdn_fresh_state_replay_is_exact(num_actual_tokens):
+    """Repeated Qwen3.8 prefills from fresh state must be bitwise stable.
+
+    Qwen3.8-27B uses K16/V48/D128 GDN at TP1.  The XE2 prefill kernel has a
+    64-token chunk, so 63/64 bracket the single-chunk path while 65/104/162
+    exercise state hand-off between chunks.  Each invocation receives the
+    same inputs and independently zeroed recurrent state, matching a new
+    request with prefix caching disabled.
+    """
+    device = "xpu"
+    dtype = torch.bfloat16
+    torch.manual_seed(20260829)
+
+    num_k_heads, num_v_heads = 16, 48
+    head_k_dim = head_v_dim = 128
+    width, tp_size = 4, 1
+    cache_batch_size, state_id = 4, 3
+    repeats_per_pattern = 20
+    poison_patterns = (0.0, 3.25, -1.75)
+
+    mixed_qkvz_size = num_k_heads * (
+        2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
+    mixed_ba_size = 2 * num_v_heads
+    mixed_qkv_size = num_k_heads * (
+        2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
+
+    projected_states_qkvz = torch.randn(
+        (num_actual_tokens, mixed_qkvz_size), dtype=dtype, device=device)
+    projected_states_ba = torch.randn(
+        (num_actual_tokens, mixed_ba_size), dtype=dtype, device=device)
+    initial_conv_state = torch.zeros(
+        (cache_batch_size, width - 1, mixed_qkv_size),
+        dtype=dtype,
+        device=device,
+    )
+    initial_ssm_state = torch.zeros(
+        (cache_batch_size, num_v_heads, head_v_dim, head_k_dim),
+        dtype=dtype,
+        device=device,
+    )
+    conv_weights = torch.randn(
+        (mixed_qkv_size, width), dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_v_heads, dtype=dtype, device=device)
+    query_start_loc = torch.tensor(
+        [0, num_actual_tokens], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([False], dtype=torch.bool, device=device)
+    state_indices = torch.tensor([state_id], dtype=torch.int32, device=device)
+
+    def run_once(poison, allocator_perturbation=0):
+        # Rotate a small temporary allocation between invocations so the
+        # fused op's internal A/w/u workspaces are not guaranteed to recycle
+        # the same addresses every time.
+        if allocator_perturbation:
+            pressure = torch.empty(
+                (allocator_perturbation, 131072), dtype=dtype, device=device)
+            pressure.fill_(allocator_perturbation)
+            del pressure
+        conv_state = initial_conv_state.clone()
+        ssm_state = initial_ssm_state.clone()
+        conv_state[state_id].fill_(poison)
+        ssm_state[state_id].fill_(poison)
+        core_attn_out = torch.zeros(
+            (num_actual_tokens, num_v_heads, head_v_dim),
+            dtype=dtype,
+            device=device,
+        )
+        z = torch.empty_like(core_attn_out)
+        torch.ops._xpu_C.gdn_attention(
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            conv_weights=conv_weights,
+            conv_bias=None,
+            activation="silu",
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_prefills=1,
+            num_decodes=0,
+            num_spec_decodes=0,
+            has_initial_state=has_initial_state,
+            non_spec_query_start_loc=query_start_loc,
+            non_spec_token_indx=None,
+            non_spec_state_indices_tensor=state_indices,
+            spec_query_start_loc=None,
+            spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            num_accepted_tokens=None,
+            num_actual_tokens=num_actual_tokens,
+            tp_size=tp_size,
+            reorder_input=True,
+        )
+        torch.xpu.synchronize()
+        return {
+            "core_attn_out": core_attn_out.cpu(),
+            "z": z.cpu(),
+            "conv_state": conv_state[state_id].cpu(),
+            "ssm_state": ssm_state[state_id].cpu(),
+        }
+
+    def assert_snapshot_equal(expected, actual, context):
+        for name, expected_tensor in expected.items():
+            actual_tensor = actual[name]
+            if torch.equal(actual_tensor, expected_tensor):
+                continue
+            mismatch = actual_tensor != expected_tensor
+            max_abs_diff = (actual_tensor.float() -
+                            expected_tensor.float()).abs().max().item()
+            pytest.fail(
+                f"{name} changed {context} at T={num_actual_tokens}: "
+                f"mismatches={mismatch.sum().item()}, "
+                f"max_abs_diff={max_abs_diff}"
+            )
+
+    zero_state_expected = None
+    for poison in poison_patterns:
+        expected = run_once(poison)
+        for repeat in range(1, repeats_per_pattern):
+            actual = run_once(poison, allocator_perturbation=1 + repeat % 8)
+            assert_snapshot_equal(
+                expected,
+                actual,
+                f"on same-poison repeat {repeat}/{repeats_per_pattern - 1} "
+                f"(poison={poison})",
+            )
+        if zero_state_expected is None:
+            zero_state_expected = expected
+        else:
+            assert_snapshot_equal(
+                zero_state_expected,
+                expected,
+                f"when fresh state poison changed from 0.0 to {poison}",
+            )
+
+    if num_actual_tokens <= 64:
+        return
+
+    ref_core_attn_out = torch.zeros(
+        (num_actual_tokens, num_v_heads, head_v_dim),
+        dtype=dtype,
+        device=device,
+    )
+    ref_z = torch.empty_like(ref_core_attn_out)
+    ref_conv_state = initial_conv_state.clone()
+    ref_ssm_state = initial_ssm_state.clone()
+    ref_gdn_attention(
+        ref_core_attn_out,
+        ref_z,
+        projected_states_qkvz,
+        projected_states_ba,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        conv_state=ref_conv_state,
+        ssm_state=ref_ssm_state,
+        conv_weights=conv_weights,
+        conv_bias=None,
+        activation="silu",
+        A_log=A_log,
+        dt_bias=dt_bias,
+        num_prefills=1,
+        num_decodes=0,
+        has_initial_state=has_initial_state,
+        non_spec_query_start_loc=query_start_loc,
+        non_spec_state_indices_tensor=state_indices,
+        num_actual_tokens=num_actual_tokens,
+        tp_size=tp_size,
+        reorder_input=True,
+    )
+    atol = rtol = 5e-2
+    torch.testing.assert_close(
+        zero_state_expected["core_attn_out"],
+        ref_core_attn_out.cpu(),
+        atol=atol,
+        rtol=rtol,
+    )
+    torch.testing.assert_close(
+        zero_state_expected["z"], ref_z.cpu(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(
+        zero_state_expected["conv_state"],
+        ref_conv_state[state_id].cpu(),
+        atol=atol,
+        rtol=rtol,
+    )
+    torch.testing.assert_close(
+        zero_state_expected["ssm_state"],
+        ref_ssm_state[state_id].cpu(),
+        atol=atol,
+        rtol=rtol,
+    )
+
+
 # chunk_update_states_kernel conv_elems guard coverage. When total conv_elems
 # is not a multiple of elems_per_group (1024), the last work-group is 
 # over-provisioned and requires an upper bound check to prevent out-of-bounds
