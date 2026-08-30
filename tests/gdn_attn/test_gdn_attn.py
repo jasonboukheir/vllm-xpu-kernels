@@ -1696,6 +1696,157 @@ def test_qwen38_gdn_fresh_state_replay_is_exact(num_actual_tokens):
 
 
 @torch.inference_mode()
+def test_qwen38_gdn_fresh_state_is_batch_separable():
+    """One ragged B4 prefill must equal four independent B1 prefills.
+
+    The sequence lengths and K16/V48/D128 geometry match the service isolation
+    failure. Distinct, poisoned cache slots verify that fresh-state handling
+    neither aliases requests nor reads a prior occupant.
+    """
+    device = "xpu"
+    dtype = torch.bfloat16
+    torch.manual_seed(20260830)
+
+    sequence_lengths = (162, 107, 104, 131)
+    num_actual_tokens = sum(sequence_lengths)
+    num_k_heads, num_v_heads = 16, 48
+    head_k_dim = head_v_dim = 128
+    width, tp_size = 4, 1
+    cache_batch_size = 5
+    state_indices_list = (4, 1, 3, 2)
+
+    mixed_qkvz_size = num_k_heads * (
+        2 * head_k_dim
+        + 2 * head_v_dim * num_v_heads // num_k_heads)
+    mixed_ba_size = 2 * num_v_heads
+    mixed_qkv_size = num_k_heads * (
+        2 * head_k_dim
+        + head_v_dim * num_v_heads // num_k_heads)
+
+    projected_states_qkvz = torch.randn(
+        (num_actual_tokens, mixed_qkvz_size), dtype=dtype, device=device)
+    projected_states_ba = torch.randn(
+        (num_actual_tokens, mixed_ba_size), dtype=dtype, device=device)
+    conv_weights = torch.randn(
+        (mixed_qkv_size, width), dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_v_heads, dtype=dtype, device=device)
+
+    initial_conv_state = torch.empty(
+        (cache_batch_size, width - 1, mixed_qkv_size),
+        dtype=dtype,
+        device=device,
+    )
+    initial_ssm_state = torch.empty(
+        (cache_batch_size, num_v_heads, head_v_dim, head_k_dim),
+        dtype=dtype,
+        device=device,
+    )
+    for state_id in range(cache_batch_size):
+        poison = float(state_id - 2)
+        initial_conv_state[state_id].fill_(poison)
+        initial_ssm_state[state_id].fill_(poison)
+
+    def run_prefill(lengths, state_ids, qkvz, ba):
+        total_tokens = sum(lengths)
+        query_start_loc = torch.tensor(
+            [0, *list(torch.tensor(lengths).cumsum(0).tolist())],
+            dtype=torch.int32,
+            device=device,
+        )
+        state_indices = torch.tensor(
+            state_ids, dtype=torch.int32, device=device)
+        has_initial_state = torch.zeros(
+            len(lengths), dtype=torch.bool, device=device)
+        conv_state = initial_conv_state.clone()
+        ssm_state = initial_ssm_state.clone()
+        core_attn_out = torch.zeros(
+            (total_tokens, num_v_heads, head_v_dim),
+            dtype=dtype,
+            device=device,
+        )
+        z = torch.empty_like(core_attn_out)
+
+        torch.ops._xpu_C.gdn_attention(
+            core_attn_out,
+            z,
+            qkvz,
+            ba,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            conv_weights=conv_weights,
+            conv_bias=None,
+            activation="silu",
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_prefills=len(lengths),
+            num_decodes=0,
+            num_spec_decodes=0,
+            has_initial_state=has_initial_state,
+            non_spec_query_start_loc=query_start_loc,
+            non_spec_token_indx=None,
+            non_spec_state_indices_tensor=state_indices,
+            spec_query_start_loc=None,
+            spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            num_accepted_tokens=None,
+            num_actual_tokens=total_tokens,
+            tp_size=tp_size,
+            reorder_input=True,
+        )
+        torch.xpu.synchronize()
+        return {
+            "core_attn_out": core_attn_out.cpu(),
+            "z": z.cpu(),
+            "conv_states": conv_state[state_indices].cpu(),
+            "ssm_states": ssm_state[state_indices].cpu(),
+        }
+
+    batched = run_prefill(
+        sequence_lengths,
+        state_indices_list,
+        projected_states_qkvz,
+        projected_states_ba,
+    )
+    independent = {
+        "core_attn_out": [],
+        "z": [],
+        "conv_states": [],
+        "ssm_states": [],
+    }
+    start = 0
+    for length, state_id in zip(
+            sequence_lengths, state_indices_list, strict=True):
+        end = start + length
+        snapshot = run_prefill(
+            (length, ),
+            (state_id, ),
+            projected_states_qkvz[start:end],
+            projected_states_ba[start:end],
+        )
+        for name, tensors in independent.items():
+            tensors.append(snapshot[name])
+        start = end
+
+    for name, tensors in independent.items():
+        expected = torch.cat(tensors)
+        actual = batched[name]
+        if torch.equal(actual, expected):
+            continue
+        mismatch = actual != expected
+        max_abs_diff = (
+            (actual.float() - expected.float()).abs().max().item())
+        pytest.fail(
+            f"GDN {name} is not batch-separable: "
+            f"mismatches={mismatch.sum().item()}, "
+            f"max_abs_diff={max_abs_diff}")
+
+
+@torch.inference_mode()
 def test_qwen38_gdn_t107_async_chain_is_exact():
     """Queued T=107 fresh-state prefills must remain bitwise repeatable.
 
