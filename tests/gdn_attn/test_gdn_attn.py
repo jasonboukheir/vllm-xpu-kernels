@@ -1879,6 +1879,158 @@ def test_qwen38_gdn_fresh_state_is_batch_separable(
 
 
 @torch.inference_mode()
+def test_qwen38_gdn_state_carry_is_exact_on_canonical_boundaries(
+        record_property):
+    """A canonical 64-token split must reproduce a one-shot T=4095 prefill.
+
+    The service's 8192-token budget can split two concurrent 4095-token
+    prompts at 3970. GDN processes prefill in 64-token chunks, so the scheduler
+    fix instead stops at absolute token 3968 and carries recurrent state into
+    the final 127 tokens. The non-canonical 3970+125 result is diagnostic only.
+    """
+    device = "xpu"
+    dtype = torch.bfloat16
+    torch.manual_seed(20260830)
+
+    num_actual_tokens = 4095
+    num_k_heads, num_v_heads = 16, 48
+    head_k_dim = head_v_dim = 128
+    width, tp_size = 4, 1
+    cache_batch_size, state_id = 3, 2
+
+    mixed_qkvz_size = num_k_heads * (
+        2 * head_k_dim
+        + 2 * head_v_dim * num_v_heads // num_k_heads)
+    mixed_ba_size = 2 * num_v_heads
+    mixed_qkv_size = num_k_heads * (
+        2 * head_k_dim
+        + head_v_dim * num_v_heads // num_k_heads)
+
+    projected_states_qkvz = torch.randn(
+        (num_actual_tokens, mixed_qkvz_size), dtype=dtype, device=device)
+    projected_states_ba = torch.randn(
+        (num_actual_tokens, mixed_ba_size), dtype=dtype, device=device)
+    conv_weights = torch.randn(
+        (mixed_qkv_size, width), dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_v_heads, dtype=dtype, device=device)
+
+    initial_conv_state = torch.full(
+        (cache_batch_size, width - 1, mixed_qkv_size),
+        7.0,
+        dtype=dtype,
+        device=device,
+    )
+    initial_ssm_state = torch.full(
+        (cache_batch_size, num_v_heads, head_v_dim, head_k_dim),
+        -3.0,
+        dtype=torch.float32,
+        device=device,
+    )
+    state_indices = torch.tensor(
+        [state_id], dtype=torch.int32, device=device)
+
+    def run_partitioned(chunk_lengths):
+        assert sum(chunk_lengths) == num_actual_tokens
+        conv_state = initial_conv_state.clone()
+        ssm_state = initial_ssm_state.clone()
+        core_attn_out = torch.empty(
+            (num_actual_tokens, num_v_heads, head_v_dim),
+            dtype=dtype,
+            device=device,
+        )
+        z = torch.empty_like(core_attn_out)
+
+        start = 0
+        for chunk_index, chunk_length in enumerate(chunk_lengths):
+            end = start + chunk_length
+            query_start_loc = torch.tensor(
+                [0, chunk_length], dtype=torch.int32, device=device)
+            has_initial_state = torch.tensor(
+                [chunk_index > 0], dtype=torch.bool, device=device)
+            torch.ops._xpu_C.gdn_attention(
+                core_attn_out[start:end],
+                z[start:end],
+                projected_states_qkvz[start:end],
+                projected_states_ba[start:end],
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                conv_weights=conv_weights,
+                conv_bias=None,
+                activation="silu",
+                A_log=A_log,
+                dt_bias=dt_bias,
+                num_prefills=1,
+                num_decodes=0,
+                num_spec_decodes=0,
+                has_initial_state=has_initial_state,
+                non_spec_query_start_loc=query_start_loc,
+                non_spec_token_indx=None,
+                non_spec_state_indices_tensor=state_indices,
+                spec_query_start_loc=None,
+                spec_token_indx=None,
+                spec_state_indices_tensor=None,
+                num_accepted_tokens=None,
+                num_actual_tokens=chunk_length,
+                tp_size=tp_size,
+                reorder_input=True,
+            )
+            start = end
+
+        torch.xpu.synchronize()
+        return {
+            "core_attn_out": core_attn_out.cpu(),
+            "z": z.cpu(),
+            "conv_state": conv_state[state_id].cpu(),
+            "ssm_state": ssm_state[state_id].cpu(),
+        }
+
+    def assert_snapshot_equal(expected, actual, partition):
+        for name, expected_tensor in expected.items():
+            actual_tensor = actual[name]
+            if torch.equal(actual_tensor, expected_tensor):
+                continue
+            mismatch = actual_tensor != expected_tensor
+            max_abs_diff = (
+                (actual_tensor.float() - expected_tensor.float())
+                .abs()
+                .max()
+                .item()
+            )
+            pytest.fail(
+                f"GDN {name} changed for partition {partition}: "
+                f"mismatches={mismatch.sum().item()}, "
+                f"max_abs_diff={max_abs_diff}")
+
+    one_shot = run_partitioned((num_actual_tokens, ))
+    canonical = run_partitioned((3968, 127))
+    assert_snapshot_equal(one_shot, canonical, "3968+127")
+    del canonical
+
+    noncanonical = run_partitioned((3970, 125))
+    for name, expected_tensor in one_shot.items():
+        actual_tensor = noncanonical[name]
+        mismatch_count = (actual_tensor != expected_tensor).sum().item()
+        max_abs_diff = (
+            (actual_tensor.float() - expected_tensor.float())
+            .abs()
+            .max()
+            .item()
+        )
+        record_property(
+            f"noncanonical_{name}_mismatches", mismatch_count)
+        record_property(
+            f"noncanonical_{name}_max_abs_diff", max_abs_diff)
+        print(
+            f"noncanonical 3970+125 {name}: mismatches={mismatch_count}, "
+            f"max_abs_diff={max_abs_diff}")
+
+
+@torch.inference_mode()
 def test_qwen38_gdn_t107_async_chain_is_exact():
     """Queued T=107 fresh-state prefills must remain bitwise repeatable.
 
