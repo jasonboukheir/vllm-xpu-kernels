@@ -476,6 +476,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
         reorder(tQrQ, tSrQ);
         using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
+        static_assert(KDimFragment{}.size() == 4);
         KDimFragment k_dim_scale;
         if (slot < 0) {
           int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
@@ -501,9 +502,21 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         loader.fill_k_fragment(
             tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
         if (slot < 0) {
+          // k_dim_scale is owned like the MMA-A (Q) fragment: lane `l`
+          // holds dimensions l, l+16, l+32, and l+48.  The MMA-B (K)
+          // fragment has different lane ownership, so CUTE's fragment-local
+          // broadcast cannot be used between them.  Select the scale from
+          // the lane which owns the K fragment's actual dimension instead.
+          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+          int const lane = subgroup.get_local_id()[0];
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrK.size(); ++i) {
-            float const dim_scale = broadcast<1>(k_dim_scale, tSrK, i);
+            auto coord = tSrK.tv_layout()(lane, i);
+            int const dim = int(get<1>(coord));
+            float const dim_scale = sycl::select_from_group(
+                subgroup,
+                static_cast<float>(k_dim_scale(dim / intel::sg_size)),
+                dim % intel::sg_size);
             tSrK(i) = static_cast<typename decltype(tSrK)::value_type>(
                 static_cast<float>(tSrK(i)) * dim_scale);
           }
