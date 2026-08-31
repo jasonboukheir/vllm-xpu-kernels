@@ -8,6 +8,7 @@ testing an older installed package during local source-override iteration.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -396,6 +397,58 @@ def test_kvarn_dpas_fragment_coordinate_tables_are_bijections() -> None:
     )
     torch.testing.assert_close(k_coords, frozen_k, rtol=0, atol=0)
     torch.testing.assert_close(v_coords, frozen_v, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dpas_layout", [False, True])
+def test_k_column_scale_reaches_every_token_subgroup(
+        monkeypatch: pytest.MonkeyPatch, dpas_layout: bool) -> None:
+    """Catch mixing MMA-A scale ownership with MMA-B cache fragments."""
+    if dpas_layout:
+        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+    else:
+        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "1")
+
+    layout = KVarNLayout(record_stride=35072)
+    cache = torch.zeros((2, 4, layout.tile_bytes_aligned), dtype=torch.uint8)
+    cache[:, :, :layout.k_packed_bytes] = 0x11
+    ones_d = torch.ones(layout.head_dim)
+    ones_g = torch.ones(layout.group)
+    for block in range(2):
+        for head in range(4):
+            record = cache[block, head]
+            k_column_scale = ones_d.clone()
+            if block == 1:
+                k_column_scale[0] = 5.0
+            _put_half(record, layout.k_s_col_offset, k_column_scale)
+            _put_half(record, layout.k_s_row_offset, ones_g)
+            _put_half(record, layout.v_s_col_offset, ones_d)
+            _put_half(record, layout.v_s_row_offset, ones_g)
+            _put_half(record, layout.v_zp_offset,
+                      torch.full((layout.group,), float(block)))
+
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    query[:, :, 0] = 16.0
+    output = torch.full_like(query, float("nan"))
+    tail_key, tail_value = _tail_tensors()
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        query,
+        cache.xpu(),
+        torch.tensor([[0, 1]], dtype=torch.int32, device="xpu"),
+        torch.tensor([256], dtype=torch.int32, device="xpu"),
+        torch.full((2,), -1, dtype=torch.int32, device="xpu"),
+        tail_key,
+        tail_value,
+        output,
+        256,
+        1.0 / 16.0,
+    )
+
+    # Page 0 has logit 1 and value 0; page 1 has logit 5 and value 1.
+    # Each page contributes 128 tokens, so every output is sigmoid(4).
+    expected = torch.full_like(output.cpu(), torch.sigmoid(torch.tensor(4.0)))
+    torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-3)
+    assert torch.isfinite(output).all()
 
 
 def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
@@ -803,10 +856,48 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         tail_value,
     )
 
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, output, max(seq_lengths), 1.0 / 16.0)
+    temp_output = torch.full(
+        (4, 24 * splits, 256),
+        float("nan"),
+        dtype=torch.float16,
+        device="xpu",
+    )
+    exp_sums = torch.full((4, 24, splits),
+                          float("nan"),
+                          dtype=torch.float32,
+                          device="xpu")
+    max_logits = torch.full_like(exp_sums, float("nan"))
+    torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+        *arguments,
+        temp_output,
+        exp_sums,
+        max_logits,
+        output,
+        max(seq_lengths),
+        1.0 / 16.0,
+    )
     torch.ops._vllm_fa2_C.kvarn_decode(
         *arguments, repeat, max(seq_lengths), 1.0 / 16.0)
+    if splits > 1:
+        kv_tiles = max(seq_lengths) // 64
+        tiles_per_split = (kv_tiles + splits - 1) // splits
+        target_split = (kv_tiles - 2) // tiles_per_split
+        split_start = target_split * tiles_per_split
+        split_end = min(split_start + tiles_per_split, kv_tiles)
+        expected_exp_sum = 128 + (
+            (split_end - split_start) * 64 - 128) * math.exp(-8.0)
+        torch.testing.assert_close(
+            exp_sums[0, :, target_split].cpu(),
+            torch.full((24,), expected_exp_sum),
+            atol=2e-2,
+            rtol=2e-4,
+        )
+        torch.testing.assert_close(
+            max_logits[0, :, target_split].cpu(),
+            torch.full((24,), 9.0 * math.log2(math.e)),
+            atol=1e-4,
+            rtol=1e-4,
+        )
     expected_rows = [
         _long_structured_expected(
             page_rows[row], seq_len, page_scores[:, row], value_rows)
