@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <c10/xpu/XPUCachingAllocator.h>
 #include <sycl/sycl.hpp>
 #include <torch/all.h>
 
@@ -1633,18 +1632,6 @@ void chunk_gated_delta_rule_impl_xe2(
         "core_attn_out dtype must be float16/bfloat16, but got ",
         core_attn_out.scalar_type());
   }
-
-  // A, w, and u are function-local scratch tensors, but the final SYCL
-  // kernel consumes them asynchronously after this function returns. Record
-  // that use with the XPU allocator so their storage cannot be recycled until
-  // the current stream has completed the queued pipeline.
-  const auto current_stream = c10::xpu::getCurrentXPUStream(device.index());
-  c10::xpu::XPUCachingAllocator::recordStream(
-      A.storage().data_ptr(), current_stream);
-  c10::xpu::XPUCachingAllocator::recordStream(
-      w.storage().data_ptr(), current_stream);
-  c10::xpu::XPUCachingAllocator::recordStream(
-      u.storage().data_ptr(), current_stream);
 
 #undef DISPATCH_STATE_DTYPE
 #undef KERNEL_LAUNCHER
