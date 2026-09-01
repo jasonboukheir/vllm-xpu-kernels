@@ -343,6 +343,28 @@ class XeFMHAFwdSplitKVKernel {
           make_shape(head_group_q, num_kv_splits, s.num_heads_kv, batch_dim);
       auto shape_sink = make_shape(s.num_heads_kv, head_group_q);
 
+      // KVarN's specialized reducers use exp_sums as the sole validity
+      // contract. Publish an invalid sentinel from the producer workgroup
+      // before any row-local scheduling branch can skip an empty split. The
+      // same row work-item overwrites these values in the epilogue for a
+      // non-empty split, so this needs neither another kernel launch nor a
+      // workgroup barrier. Partial output may remain untouched: reducers must
+      // not read it unless the corresponding exp_sum is positive.
+      if constexpr (CollectiveMainloop::InitializeSplitScratchSentinels) {
+        constexpr int q_tile_rows = cute::size<0>(TileShapeO{});
+        int const q_row = blk_q * q_tile_rows + thr_id;
+        if (num_kv_splits > 1 && q_row < head_group_q) {
+          int const query_head = head * head_group_q + q_row;
+          int const stats_batch = is_var_len ? 0 : idx_b;
+          int const packed_stats_offset =
+              (stats_batch * s.num_heads_q + query_head) * num_kv_splits +
+              idx_kv_split;
+          p.exp_sums[offset_exp_sums + packed_stats_offset] = ElementLSE(0);
+          p.max_logits[offset_max_logits + packed_stats_offset] =
+              ElementLSE(-INFINITY);
+        }
+      }
+
       int kv_split_offset;
       int num_effective_kv_blocks;
       int seq_num_kv_splits;
@@ -835,11 +857,17 @@ class ReduceSplitK {
           ElementLSE rescale =
               sycl::native::exp2(local_max_logit - global_max_logits);
 
-          // Partial outputs are unnormalized (not divided by exp_sum in the
-          // epilogue), so combine them directly with the rescale factor.
           ElementLSE o_accum_val = static_cast<ElementLSE>(
               Oaccum(seq_idx, idx, i * num_heads_q + head_q, l_coord));
-          acc += o_accum_val * rescale;
+          if constexpr (FMHAKernel_::CollectiveMainloop::
+                            NormalizeSplitPartialOutput) {
+            // This specialized producer stores a bounded normalized partial
+            // to avoid fp16 overflow. Restore its local softmax weight here.
+            acc += o_accum_val * local_exp_sum * rescale;
+          } else {
+            // Generic producers store the unnormalized numerator.
+            acc += o_accum_val * rescale;
+          }
 
           // update global exp sum
           global_exp_sums += local_exp_sum * rescale;

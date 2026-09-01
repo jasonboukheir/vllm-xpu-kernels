@@ -15,7 +15,8 @@ void kvarn_decode_xe2(
     const at::Tensor& tail_value,
     at::Tensor& output,
     int64_t max_seq_len,
-    double softmax_scale);
+    double softmax_scale,
+    bool unrotate_output);
 
 void kvarn_decode_with_scratch_xe2(
     const at::Tensor& query,
@@ -30,7 +31,8 @@ void kvarn_decode_with_scratch_xe2(
     at::Tensor& max_logits,
     at::Tensor& output,
     int64_t max_seq_len,
-    double softmax_scale);
+    double softmax_scale,
+    bool unrotate_output);
 
 void kvarn_materialize_packed_kv_xe2(
     const at::Tensor& packed_cache,

@@ -335,6 +335,11 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool PagedKV = true;
   static constexpr bool CausalMask = false;
   static constexpr bool LocalMask = false;
+  static constexpr bool InitializeSplitScratchSentinels = true;
+  // An unnormalized split numerator can exceed fp16 at long context (split-4
+  // reaches 65,536 tokens). Store the bounded normalized partial instead;
+  // KVarN reducers multiply it by the producer-written exp_sum.
+  static constexpr bool NormalizeSplitPartialOutput = true;
 
   struct Arguments {
     typename Base::Arguments base;

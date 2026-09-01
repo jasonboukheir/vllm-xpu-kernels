@@ -26,6 +26,7 @@ class KVarNHadamardScatterKernel {
       sycl::half* tail_value,
       int64_t tokens,
       int64_t lookup_size,
+      int64_t pool_size,
       int64_t key_token_stride,
       int64_t key_head_stride,
       int64_t value_token_stride,
@@ -41,6 +42,7 @@ class KVarNHadamardScatterKernel {
         tail_value_(tail_value),
         tokens_(tokens),
         lookup_size_(lookup_size),
+        pool_size_(pool_size),
         key_token_stride_(key_token_stride),
         key_head_stride_(key_head_stride),
         value_token_stride_(value_token_stride),
@@ -64,7 +66,7 @@ class KVarNHadamardScatterKernel {
     const int64_t block = logical_slot / group;
     if (block < 0 || block >= lookup_size_) return;
     const int32_t pool_slot = block_to_slot_[block];
-    if (pool_slot < 0) return;
+    if (pool_slot < 0 || pool_slot >= pool_size_) return;
     const int64_t position = logical_slot % group;
 
     const input_t* src =
@@ -123,6 +125,7 @@ class KVarNHadamardScatterKernel {
   sycl::half* tail_value_;
   int64_t tokens_;
   int64_t lookup_size_;
+  int64_t pool_size_;
   int64_t key_token_stride_;
   int64_t key_head_stride_;
   int64_t value_token_stride_;
@@ -205,6 +208,7 @@ void kvarn_hadamard_scatter_xe2(
               reinterpret_cast<sycl::half*>(tail_value.data_ptr<at::Half>()),
               key.size(0),
               block_to_slot.numel(),
+              tail_key.size(0),
               key.stride(0),
               key.stride(1),
               value.stride(0),
