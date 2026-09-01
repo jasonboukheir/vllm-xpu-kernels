@@ -28,8 +28,7 @@ constexpr int kRecordBytes = kVZpOffset + kGroup * 2;
 
 int native_split_count(int64_t max_seq_len) {
   auto const* value = std::getenv("KVARN_NATIVE_XPU_SPLITS");
-  if (value == nullptr) return 1;
-  int splits = std::atoi(value);
+  int splits = value == nullptr ? 16 : std::atoi(value);
   TORCH_CHECK(
       splits == 1 || splits == 2 || splits == 4 || splits == 8 ||
           splits == 16 || splits == 17 || splits == 24 || splits == 32,
@@ -107,7 +106,8 @@ void kvarn_decode_with_scratch_xe2(
     at::Tensor& max_logits,
     at::Tensor& output,
     int64_t max_seq_len,
-    double softmax_scale) {
+    double softmax_scale,
+    bool unrotate_output) {
   check_xpu(query, "query");
   check_xpu(packed_cache, "packed_cache");
   check_xpu(block_table, "block_table");
@@ -233,20 +233,33 @@ void kvarn_decode_with_scratch_xe2(
       kVZpOffset};
   int const num_kv_splits = native_split_count(max_seq_len);
   TORCH_CHECK(
+      !unrotate_output || num_kv_splits > 1,
+      "unrotate_output requires a multi-split KVarN decode");
+  // Multi-split reducers index caller-owned scratch with raw packed strides,
+  // so an oversized split dimension would silently change every following
+  // row's address. The one-split direct-output path does not consume scratch
+  // and may safely reuse the service's larger persistent allocation.
+  bool const temp_split_extent_valid =
+      temp_output.dim() == 3 &&
+      (num_kv_splits == 1 ? temp_output.size(1) >= kQueryHeads
+                          : temp_output.size(1) == kQueryHeads * num_kv_splits);
+  TORCH_CHECK(
       temp_output.scalar_type() == at::kHalf && temp_output.dim() == 3 &&
-          temp_output.size(0) == batch &&
-          temp_output.size(1) >= kQueryHeads * num_kv_splits &&
+          temp_output.size(0) == batch && temp_split_extent_valid &&
           temp_output.size(2) == kHeadDim && temp_output.is_contiguous(),
       "temp_output must be contiguous fp16 [B, ",
       kQueryHeads * num_kv_splits,
       ", 256] for the configured split count");
+  bool const stats_split_extent_valid =
+      exp_sums.dim() == 3 &&
+      (num_kv_splits == 1 ? exp_sums.size(2) >= 1
+                          : exp_sums.size(2) == num_kv_splits);
   TORCH_CHECK(
       exp_sums.scalar_type() == at::kFloat &&
           max_logits.scalar_type() == at::kFloat && exp_sums.dim() == 3 &&
           exp_sums.sizes() == max_logits.sizes() && exp_sums.size(0) == batch &&
-          exp_sums.size(1) == kQueryHeads &&
-          exp_sums.size(2) >= num_kv_splits && exp_sums.is_contiguous() &&
-          max_logits.is_contiguous(),
+          exp_sums.size(1) == kQueryHeads && stats_split_extent_valid &&
+          exp_sums.is_contiguous() && max_logits.is_contiguous(),
       "exp_sums and max_logits must be contiguous fp32 [B, 24, ",
       num_kv_splits,
       "] for the configured split count");
@@ -273,6 +286,7 @@ void kvarn_decode_with_scratch_xe2(
       static_cast<int>(block_table.size(1)),
       num_kv_splits,
       static_cast<float>(softmax_scale),
+      unrotate_output,
       layout};
 
   args.exp_sums = exp_sums.data_ptr<float>();
@@ -297,7 +311,8 @@ void kvarn_decode_xe2(
     const at::Tensor& tail_value,
     at::Tensor& output,
     int64_t max_seq_len,
-    double softmax_scale) {
+    double softmax_scale,
+    bool unrotate_output) {
   int const num_kv_splits = native_split_count(max_seq_len);
   int64_t const batch = query.size(0);
   auto temp_output = at::empty(
@@ -320,7 +335,8 @@ void kvarn_decode_xe2(
       max_logits,
       output,
       max_seq_len,
-      softmax_scale);
+      softmax_scale,
+      unrotate_output);
 
   // Multi-split decode consumes these function-local tensors asynchronously
   // in both the main kernel and its reducer. Keep their allocations live on

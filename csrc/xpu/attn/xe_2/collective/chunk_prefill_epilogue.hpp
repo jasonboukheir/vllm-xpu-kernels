@@ -565,22 +565,30 @@ class DecodeFwdEpilogue {
         exp_sums(q_row, idx_kv_split) = ElementA(1);
         max_logits(q_row, idx_kv_split) = ElementA(0);
       } else if (num_kv_splits > 1) {
-        exp_sums(q_row, idx_kv_split) = rA_sum(0);
-        max_logits(q_row, idx_kv_split) = rA_max(0);
+        // A row-local split can be empty even when the batch-wide scheduler
+        // assigns it work. Keep the producer contract identical to an
+        // explicitly skipped split: positive exp_sum means valid; otherwise
+        // publish the exact zero/-infinity sentinel pair.
+        bool const split_valid = rA_sum(0) > ElementA(0);
+        exp_sums(q_row, idx_kv_split) = split_valid ? rA_sum(0) : ElementA(0);
+        max_logits(q_row, idx_kv_split) =
+            split_valid ? rA_max(0) : ElementA(-INFINITY);
       }
     }
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Complete softmax: normalize output for single-split sequences
-       (so ReduceSplitK pass-through gives correct result).
-       For multi-split, store unnormalized to avoid divide-multiply
-       precision loss in the reduce roundtrip. */
-    if (is_single_split || num_kv_splits <= 1) {
+    /* Complete softmax for a direct output, or for a specialized split
+       collective whose fp16 partial scratch cannot safely hold an
+       unnormalized numerator at long context. Its reducer restores the local
+       exp-sum weight when combining normalized partials. */
+    if (is_single_split || num_kv_splits <= 1 ||
+        CollectiveMainloop::NormalizeSplitPartialOutput) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
-        rA_sum(i) = ElementA(1) / rA_sum(i);
+        rA_sum(i) =
+            rA_sum(i) > ElementA(0) ? ElementA(1) / rA_sum(i) : ElementA(0);
       }
 
       CUTLASS_PRAGMA_UNROLL

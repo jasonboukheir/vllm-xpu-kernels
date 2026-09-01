@@ -77,15 +77,16 @@ def test_kvarn_hadamard_scatter_matches_fp32(dtype, tokens):
 
 def test_kvarn_hadamard_scatter_structured_and_invalid_rows():
     _load_op()
-    key = torch.zeros(5, 4, 256, dtype=torch.float16)
+    key = torch.zeros(6, 4, 256, dtype=torch.float16)
     value = torch.zeros_like(key)
     key[0, :, 0] = 16
     value[0, :, 255] = 16
     key[1] = 1
     value[1] = -1
-    slots = torch.tensor([0, 129, -1, 384, 640], dtype=torch.int64)
-    # block 1 is valid, block 3 has no pool slot, block 5 is out of lookup.
-    block_to_slot = torch.tensor([1, 0, -1, -1], dtype=torch.int32)
+    slots = torch.tensor([0, 129, -1, 256, 384, 640], dtype=torch.int64)
+    # Block 2 maps one past the pool, block 3 has no pool slot, and block 5 is
+    # outside the lookup. All three rows must leave the canary untouched.
+    block_to_slot = torch.tensor([1, 0, 2, -1], dtype=torch.int32)
     sentinel = -77.0
     tail_key = torch.full(
         (2, 128, 4, 256), sentinel, dtype=torch.float16, device="xpu"

@@ -26,6 +26,7 @@ struct kvarn_decode_args_t {
   int max_pages_per_seq;
   int num_kv_splits;
   float softmax_scale;
+  bool unrotate_output;
   cutlass::fmha::collective::KVarNK4V4Layout layout;
 };
 
@@ -70,6 +71,7 @@ struct KVarNReduceSplit16Kernel {
     float const* exp_sums;
     float const* max_logits;
     int const* seq_lens;
+    int kv_tiles_per_split;
   };
 
   struct SharedStorage {};
@@ -90,25 +92,21 @@ struct KVarNReduceSplit16Kernel {
     int const subgroup_id = thread / cute::intel::sg_size;
     auto subgroup = get_sub_group();
 
-    int const kv_blocks = cute::ceil_div(
+    int const kv_tiles = cute::ceil_div(
         params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
-    int const blocks_per_split = cute::ceil_div(kv_blocks, kSplits);
-    bool valid = lane * blocks_per_split < kv_blocks;
+    int const active_splits =
+        cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
     int const stats_offset =
         (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) * kSplits +
         lane;
 
-    float local_max = cutlass::platform::numeric_limits<float>::lowest();
-    float local_exp_sum = 0.0f;
-    if (valid) {
-      local_max = params.max_logits[stats_offset];
-      local_exp_sum = params.exp_sums[stats_offset];
-      valid = local_exp_sum > 0.0f;
-      if (!valid) {
-        local_max = cutlass::platform::numeric_limits<float>::lowest();
-        local_exp_sum = 0.0f;
-      }
-    }
+    float local_exp_sum =
+        lane < active_splits ? params.exp_sums[stats_offset] : 0.0f;
+    bool const valid = local_exp_sum > 0.0f;
+    float local_max = valid
+                          ? params.max_logits[stats_offset]
+                          : cutlass::platform::numeric_limits<float>::lowest();
+    local_exp_sum = valid ? local_exp_sum : 0.0f;
 
     float const global_max =
         sycl::reduce_over_group(subgroup, local_max, sycl::maximum<>());
@@ -127,7 +125,7 @@ struct KVarNReduceSplit16Kernel {
           dim;
       float const partial =
           valid ? static_cast<float>(params.partial_output[partial_offset]) *
-                      rescale
+                      local_exp_sum * rescale
                 : 0.0f;
       float const numerator =
           sycl::reduce_over_group(subgroup, partial, sycl::plus<>());
@@ -159,6 +157,7 @@ struct KVarNReduceSplit32Kernel {
     float const* exp_sums;
     float const* max_logits;
     int const* seq_lens;
+    int kv_tiles_per_split;
   };
 
   static constexpr int kSplits = 32;
@@ -176,17 +175,20 @@ struct KVarNReduceSplit32Kernel {
     auto* split_weights = reinterpret_cast<float*>(shared_storage);
     auto* split_exp_sums = split_weights + kSplits;
 
-    int const kv_blocks = cute::ceil_div(
+    int const kv_tiles = cute::ceil_div(
         params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
-    int const blocks_per_split = cute::ceil_div(kv_blocks, kSplits);
-    bool valid = thread < kSplits && thread * blocks_per_split < kv_blocks;
+    int const active_splits =
+        cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
     int const stats_offset =
         (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) * kSplits +
         thread;
+    float local_exp_sum =
+        thread < active_splits ? params.exp_sums[stats_offset] : 0.0f;
+    bool const valid = local_exp_sum > 0.0f;
     float local_max = valid
                           ? params.max_logits[stats_offset]
                           : cutlass::platform::numeric_limits<float>::lowest();
-    float local_exp_sum = valid ? params.exp_sums[stats_offset] : 0.0f;
+    local_exp_sum = valid ? local_exp_sum : 0.0f;
 
     float const global_max =
         sycl::reduce_over_group(workgroup, local_max, sycl::maximum<>());
@@ -200,7 +202,7 @@ struct KVarNReduceSplit32Kernel {
     if (thread < KVarNDecodeD256G128Policy::HeadDim) {
       float numerator = 0.0f;
       float denominator = 0.0f;
-      for (int split = 0; split < kSplits; ++split) {
+      for (int split = 0; split < active_splits; ++split) {
         float const exp_sum = split_exp_sums[split];
         if (exp_sum <= 0.0f) continue;
         int const partial_offset =
@@ -210,7 +212,7 @@ struct KVarNReduceSplit32Kernel {
                 KVarNDecodeD256G128Policy::HeadDim +
             thread;
         numerator += static_cast<float>(params.partial_output[partial_offset]) *
-                     split_weights[split];
+                     exp_sum * split_weights[split];
         denominator += exp_sum * split_weights[split];
       }
       int const output_offset =
@@ -220,6 +222,122 @@ struct KVarNReduceSplit32Kernel {
       params.output[output_offset] =
           static_cast<Element>(numerator / denominator);
     }
+  }
+};
+
+/** KVarN-only split reducer with a fused inverse H256 output transform.
+ *
+ * The standalone H256 kernel reads the fp16 result of split reduction, so the
+ * fused path deliberately keeps that fp16 rounding boundary before applying
+ * the float butterflies.  One workgroup owns a complete output row: its first
+ * 32 threads load split statistics, all 256 threads reduce one output
+ * dimension each, and the first 128 threads perform one butterfly per H256
+ * stage.  This removes one launch without repeating the transform in every
+ * producer split workgroup.
+ */
+struct KVarNReduceSplitOutputHadamardKernel {
+  using Element = cutlass::half_t;
+
+  static constexpr int kMaxSplits = 32;
+  static constexpr int kThreads = KVarNDecodeD256G128Policy::HeadDim;
+
+  struct Params {
+    Element* output;
+    Element const* partial_output;
+    float const* exp_sums;
+    float const* max_logits;
+    int num_kv_splits;
+    int const* seq_lens;
+    int kv_tiles_per_split;
+  };
+
+  struct SharedStorage {
+    cutlass::Array<float, kMaxSplits> split_weights;
+    cutlass::Array<float, kMaxSplits> split_exp_sums;
+    cutlass::Array<float, KVarNDecodeD256G128Policy::HeadDim> output_row;
+  };
+  static constexpr int SharedStorageSize = sizeof(SharedStorage);
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* shared_storage) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    int const head = int(BlockIdxY());
+    int const batch = int(BlockIdxZ());
+    int const thread = int(ThreadIdxX());
+    auto workgroup = get_work_group<3>();
+    auto& storage = *reinterpret_cast<SharedStorage*>(shared_storage);
+
+    int const kv_tiles = cute::ceil_div(
+        params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
+    int const active_splits =
+        cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
+    int const stats_offset =
+        (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) *
+            params.num_kv_splits +
+        thread;
+    float local_exp_sum =
+        thread < active_splits ? params.exp_sums[stats_offset] : 0.0f;
+    bool const valid = local_exp_sum > 0.0f;
+    float local_max = valid
+                          ? params.max_logits[stats_offset]
+                          : cutlass::platform::numeric_limits<float>::lowest();
+    local_exp_sum = valid ? local_exp_sum : 0.0f;
+
+    float const global_max =
+        sycl::reduce_over_group(workgroup, local_max, sycl::maximum<>());
+    if (thread < params.num_kv_splits) {
+      storage.split_weights[thread] =
+          valid ? sycl::native::exp2(local_max - global_max) : 0.0f;
+      storage.split_exp_sums[thread] = local_exp_sum;
+    }
+    sycl::group_barrier(workgroup);
+
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (int split = 0; split < active_splits; ++split) {
+      float const exp_sum = storage.split_exp_sums[split];
+      if (exp_sum <= 0.0f) continue;
+      int const partial_offset = ((batch * params.num_kv_splits + split) *
+                                      KVarNDecodeD256G128Policy::NumQueryHeads +
+                                  head) *
+                                     KVarNDecodeD256G128Policy::HeadDim +
+                                 thread;
+      float const weight = exp_sum * storage.split_weights[split];
+      numerator +=
+          static_cast<float>(params.partial_output[partial_offset]) * weight;
+      denominator += weight;
+    }
+
+    // Match the established reducer -> fp16 output -> H256 path exactly at
+    // the operation boundary.  Keeping the half rounding here avoids a fused
+    // mode silently changing the numerical contract.
+    Element const reduced = static_cast<Element>(numerator / denominator);
+    storage.output_row[thread] = static_cast<float>(reduced);
+    sycl::group_barrier(workgroup);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int stage = 0; stage < 8; ++stage) {
+      int const span = 1 << stage;
+      if (thread < KVarNDecodeD256G128Policy::HeadDim / 2) {
+        int const pair = thread / span;
+        int const offset = thread - pair * span;
+        int const low = pair * 2 * span + offset;
+        int const high = low + span;
+        float const a = storage.output_row[low];
+        float const b = storage.output_row[high];
+        storage.output_row[low] = a + b;
+        storage.output_row[high] = a - b;
+      }
+      sycl::group_barrier(workgroup);
+    }
+
+    int const output_offset =
+        (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) *
+            KVarNDecodeD256G128Policy::HeadDim +
+        thread;
+    params.output[output_offset] =
+        static_cast<Element>(storage.output_row[thread] * (1.0f / 16.0f));
   }
 };
 
@@ -431,25 +549,40 @@ struct KVarNDecodeD256G128ConfigImpl {
     auto params = Kernel::to_underlying_arguments(kernel_args, nullptr);
     auto reduce_params =
         ReductionSplitKernel::to_underlying_arguments(reduce_args, nullptr);
+    int const max_kv_tiles = cute::ceil_div(args.max_seq_len, Policy::KVTile);
+    int const kv_tiles_per_split =
+        cute::ceil_div(max_kv_tiles, args.num_kv_splits);
     KVarNReduceSplit16Kernel::Params reduce16_params{
         out,
         reinterpret_cast<Element const*>(args.temp_output),
         args.exp_sums,
         args.max_logits,
-        args.seq_lens};
+        args.seq_lens,
+        kv_tiles_per_split};
     KVarNReduceSplit32Kernel::Params reduce32_params{
         out,
         reinterpret_cast<Element const*>(args.temp_output),
         args.exp_sums,
         args.max_logits,
-        args.seq_lens};
+        args.seq_lens,
+        kv_tiles_per_split};
+    KVarNReduceSplitOutputHadamardKernel::Params reduce_hadamard_params{
+        out,
+        reinterpret_cast<Element const*>(args.temp_output),
+        args.exp_sums,
+        args.max_logits,
+        args.num_kv_splits,
+        args.seq_lens,
+        kv_tiles_per_split};
     launch(
         queue,
         params,
         reduce_params,
         reduce16_params,
         reduce32_params,
-        args.num_kv_splits);
+        reduce_hadamard_params,
+        args.num_kv_splits,
+        args.unrotate_output);
     return cutlass::Status::kSuccess;
   }
 
@@ -459,7 +592,9 @@ struct KVarNDecodeD256G128ConfigImpl {
       typename ReductionSplitKernel::Params reduce_params,
       KVarNReduceSplit16Kernel::Params reduce16_params,
       KVarNReduceSplit32Kernel::Params reduce32_params,
-      int num_kv_splits) {
+      KVarNReduceSplitOutputHadamardKernel::Params reduce_hadamard_params,
+      int num_kv_splits,
+      bool unrotate_output) {
     namespace syclex = sycl::ext::oneapi::experimental;
     namespace intelex = sycl::ext::intel::experimental;
     dim3 const block = Kernel::get_block_shape();
@@ -476,7 +611,19 @@ struct KVarNDecodeD256G128ConfigImpl {
     compat::experimental::launch<cutlass::device_kernel<Kernel>>(
         policy, queue, params);
 
-    if (num_kv_splits == 32) {
+    if (unrotate_output) {
+      compat::experimental::launch_properties reduce_hadamard_launch_props{
+          syclex::work_group_scratch_size(
+              KVarNReduceSplitOutputHadamardKernel::SharedStorageSize)};
+      compat::experimental::launch_policy reduce_hadamard_policy{
+          compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
+          compat::dim3(KVarNReduceSplitOutputHadamardKernel::kThreads, 1, 1),
+          reduce_hadamard_launch_props,
+          kernel_props};
+      compat::experimental::launch<
+          cutlass::device_kernel<KVarNReduceSplitOutputHadamardKernel>>(
+          reduce_hadamard_policy, queue, reduce_hadamard_params);
+    } else if (num_kv_splits == 32) {
       compat::experimental::launch_properties reduce32_launch_props{
           syclex::work_group_scratch_size(
               KVarNReduceSplit32Kernel::SharedStorageSize)};

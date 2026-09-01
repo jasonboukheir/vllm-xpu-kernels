@@ -18,13 +18,20 @@ import torch
 
 REPO_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from benchmark.check_kvarn_decode import (_put_half,  # noqa: E402
-                                          expected_value, make_cache,
-                                          make_random_cache, reference_decode)
-from benchmark.kvarn_utils import (KVarNLayout, _k_dpas_coord,  # noqa: E402
-                                   _v_dpas_coord,
-                                   dequant_record,
-                                   swizzle_record_dpas_k4v4)
+from benchmark.check_kvarn_decode import (  # noqa: E402
+    _put_half,
+    expected_value,
+    make_cache,
+    make_random_cache,
+    reference_decode,
+)
+from benchmark.kvarn_utils import (  # noqa: E402
+    KVarNLayout,
+    _k_dpas_coord,
+    _v_dpas_coord,
+    dequant_record,
+    swizzle_record_dpas_k4v4,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -44,71 +51,97 @@ def _tail_tensors() -> tuple[torch.Tensor, torch.Tensor]:
 
 def _make_long_structured_cache(
     num_blocks: int,
-) -> tuple[
-        torch.Tensor, KVarNLayout, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, KVarNLayout, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a vectorized long-context cache with page-sensitive K/V rows."""
     layout = KVarNLayout(record_stride=35072)
     cache = torch.zeros(
-        num_blocks, 4, layout.tile_bytes_aligned, dtype=torch.uint8)
+        num_blocks, 4, layout.tile_bytes_aligned, dtype=torch.uint8
+    )
 
     # Exercise the packed payload at high physical addresses as well as its
     # metadata. Page-varying uint4 K values make a wrong physical payload load
     # observable while keeping the independent expected value cheap.
     packed_k_values = torch.tensor([1, 2, 4], dtype=torch.uint8)[
-        torch.arange(num_blocks) % 3]
+        torch.arange(num_blocks) % 3
+    ]
     packed_k_bytes = packed_k_values | (packed_k_values << 4)
-    cache[:, :, :layout.k_packed_bytes] = packed_k_bytes[:, None, None]
-    cache[:, :, layout.v_packed_offset:layout.v_packed_offset +
-          layout.v_packed_bytes] = 0x11
+    cache[:, :, : layout.k_packed_bytes] = packed_k_bytes[:, None, None]
+    cache[
+        :,
+        :,
+        layout.v_packed_offset : layout.v_packed_offset + layout.v_packed_bytes,
+    ] = 0x11
 
     one_dim = torch.ones(layout.head_dim, dtype=torch.float16).view(torch.uint8)
     one_row = torch.ones(layout.group, dtype=torch.float16).view(torch.uint8)
-    cache[:, :, layout.k_s_row_offset:layout.k_s_row_offset +
-          one_row.numel()] = one_row
-    cache[:, :, layout.v_s_col_offset:layout.v_s_col_offset +
-          one_dim.numel()] = one_dim
-    cache[:, :, layout.v_s_row_offset:layout.v_s_row_offset +
-          one_row.numel()] = one_row
+    cache[
+        :, :, layout.k_s_row_offset : layout.k_s_row_offset + one_row.numel()
+    ] = one_row
+    cache[
+        :, :, layout.v_s_col_offset : layout.v_s_col_offset + one_dim.numel()
+    ] = one_dim
+    cache[
+        :, :, layout.v_s_row_offset : layout.v_s_row_offset + one_row.numel()
+    ] = one_row
 
     # Each batch query selects its own K dimension. The test marks one physical
     # final page per traversal with a high score, so dropping that page or
     # mishandling a partial tail changes the answer materially even at 262K.
     page_scores = torch.zeros(num_blocks, 4, dtype=torch.float16)
     key_column_scales = (
-        1.0 / packed_k_values.float())[:, None, None].expand(
-            -1, 4, layout.head_dim).half().contiguous()
-    cache[:, :, layout.k_s_col_offset:layout.k_s_col_offset +
-          layout.head_dim * 2] = key_column_scales.view(torch.uint8)
+        (1.0 / packed_k_values.float())[:, None, None]
+        .expand(-1, 4, layout.head_dim)
+        .half()
+        .contiguous()
+    )
+    cache[
+        :,
+        :,
+        layout.k_s_col_offset : layout.k_s_col_offset + layout.head_dim * 2,
+    ] = key_column_scales.view(torch.uint8)
     key_zero_points = torch.zeros(
-        num_blocks, 4, layout.head_dim, dtype=torch.float16)
+        num_blocks, 4, layout.head_dim, dtype=torch.float16
+    )
     key_zero_points[:, :, :4] = page_scores[:, None, :]
-    cache[:, :, layout.k_zp_offset:layout.k_zp_offset +
-          layout.head_dim * 2] = key_zero_points.view(torch.uint8)
+    cache[
+        :, :, layout.k_zp_offset : layout.k_zp_offset + layout.head_dim * 2
+    ] = key_zero_points.view(torch.uint8)
 
     page_values = ((torch.arange(num_blocks) * 73) % 257).float()
     page_values = (page_values - 128.0)[:, None] / 1024.0
     token_values = torch.arange(layout.group)[None, :] / 512.0
     value_rows = (page_values + token_values).half()
     value_zero_points = value_rows[:, None, :].expand(-1, 4, -1).contiguous()
-    cache[:, :, layout.v_zp_offset:layout.v_zp_offset +
-          layout.group * 2] = value_zero_points.view(torch.uint8)
+    cache[:, :, layout.v_zp_offset : layout.v_zp_offset + layout.group * 2] = (
+        value_zero_points.view(torch.uint8)
+    )
 
     # Packed V contributes 0.25 through s_row. Per-head/per-dimension column
     # scales make GQA head or output-lane routing mistakes visible.
     value_row_scale = torch.full(
-        (num_blocks, 4, layout.group), 0.25, dtype=torch.float16)
-    cache[:, :, layout.v_s_row_offset:layout.v_s_row_offset +
-          layout.group * 2] = value_row_scale.view(torch.uint8)
+        (num_blocks, 4, layout.group), 0.25, dtype=torch.float16
+    )
+    cache[
+        :, :, layout.v_s_row_offset : layout.v_s_row_offset + layout.group * 2
+    ] = value_row_scale.view(torch.uint8)
     head_scale = 1.0 + torch.arange(4)[:, None] / 4.0
-    dim_scale = 0.5 + (
-        (torch.arange(layout.head_dim)[None, :] * 37) % 17) / 8.0
+    dim_scale = 0.5 + ((torch.arange(layout.head_dim)[None, :] * 37) % 17) / 8.0
     value_column_scales = (head_scale * dim_scale).half()
-    encoded_column_scales = value_column_scales[None].expand(
-        num_blocks, -1, -1).contiguous()
-    cache[:, :, layout.v_s_col_offset:layout.v_s_col_offset +
-          layout.head_dim * 2] = encoded_column_scales.view(torch.uint8)
-    return (cache, layout, page_scores.float(), value_rows.float(),
-            value_column_scales.float())
+    encoded_column_scales = (
+        value_column_scales[None].expand(num_blocks, -1, -1).contiguous()
+    )
+    cache[
+        :,
+        :,
+        layout.v_s_col_offset : layout.v_s_col_offset + layout.head_dim * 2,
+    ] = encoded_column_scales.view(torch.uint8)
+    return (
+        cache,
+        layout,
+        page_scores.float(),
+        value_rows.float(),
+        value_column_scales.float(),
+    )
 
 
 def _long_structured_expected(
@@ -118,20 +151,23 @@ def _long_structured_expected(
     value_rows: torch.Tensor,
 ) -> float:
     full_pages, tail_tokens = divmod(seq_len, 128)
-    physical = pages[:full_pages + int(tail_tokens > 0)]
+    physical = pages[: full_pages + int(tail_tokens > 0)]
     counts = torch.full((physical.numel(),), 128, dtype=torch.int64)
     if tail_tokens:
         counts[-1] = tail_tokens
     scores = page_scores[physical].double()
     weights = torch.exp(scores - scores.max())
-    row_sums = torch.stack([
-        value_rows[block, :count].double().sum()
-        for block, count in zip(physical.tolist(), counts.tolist())
-    ])
+    row_sums = torch.stack(
+        [
+            value_rows[block, :count].double().sum()
+            for block, count in zip(physical.tolist(), counts.tolist())
+        ]
+    )
     packed_v_term = 0.25
     return float(
-        (weights * (row_sums + packed_v_term * counts)).sum() /
-        (weights * counts).sum())
+        (weights * (row_sums + packed_v_term * counts)).sum()
+        / (weights * counts).sum()
+    )
 
 
 @pytest.mark.parametrize("record_stride", [35072, 65536])
@@ -165,9 +201,9 @@ def test_materialize_random_packed_cache_matches_independent_oracle(
         packed_cache.xpu(),
         torch.tensor(pages, dtype=torch.int32, device="xpu"),
         torch.tensor(lengths, dtype=torch.int32, device="xpu"),
-        torch.tensor([0, lengths[0], total_tokens],
-                     dtype=torch.int32,
-                     device="xpu"),
+        torch.tensor(
+            [0, lengths[0], total_tokens], dtype=torch.int32, device="xpu"
+        ),
         torch.full((5,), -1, dtype=torch.int32, device="xpu"),
         tail_key,
         tail_value,
@@ -401,7 +437,8 @@ def test_kvarn_dpas_fragment_coordinate_tables_are_bijections() -> None:
 
 @pytest.mark.parametrize("dpas_layout", [False, True])
 def test_k_column_scale_reaches_every_token_subgroup(
-        monkeypatch: pytest.MonkeyPatch, dpas_layout: bool) -> None:
+    monkeypatch: pytest.MonkeyPatch, dpas_layout: bool
+) -> None:
     """Catch mixing MMA-A scale ownership with MMA-B cache fragments."""
     if dpas_layout:
         monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
@@ -411,7 +448,7 @@ def test_k_column_scale_reaches_every_token_subgroup(
 
     layout = KVarNLayout(record_stride=35072)
     cache = torch.zeros((2, 4, layout.tile_bytes_aligned), dtype=torch.uint8)
-    cache[:, :, :layout.k_packed_bytes] = 0x11
+    cache[:, :, : layout.k_packed_bytes] = 0x11
     ones_d = torch.ones(layout.head_dim)
     ones_g = torch.ones(layout.group)
     for block in range(2):
@@ -424,8 +461,11 @@ def test_k_column_scale_reaches_every_token_subgroup(
             _put_half(record, layout.k_s_row_offset, ones_g)
             _put_half(record, layout.v_s_col_offset, ones_d)
             _put_half(record, layout.v_s_row_offset, ones_g)
-            _put_half(record, layout.v_zp_offset,
-                      torch.full((layout.group,), float(block)))
+            _put_half(
+                record,
+                layout.v_zp_offset,
+                torch.full((layout.group,), float(block)),
+            )
 
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     query[:, :, 0] = 16.0
@@ -710,6 +750,46 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage(
         torch.testing.assert_close(actual, legacy, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("oversized", ["temp_output", "statistics"])
+def test_multisplit_scratch_requires_exact_split_extent(
+    monkeypatch: pytest.MonkeyPatch, oversized: str
+) -> None:
+    """Raw packed reducer strides cannot address oversized split extents."""
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "2")
+    cache, _ = make_random_cache(16)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    arguments = (
+        query,
+        cache.xpu(),
+        torch.arange(16, dtype=torch.int32, device="xpu").reshape(1, 16),
+        torch.tensor([2048], dtype=torch.int32, device="xpu"),
+        torch.full((16,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+    )
+    temp_splits = 3 if oversized == "temp_output" else 2
+    stats_splits = 3 if oversized == "statistics" else 2
+    temp_output = torch.empty(
+        (1, 24 * temp_splits, 256), dtype=torch.float16, device="xpu"
+    )
+    exp_sums = torch.empty(
+        (1, 24, stats_splits), dtype=torch.float32, device="xpu"
+    )
+    max_logits = torch.empty_like(exp_sums)
+    expected_error = (
+        "temp_output must" if oversized == "temp_output" else "exp_sums and"
+    )
+    with pytest.raises(RuntimeError, match=expected_error):
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            *arguments,
+            temp_output,
+            exp_sums,
+            max_logits,
+            torch.empty_like(query),
+            2048,
+            1.0 / 16.0,
+        )
+
+
 @pytest.mark.parametrize("record_stride", [35072, 65536])
 @pytest.mark.parametrize("splits", [16, 32])
 def test_split_local_scratch_survives_allocator_pressure(
@@ -796,7 +876,183 @@ def test_split_matches_split1(
     torch.testing.assert_close(split_output, split1, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("splits", [1, 16, 17, 32])
+@pytest.mark.parametrize("splits", [16, 32])
+@pytest.mark.parametrize("fused_hadamard", [False, True])
+def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
+    monkeypatch: pytest.MonkeyPatch, splits: int, fused_hadamard: bool
+) -> None:
+    """Reducers must ignore split lanes the producer does not schedule."""
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
+    max_seq_len = 3073
+    seq_lengths = (3070, 3071, 3072, max_seq_len)
+    pages_per_row = (max_seq_len + 127) // 128
+    cache, _ = make_cache(pages_per_row)
+    pages_cpu = list(range(pages_per_row))
+    pages = torch.tensor([pages_cpu] * 4, dtype=torch.int32, device="xpu")
+    query = torch.zeros((4, 24, 256), dtype=torch.float16, device="xpu")
+    seq_lens = torch.tensor(seq_lengths, dtype=torch.int32, device="xpu")
+    block_to_slot = torch.full(
+        (pages_per_row,), -1, dtype=torch.int32, device="xpu"
+    )
+    arguments = (
+        query,
+        cache.xpu(),
+        pages,
+        seq_lens,
+        block_to_slot,
+        *_tail_tensors(),
+    )
+    expected = torch.stack(
+        [
+            torch.full(
+                (24, 256),
+                expected_value(pages_cpu, seq_len),
+                dtype=torch.float16,
+                device="xpu",
+            )
+            for seq_len in seq_lengths
+        ]
+    )
+    if fused_hadamard:
+        transformed = torch.empty_like(expected)
+        torch.ops._vllm_fa2_C.kvarn_hadamard(
+            expected.view(-1, 256), transformed.view(-1, 256)
+        )
+        expected = transformed
+
+    temp_output = torch.empty(
+        (4, 24 * splits, 256), dtype=torch.float16, device="xpu"
+    )
+    exp_sums = torch.empty((4, 24, splits), dtype=torch.float32, device="xpu")
+    max_logits = torch.empty_like(exp_sums)
+    output = torch.empty_like(query)
+    max_kv_tiles = (max_seq_len + 63) // 64
+    tiles_per_split = (max_kv_tiles + splits - 1) // splits
+    globally_active_splits = (
+        max_kv_tiles + tiles_per_split - 1
+    ) // tiles_per_split
+
+    for _ in range(3):
+        temp_output.fill_(float("nan"))
+        exp_sums.fill_(1.0)
+        max_logits.fill_(0.0)
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            *arguments,
+            temp_output,
+            exp_sums,
+            max_logits,
+            output,
+            max_seq_len,
+            1.0 / 16.0,
+            fused_hadamard,
+        )
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
+
+        exp_sums_cpu = exp_sums.cpu()
+        max_logits_cpu = max_logits.cpu()
+        for row, seq_len in enumerate(seq_lengths):
+            kv_tiles = (seq_len + 63) // 64
+            active_splits = (kv_tiles + tiles_per_split - 1) // tiles_per_split
+            # The producer launches the batch-global split surface. A split
+            # empty only for this row must publish its validity sentinel.
+            torch.testing.assert_close(
+                exp_sums_cpu[row, :, active_splits:globally_active_splits],
+                torch.zeros((24, globally_active_splits - active_splits)),
+                atol=0,
+                rtol=0,
+            )
+            assert torch.isneginf(
+                max_logits_cpu[row, :, active_splits:globally_active_splits]
+            ).all()
+        # The producer publishes the same validity sentinel for splits outside
+        # the batch-global active surface, but deliberately leaves their much
+        # larger partial-output rows untouched.  Keeping those rows poisoned
+        # proves the specialized reducers never consume an inactive partial.
+        torch.testing.assert_close(
+            exp_sums_cpu[:, :, globally_active_splits:],
+            torch.zeros((4, 24, splits - globally_active_splits)),
+            atol=0,
+            rtol=0,
+        )
+        assert torch.isneginf(
+            max_logits_cpu[:, :, globally_active_splits:]
+        ).all()
+        inactive_partials = temp_output.view(4, splits, 24, 256)[
+            :, globally_active_splits:
+        ]
+        assert torch.isnan(inactive_partials).all()
+
+
+@pytest.mark.parametrize("splits", [2, 4, 8, 16, 17, 24, 32])
+def test_fused_output_hadamard_matches_separate_transform(
+    monkeypatch: pytest.MonkeyPatch, splits: int
+) -> None:
+    """The reducer fusion preserves the established fp16/H256 boundary."""
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
+    max_seq_len = 4096
+    pages_per_row = max_seq_len // 128
+    blocks = 4 * pages_per_row
+    cache, _ = make_random_cache(blocks)
+    generator = torch.Generator().manual_seed(8675309 + splits)
+    query = torch.randn((4, 24, 256), generator=generator).half().xpu()
+    pages = torch.arange(blocks, dtype=torch.int32, device="xpu").reshape(
+        4, pages_per_row
+    )
+    seq_lens = torch.tensor(
+        [max_seq_len, 2048, 1024, 128], dtype=torch.int32, device="xpu"
+    )
+    block_to_slot = torch.full((blocks,), -1, dtype=torch.int32, device="xpu")
+    tail_key, tail_value = _tail_tensors()
+    arguments = (
+        query,
+        cache.xpu(),
+        pages,
+        seq_lens,
+        block_to_slot,
+        tail_key,
+        tail_value,
+    )
+
+    rotated = torch.empty_like(query)
+    expected = torch.empty_like(query)
+    fused = torch.empty_like(query)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments, rotated, max_seq_len, 1.0 / 16.0
+    )
+    torch.ops._vllm_fa2_C.kvarn_hadamard(
+        rotated.view(-1, 256), expected.view(-1, 256)
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments, fused, max_seq_len, 1.0 / 16.0, True
+    )
+
+    assert torch.isfinite(fused).all()
+    torch.testing.assert_close(fused, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_fused_output_hadamard_rejects_single_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "1")
+    cache, _ = make_random_cache(4)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    with pytest.raises(RuntimeError, match="requires a multi-split"):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            cache.xpu(),
+            torch.arange(4, dtype=torch.int32, device="xpu").reshape(1, 4),
+            torch.tensor([128], dtype=torch.int32, device="xpu"),
+            torch.full((4,), -1, dtype=torch.int32, device="xpu"),
+            *_tail_tensors(),
+            torch.empty_like(query),
+            128,
+            1.0 / 16.0,
+            True,
+        )
+
+
+@pytest.mark.parametrize("splits", [1, 2, 4, 8, 16, 17, 24, 32])
 def test_long_context_ragged_b4_matches_structured_oracle(
     monkeypatch: pytest.MonkeyPatch, splits: int
 ) -> None:
@@ -804,14 +1060,17 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     num_blocks = 2048
     cache, layout, page_scores, value_rows, column_scales = (
-        _make_long_structured_cache(num_blocks))
+        _make_long_structured_cache(num_blocks)
+    )
     base = torch.arange(num_blocks, dtype=torch.int64)
-    page_rows = torch.stack((
-        base,
-        (base * 5 + 17) % num_blocks,
-        base.flip(0),
-        torch.cat((torch.tensor([2047, 1023]), base[2:])),
-    ))
+    page_rows = torch.stack(
+        (
+            base,
+            (base * 5 + 17) % num_blocks,
+            base.flip(0),
+            torch.cat((torch.tensor([2047, 1023]), base[2:])),
+        )
+    )
     seq_lengths = (262144, 131071, 65536, 192)
     target_pages = [
         int(page_rows[row, (seq_len - 1) // 128])
@@ -819,26 +1078,35 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     ]
     target_values = (0.75, 0.25, -0.25, -0.75)
     for row, (target_page, target_value) in enumerate(
-            zip(target_pages, target_values)):
+        zip(target_pages, target_values)
+    ):
         page_scores[target_page, row] = 8.0
-        value_rows[target_page] = target_value + (
-            torch.arange(128) / 512.0)
+        value_rows[target_page] = target_value + (torch.arange(128) / 512.0)
 
     # Apply the late score sentinels through q_k * k_s_col rather than K zero
     # points. The packed K payload is therefore required for the oracle.
     packed_k_values = torch.tensor([1.0, 2.0, 4.0])[
-        torch.arange(num_blocks) % 3]
+        torch.arange(num_blocks) % 3
+    ]
     key_column_scales = (
-        1.0 / packed_k_values)[:, None, None].expand(
-            -1, 4, layout.head_dim).clone()
+        (1.0 / packed_k_values)[:, None, None]
+        .expand(-1, 4, layout.head_dim)
+        .clone()
+    )
     key_column_scales[:, :, :4] = (
-        (1.0 + page_scores) / packed_k_values[:, None])[:, None, :]
-    cache[:, :, layout.k_s_col_offset:layout.k_s_col_offset +
-          layout.head_dim * 2] = key_column_scales.half().view(torch.uint8)
-    value_zero_points = value_rows.half()[:, None, :].expand(
-        -1, 4, -1).contiguous()
-    cache[:, :, layout.v_zp_offset:layout.v_zp_offset +
-          layout.group * 2] = value_zero_points.view(torch.uint8)
+        (1.0 + page_scores) / packed_k_values[:, None]
+    )[:, None, :]
+    cache[
+        :,
+        :,
+        layout.k_s_col_offset : layout.k_s_col_offset + layout.head_dim * 2,
+    ] = key_column_scales.half().view(torch.uint8)
+    value_zero_points = (
+        value_rows.half()[:, None, :].expand(-1, 4, -1).contiguous()
+    )
+    cache[:, :, layout.v_zp_offset : layout.v_zp_offset + layout.group * 2] = (
+        value_zero_points.view(torch.uint8)
+    )
 
     query = torch.zeros((4, 24, 256), dtype=torch.float16)
     for row in range(4):
@@ -862,10 +1130,9 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         dtype=torch.float16,
         device="xpu",
     )
-    exp_sums = torch.full((4, 24, splits),
-                          float("nan"),
-                          dtype=torch.float32,
-                          device="xpu")
+    exp_sums = torch.full(
+        (4, 24, splits), float("nan"), dtype=torch.float32, device="xpu"
+    )
     max_logits = torch.full_like(exp_sums, float("nan"))
     torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
         *arguments,
@@ -877,15 +1144,47 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         1.0 / 16.0,
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, repeat, max(seq_lengths), 1.0 / 16.0)
+        *arguments, repeat, max(seq_lengths), 1.0 / 16.0
+    )
     if splits > 1:
+        partials_cpu = temp_output.cpu().view(4, splits, 24, 256)
+        exp_sums_cpu = exp_sums.cpu()
+        max_logits_cpu = max_logits.cpu()
+        max_kv_tiles = (max(seq_lengths) + 63) // 64
+        tiles_per_split = (max_kv_tiles + splits - 1) // splits
+        globally_active_splits = min(
+            splits,
+            (max_kv_tiles + tiles_per_split - 1) // tiles_per_split,
+        )
+        for row, seq_len in enumerate(seq_lengths):
+            kv_tiles = (seq_len + 63) // 64
+            active_splits = min(
+                splits, (kv_tiles + tiles_per_split - 1) // tiles_per_split
+            )
+            assert torch.isfinite(partials_cpu[row, :active_splits]).all()
+            assert torch.isfinite(exp_sums_cpu[row, :, :active_splits]).all()
+            assert (exp_sums_cpu[row, :, :active_splits] > 0).all()
+            assert torch.isfinite(max_logits_cpu[row, :, :active_splits]).all()
+            torch.testing.assert_close(
+                exp_sums_cpu[row, :, active_splits:globally_active_splits],
+                torch.zeros((24, globally_active_splits - active_splits)),
+                atol=0,
+                rtol=0,
+            )
+            assert torch.isneginf(
+                max_logits_cpu[row, :, active_splits:globally_active_splits]
+            ).all()
+        assert torch.isnan(exp_sums_cpu[:, :, globally_active_splits:]).all()
+        assert torch.isnan(max_logits_cpu[:, :, globally_active_splits:]).all()
+
         kv_tiles = max(seq_lengths) // 64
         tiles_per_split = (kv_tiles + splits - 1) // splits
         target_split = (kv_tiles - 2) // tiles_per_split
         split_start = target_split * tiles_per_split
         split_end = min(split_start + tiles_per_split, kv_tiles)
         expected_exp_sum = 128 + (
-            (split_end - split_start) * 64 - 128) * math.exp(-8.0)
+            (split_end - split_start) * 64 - 128
+        ) * math.exp(-8.0)
         torch.testing.assert_close(
             exp_sums[0, :, target_split].cpu(),
             torch.full((24,), expected_exp_sum),
@@ -900,26 +1199,39 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         )
     expected_rows = [
         _long_structured_expected(
-            page_rows[row], seq_len, page_scores[:, row], value_rows)
+            page_rows[row], seq_len, page_scores[:, row], value_rows
+        )
         for row, seq_len in enumerate(seq_lengths)
     ]
     # Mutation checks keep this oracle from becoming insensitive again.
-    assert min(abs(left - right) for index, left in enumerate(expected_rows)
-               for right in expected_rows[index + 1:]) > 0.2
+    assert (
+        min(
+            abs(left - right)
+            for index, left in enumerate(expected_rows)
+            for right in expected_rows[index + 1 :]
+        )
+        > 0.2
+    )
     omitted_last = [
         _long_structured_expected(
-            page_rows[row], ((seq_len - 1) // 128) * 128,
-            page_scores[:, row], value_rows)
+            page_rows[row],
+            ((seq_len - 1) // 128) * 128,
+            page_scores[:, row],
+            value_rows,
+        )
         for row, seq_len in enumerate(seq_lengths)
     ]
-    assert all(abs(actual - truncated) > 0.05 for actual, truncated in zip(
-        expected_rows, omitted_last))
+    assert all(
+        abs(actual - truncated) > 0.05
+        for actual, truncated in zip(expected_rows, omitted_last)
+    )
     rounded_tail = _long_structured_expected(
-        page_rows[3], 256, page_scores[:, 3], value_rows)
+        page_rows[3], 256, page_scores[:, 3], value_rows
+    )
     assert abs(expected_rows[3] - rounded_tail) > 0.05
 
     packed_k_mutant = cache[target_pages[0], 0].clone()
-    packed_k_mutant[:layout.k_packed_bytes].zero_()
+    packed_k_mutant[: layout.k_packed_bytes].zero_()
     mutant_key, _ = dequant_record(packed_k_mutant, layout)
     assert mutant_key[0, 0] == 0
 
@@ -927,14 +1239,13 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     for row, base_value in enumerate(expected_rows):
         for query_head in range(24):
             expected[row, query_head] = (
-                base_value * column_scales[query_head // 6])
+                base_value * column_scales[query_head // 6]
+            )
     for row in range(4):
-        adjacent_gaps = (expected[row, :, 1:] -
-                         expected[row, :, :-1]).abs()
+        adjacent_gaps = (expected[row, :, 1:] - expected[row, :, :-1]).abs()
         assert adjacent_gaps.min() > 0.05
 
     assert torch.isfinite(output).all()
     assert torch.isfinite(repeat).all()
-    torch.testing.assert_close(
-        output.cpu(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(output.cpu(), expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(output, repeat, atol=0, rtol=0)
