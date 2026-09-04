@@ -333,10 +333,11 @@ void kvarn_decode_with_scratch_xe2(
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) ||
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore) ||
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch) ||
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6PageRecordCursor) ||
+      kernel_variant ==
+          static_cast<int64_t>(
+              KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor) ||
       kernel_variant == static_cast<int64_t>(
                             KVarNNativeKernelVariant::kQ6PrefetchRecordCursor);
   bool const use_dpas_vector_load =
@@ -385,14 +386,14 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant ==
       static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore);
   bool const use_q6_current_half_v_prefetch =
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch);
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch);
   bool const use_q6_page_record_cursor =
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6PageRecordCursor);
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor);
   bool const use_q6_prefetch_record_cursor =
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6PrefetchRecordCursor);
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PrefetchRecordCursor);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
