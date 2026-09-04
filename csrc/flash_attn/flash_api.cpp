@@ -9,6 +9,7 @@
   #include "xpu/attn/xe_2/kvarn_dequant_xe2.h"
   #include "xpu/attn/xe_2/kvarn_hadamard_xe2.h"
   #include "xpu/attn/xe_2/kvarn_hadamard_scatter_xe2.h"
+  #include "xpu/attn/xe_2/kvarn_sinkhorn_writer_xe2.h"
 #endif
 #include "utils.h"
 #include <torch/all.h>
@@ -492,6 +493,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "value_sinkhorn_col, Tensor value_sinkhorn_row, Tensor block_ids, "
       "Tensor! packed_cache, bool dpas_layout=False) -> ()");
   ops.impl("kvarn_pack_balanced_kv", torch::kXPU, &kvarn_pack_balanced_kv_xe2);
+  ops.def(
+      "kvarn_sinkhorn_pack_kv(Tensor tail_key, Tensor tail_value, Tensor "
+      "pool_slots, Tensor block_ids, Tensor! packed_cache, int "
+      "sinkhorn_iterations=16, bool dpas_layout=False) -> ()");
+  ops.impl("kvarn_sinkhorn_pack_kv", torch::kXPU, &kvarn_sinkhorn_pack_kv_xe2);
   ops.def("kvarn_hadamard(Tensor input, Tensor! output) -> ()");
   ops.impl("kvarn_hadamard", torch::kXPU, &kvarn_hadamard_xe2);
 #endif
