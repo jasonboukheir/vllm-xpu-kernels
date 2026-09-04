@@ -491,7 +491,8 @@ template <
     bool PagePair = false,
     int MainKernelGrfSize = 256,
     bool SpecializedSplitReducer = false,
-    bool NextPagePrefetch = false>
+    bool NextPagePrefetch = false,
+    bool SimdPackedUnpack = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -523,6 +524,11 @@ struct KVarNDecodeD256G128ConfigImpl {
           (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
       "next-page prefetch is an exact-Q6 DPAS experiment");
   static_assert(!NextPagePrefetch || !PagePair);
+  static_assert(
+      !SimdPackedUnpack ||
+          (DpasPacked && VectorPackedLoads &&
+           cute::is_same_v<QPacked, cute::Int<6>> && !QKInt8U4),
+      "SIMD packed unpack is an exact-Q6 DPAS vector-load experiment");
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -587,7 +593,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       QKInt8U4,
       ExactLiveRows,
       PagePair,
-      NextPagePrefetch>;
+      NextPagePrefetch,
+      SimdPackedUnpack>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -1019,6 +1026,18 @@ using KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig =
         256,
         true,
         true>;
+using KVarNDecodeD256G128DpasQ6SimdUnpackConfig = KVarNDecodeD256G128ConfigImpl<
+    true,
+    cute::Int<6>,
+    true,
+    false,
+    false,
+    false,
+    false,
+    256,
+    false,
+    false,
+    true>;
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -1155,6 +1174,18 @@ static_assert(
     sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::
                SharedStorage) ==
     sizeof(KVarNDecodeD256G128DpasQ6Config::Mainloop::SharedStorage));
+static_assert(
+    !KVarNDecodeD256G128DpasQ6VectorLoadConfig::Mainloop::SimdPackedUnpack);
+static_assert(
+    KVarNDecodeD256G128DpasQ6SimdUnpackConfig::Mainloop::SimdPackedUnpack);
+static_assert(
+    !KVarNDecodeD256G128DpasQ6SimdUnpackConfig::Mainloop::NextPagePrefetch);
+static_assert(!KVarNDecodeD256G128DpasQ6SimdUnpackConfig::Mainloop::PagePair);
+static_assert(KVarNDecodeD256G128DpasQ6SimdUnpackConfig::MainGrfSize == 256);
+static_assert(
+    !KVarNDecodeD256G128DpasQ6SimdUnpackConfig::UsesSpecializedSplitReducer);
+static_assert(
+    KVarNDecodeD256G128DpasQ6SimdUnpackConfig::KVWorkUnitTokens == 64);
 static_assert(
     cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
     6);

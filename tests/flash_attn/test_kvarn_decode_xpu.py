@@ -44,6 +44,7 @@ Q6_MAIN_GRF128 = 10
 Q6_SPLIT_REDUCER_SPECIALIZED = 11
 Q6_NEXT_PAGE_PREFETCH = 12
 Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
+Q6_SIMD_UNPACK = 14
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -56,6 +57,7 @@ Q6_FACTORY_VARIANTS = (
     Q6_SPLIT_REDUCER_SPECIALIZED,
     Q6_NEXT_PAGE_PREFETCH,
     Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+    Q6_SIMD_UNPACK,
 )
 
 
@@ -446,8 +448,8 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, and 13 "
-            "require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, "
+            "and 14 require "
             "dpas_layout=True"
         ),
     ):
@@ -678,8 +680,8 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, and 13 "
-            "require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, "
+            "and 14 require "
             "dpas_layout=True"
         ),
     ):
@@ -741,7 +743,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [5, -1, 14])
+@pytest.mark.parametrize("kernel_variant", [5, -1, 99])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -781,6 +783,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         Q6_SPLIT_REDUCER_SPECIALIZED,
         Q6_NEXT_PAGE_PREFETCH,
         Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+        Q6_SIMD_UNPACK,
     ],
 )
 def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
@@ -805,8 +808,8 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, and 13 "
-            "require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, "
+            "and 14 require "
             "dpas_layout=True"
         ),
     ):
@@ -843,6 +846,7 @@ def test_r1_p2_dpas_q6_t64_matches_q8_at_262k_high_addresses() -> None:
     q6 = torch.empty_like(query)
     q8_vector = torch.empty_like(query)
     q6_vector = torch.empty_like(query)
+    q6_simd_unpack = torch.empty_like(query)
 
     torch.ops._vllm_fa2_C.kvarn_decode(
         *arguments,
@@ -864,6 +868,7 @@ def test_r1_p2_dpas_q6_t64_matches_q8_at_262k_high_addresses() -> None:
         (R1_P2_DPAS_Q6, q6),
         (R1_P5_DPAS_VECTOR_LOAD, q8_vector),
         (R1_P2_P5_DPAS_Q6_VECTOR_LOAD, q6_vector),
+        (Q6_SIMD_UNPACK, q6_simd_unpack),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
             *arguments,
@@ -881,6 +886,7 @@ def test_r1_p2_dpas_q6_t64_matches_q8_at_262k_high_addresses() -> None:
     torch.testing.assert_close(q6, q8, rtol=0, atol=0)
     torch.testing.assert_close(q8_vector, q8, rtol=0, atol=0)
     torch.testing.assert_close(q6_vector, q8, rtol=0, atol=0)
+    torch.testing.assert_close(q6_simd_unpack, q8, rtol=0, atol=0)
     assert torch.isfinite(q6).all()
 
 
@@ -1879,6 +1885,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
                 Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
                 "q6-next-page-prefetch-split-reducer",
             ),
+            (Q6_SIMD_UNPACK, "q6-simd-unpack"),
         )
     ]
 )
