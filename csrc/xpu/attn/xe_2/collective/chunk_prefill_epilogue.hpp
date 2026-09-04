@@ -578,14 +578,43 @@ class DecodeFwdEpilogue {
     using ElementA = typename FragA::element_type;
     constexpr float kLn2 = 0.6931471805599453f;
 
-    // Decode tiles head_group_q across the grid's Q dimension (blk_qv[0]).
-    // The work-item's row within this tile is thr_id; its global head-group
-    // row is offset by the tile start. q_tile_rows is the packed-Q tile size.
-    constexpr int q_tile_rows = cute::size<0>(TileShapeO{});
-    int q_row = get<0>(blk_qv) * q_tile_rows + thr_id;
-    bool row_valid = (thr_id < q_tile_rows) && (q_row < head_group_q);
-
     auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+
+    // Decode tiles head_group_q across the grid's Q dimension (blk_qv[0]).
+    // The established epilogue assigns one reporting lane to every complete
+    // Q row directly from thr_id. ScalarOutput redistributes Q6 as a 2x2 set
+    // of 3x128 output subtiles, so its reporting row must instead follow the
+    // active subgroup's output subtile. Only the first V subtile reports LSE,
+    // avoiding same-address writes from both halves of the output tile.
+    constexpr int q_tile_rows = cute::size<0>(TileShapeO{});
+    int q_row;
+    bool row_valid;
+    if constexpr (ScalarOutput) {
+      auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk())
+                         .get_flat_coord(assert_uniform(thr_id));
+      int const source_k = int(get<2>(thr_vak));
+      auto output_subtile = idx2crd(source_k, shape(ReduceSGLayout{}));
+      int const q_subtile = int(get<0>(output_subtile));
+      int const v_subtile = int(get<1>(output_subtile));
+      int const lane =
+          sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+      constexpr int q_rows_per_subtile = cute::size<0>(SGTileShapeO{});
+      int const q_local = int(rA_max.tv_layout()(lane).value());
+      bool first_lane_for_row = true;
+      CUTLASS_PRAGMA_UNROLL
+      for (int peer = 0; peer < cute::intel::sg_size; ++peer) {
+        if (peer < lane && int(rA_max.tv_layout()(peer).value()) == q_local) {
+          first_lane_for_row = false;
+        }
+      }
+      q_row = get<0>(blk_qv) * q_tile_rows + q_subtile * q_rows_per_subtile +
+              q_local;
+      row_valid = active && v_subtile == 0 && first_lane_for_row &&
+                  q_local < q_rows_per_subtile && q_row < head_group_q;
+    } else {
+      q_row = get<0>(blk_qv) * q_tile_rows + thr_id;
+      row_valid = (thr_id < q_tile_rows) && (q_row < head_group_q);
+    }
 
     // Softmax denominator for the row this work-item reports statistics for
     // (q_row). The Sink block below folds the sink into rA_sum(0) using the

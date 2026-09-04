@@ -134,6 +134,39 @@ def test_kvarn_fused_qkv_hadamard_scatter_matches_separate_ops(dtype, tokens):
     assert torch.equal(fused_value.cpu(), separate_value.cpu())
 
 
+@pytest.mark.parametrize("metadata", ["slot_mapping", "block_to_slot"])
+def test_kvarn_fused_qkv_rejects_noncontiguous_metadata(metadata):
+    _load_op()
+    tokens = 2
+    query = torch.zeros(tokens, 24, 256, dtype=torch.float16, device="xpu")
+    key = torch.zeros(tokens, 4, 256, dtype=torch.float16, device="xpu")
+    value = torch.zeros_like(key)
+    slots = torch.arange(tokens * 2, dtype=torch.int64, device="xpu")[::2]
+    lookup = torch.arange(4, dtype=torch.int32, device="xpu")[::2]
+    if metadata == "slot_mapping":
+        assert not slots.is_contiguous()
+    else:
+        slots = slots.contiguous()
+        assert not lookup.is_contiguous()
+    query_output = torch.empty_like(query)
+    tail_key = torch.empty(2, 128, 4, 256, dtype=torch.float16, device="xpu")
+    tail_value = torch.empty_like(tail_key)
+
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        torch.ops._vllm_fa2_C.kvarn_hadamard_qkv_scatter(
+            query,
+            key,
+            value,
+            slots,
+            lookup,
+            query_output,
+            tail_key,
+            tail_value,
+            128,
+            False,
+        )
+
+
 def test_kvarn_hadamard_scatter_structured_and_invalid_rows():
     _load_op()
     key = torch.zeros(6, 4, 256, dtype=torch.float16)

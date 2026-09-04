@@ -279,6 +279,12 @@ void check_inputs(
           block_to_slot.is_xpu() && tail_key.is_xpu() && tail_value.is_xpu(),
       "all tensors must be on XPU");
   TORCH_CHECK(
+      value.device() == key.device() && slot_mapping.device() == key.device() &&
+          block_to_slot.device() == key.device() &&
+          tail_key.device() == key.device() &&
+          tail_value.device() == key.device(),
+      "all tensors must be on the same XPU device");
+  TORCH_CHECK(
       key.scalar_type() == at::kHalf || key.scalar_type() == at::kBFloat16,
       "key and value must have dtype float16 or bfloat16");
   TORCH_CHECK(
@@ -294,6 +300,11 @@ void check_inputs(
   TORCH_CHECK(
       slot_mapping.dim() == 1 && slot_mapping.size(0) == key.size(0),
       "slot_mapping must have shape [tokens]");
+  TORCH_CHECK(
+      block_to_slot.dim() == 1, "block_to_slot must have shape [lookup_size]");
+  TORCH_CHECK(
+      slot_mapping.is_contiguous() && block_to_slot.is_contiguous(),
+      "slot_mapping and block_to_slot must be contiguous");
   TORCH_CHECK(group == 128, "only group=128 is supported");
   TORCH_CHECK(
       tail_key.dim() == 4 && tail_key.size(1) == group &&
@@ -332,6 +343,9 @@ void kvarn_hadamard_qkv_scatter_xe2(
   TORCH_CHECK(
       query.is_xpu() && query_output.is_xpu(),
       "query and query_output must be on XPU");
+  TORCH_CHECK(
+      query.device() == key.device() && query_output.device() == key.device(),
+      "Q/K/V and query_output must be on the same XPU device");
   TORCH_CHECK(
       query.scalar_type() == key.scalar_type(), "Q/K/V dtypes must match");
   TORCH_CHECK(

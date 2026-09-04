@@ -256,6 +256,35 @@ struct KVarNK4V4FragmentLoader {
   }
 
   template <class Fragment>
+  CUTLASS_DEVICE void fill_k_fragment_by_coordinate(
+      Fragment& dst,
+      std::uint8_t const* rec,
+      int slot,
+      int kv_head,
+      int logical_tile,
+      int token_sg,
+      int dim_tile) const {
+    static_assert(DpasPacked);
+    int const token_base = (logical_tile & 1) * kTileK;
+    int const lane =
+        sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < dst.size(); ++i) {
+      // The xe2_dpas cache ABI is frozen in the FP16 MMA-B fragment order.
+      // Integer DPAS has a different MMA-B coordinate layout, so resolve each
+      // destination coordinate through the frozen cache mapping instead of
+      // treating its fragment slots as byte-order compatible.
+      auto coord = dst.tv_layout()(lane, i);
+      int const token = token_base + token_sg + int(get<0>(coord));
+      int const dim = dim_tile + int(get<1>(coord));
+      float const value = slot < 0
+                              ? load_k_dpas_quantized(rec, token, dim)
+                              : load_tail(tail.key, slot, token, kv_head, dim);
+      dst(i) = static_cast<typename Fragment::value_type>(value);
+    }
+  }
+
+  template <class Fragment>
   CUTLASS_DEVICE void fill_v_fragment(
       Fragment& dst,
       std::uint8_t const* rec,
@@ -575,7 +604,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                   sycl::clamp(quantized, -127.0f, 127.0f));
             }
             reorder(tQrQInt8, tIrQ);
-            loader.fill_k_fragment(
+            loader.fill_k_fragment_by_coordinate(
                 tIrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
             clear(tIrS);
             cute::gemm(mma_qk_int, tIrQ, tIrK, tIrS);
