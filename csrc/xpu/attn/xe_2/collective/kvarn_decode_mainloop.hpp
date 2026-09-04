@@ -221,8 +221,8 @@ struct KVarNK4V4FragmentLoader {
    * Column scales are page-wide; packed V, row scales, and zero points are
    * half-local contiguous ranges in the immutable xe2_dpas cache ABI.
    */
-  CUTLASS_DEVICE void prefetch_dpas_v_half_l1(
-      std::uint8_t const* rec, int half, int thread) const {
+  CUTLASS_DEVICE void
+  prefetch_dpas_v_half_l1(std::uint8_t const* rec, int half, int thread) const {
     static_assert(DpasPacked);
     prefetch_lane_partition_l1<kPackedHalfBytes>(
         rec + layout.v_packed_offset + half * kPackedHalfBytes, thread);
