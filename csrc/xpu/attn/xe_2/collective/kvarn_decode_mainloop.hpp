@@ -617,6 +617,13 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         if (page * KVarNK4V4FragmentLoader<>::kGroup >= actual_seq_len) {
           break;
         }
+        // This predicate is uniform for the workgroup.  In particular, a
+        // hybrid tail page ending in its first K64 half may leave the second
+        // half entirely uninitialized; do not even materialize that half,
+        // since a later PV MMA would otherwise allow 0 * NaN to poison the
+        // output after its logits were masked.
+        bool const has_live_second_half =
+            (first_k_tile + 1) * 64 < actual_seq_len;
 
         // One lookup and address calculation serve both K64 halves.  This is
         // also important for the hybrid path: a page cannot change storage
@@ -669,9 +676,17 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
           loader.fill_k_fragment(
               tSrK, rec, slot, kv_head, first_k_tile, qk_token_sg, d_tile);
           cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-          loader.fill_k_fragment(
-              tSrK, rec, slot, kv_head, first_k_tile + 1, qk_token_sg, d_tile);
-          cute::gemm(mma_qk, tSrQ, tSrK, tSrSSecond);
+          if (has_live_second_half) {
+            loader.fill_k_fragment(
+                tSrK,
+                rec,
+                slot,
+                kv_head,
+                first_k_tile + 1,
+                qk_token_sg,
+                d_tile);
+            cute::gemm(mma_qk, tSrQ, tSrK, tSrSSecond);
+          }
         }
 
         if (slot < 0) {
@@ -687,7 +702,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
             auto coord = tSrS.tv_layout()(lane, i);
             float const bias = k_zp_bias[int(get<0>(coord))];
             tSrS(i) += bias;
-            tSrSSecond(i) += bias;
+            if (has_live_second_half) {
+              tSrSSecond(i) += bias;
+            }
           }
 
           FragSCol first_k_row_scale;
@@ -700,13 +717,17 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                    second_token += intel::sg_size) {
             first_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
                 rec + params.kvarn.k_s_row_offset + 2 * first_token);
-            second_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.k_s_row_offset + 2 * second_token);
+            if (has_live_second_half) {
+              second_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_s_row_offset + 2 * second_token);
+            }
           }
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrS.size(); ++i) {
             tSrS(i) *= broadcast<1>(first_k_row_scale, tSrS, i);
-            tSrSSecond(i) *= broadcast<1>(second_k_row_scale, tSrSSecond, i);
+            if (has_live_second_half) {
+              tSrSSecond(i) *= broadcast<1>(second_k_row_scale, tSrSSecond, i);
+            }
           }
         }
 
@@ -728,7 +749,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
             tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(mask, tSrS, i));
           }
         }
-        if ((first_k_tile + 2) * 64 > actual_seq_len) {
+        if (has_live_second_half && (first_k_tile + 2) * 64 > actual_seq_len) {
           FragSCol mask;
           int token = (first_k_tile + 1) * 64 + qk_token_sg +
                       sycl::ext::oneapi::this_work_item::get_sub_group()
@@ -830,6 +851,27 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                 vv * get<1>(TileShapePV{}));
             cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
           }
+        }
+
+        if (!has_live_second_half) {
+          // Packed V accumulation temporarily uses the page's inverse column
+          // scale so both halves can share one scale frame.  Ordinarily the
+          // second-half path restores that frame; do it here before leaving a
+          // page whose second half is wholly inactive.
+          if (slot < 0) {
+            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                                 .get_local_id()[0];
+            CUTLASS_PRAGMA_UNROLL
+            for (int vv = 0; vv < VTiles; ++vv) {
+              auto output_tile = tArA(_, _, _, vv);
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < output_tile.size(); ++i) {
+                output_tile(i) *=
+                    broadcast<1>(page_v_dim_scale[vv], fragment_shape, i);
+              }
+            }
+          }
+          continue;
         }
 
         // Consume the second half only after the first half's PV update.  The
