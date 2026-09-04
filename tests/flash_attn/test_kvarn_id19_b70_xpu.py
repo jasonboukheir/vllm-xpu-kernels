@@ -173,9 +173,17 @@ def test_id19_b1_dpas_matches_exact_id18(
     assert _completion_words(id19_state) == [1 << 32] * KV_HEADS
 
 
-def test_id19_reuses_persistent_scratch_and_advances_epochs() -> None:
-    """Reuse scratch while advancing the completion epoch."""
-    seq_len = 4608
+@pytest.mark.parametrize(
+    "seq_len",
+    [
+        pytest.param(4097, id="thirteen-of-sixteen-producers"),
+        pytest.param(4608, id="fifteen-of-sixteen-producers"),
+    ],
+)
+def test_id19_reuses_persistent_scratch_and_advances_epochs(
+    seq_len: int,
+) -> None:
+    """Reuse scratch across epochs with a partially active split grid."""
     splits = 16
     arguments, _ = _make_b1_dpas_case(seq_len)
     scratch = _new_scratch(splits)
