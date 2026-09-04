@@ -555,6 +555,8 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static_assert(!NextPagePrefetch || !PagePair);
   static_assert(!CurrentHalfVPrefetch || DpasPacked_);
   static_assert(!CurrentHalfVPrefetch || !PagePair);
+  static_assert(!ReusePageRecordCursor || DpasPacked_);
+  static_assert(!ReusePageRecordCursor || !PagePair);
   static_assert(
       !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
   // Each split stores a bounded normalized partial. KVarN reducers combine
@@ -1028,6 +1030,8 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       return;
     }
 
+    int record_cursor_slot = 0;
+    std::uint8_t const* record_cursor = nullptr;
     for (int k_tile = blk_k0; k_tile < blk_k1; ++k_tile) {
       // The scheduler tiles to the batch maximum.  A workgroup owns exactly
       // one batch row, so this exit is uniform across all of its subgroups and
@@ -1038,13 +1042,37 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       if (k_tile * 64 >= actual_seq_len) {
         break;
       }
-      int const physical = loader.physical_block(idx_b, k_tile);
-      int const slot = params.tail.block_to_slot[physical];
-      auto const* rec =
-          slot < 0 ? params.kvarn.cache +
-                         std::int64_t(physical) * params.kvarn.block_stride +
-                         std::int64_t(kv_head) * params.kvarn.head_stride
-                   : nullptr;
+      int slot;
+      std::uint8_t const* rec;
+      if constexpr (ReusePageRecordCursor) {
+        // Each physical page supplies two consecutive K64 tiles.  Refresh at
+        // every even tile, plus an odd split start, then carry the resolved
+        // storage class and record address into the second half.  The first
+        // iteration always refreshes, so neither cursor value is observed
+        // before initialization.  A page cannot switch between packed and
+        // hybrid storage across its halves.
+        bool const refresh_record = (k_tile & 1) == 0 || k_tile == blk_k0;
+        if (refresh_record) {
+          int const physical = loader.physical_block(idx_b, k_tile);
+          record_cursor_slot = params.tail.block_to_slot[physical];
+          record_cursor =
+              record_cursor_slot < 0
+                  ? params.kvarn.cache +
+                        std::int64_t(physical) * params.kvarn.block_stride +
+                        std::int64_t(kv_head) * params.kvarn.head_stride
+                  : nullptr;
+        }
+        slot = record_cursor_slot;
+        rec = record_cursor;
+      } else {
+        int const physical = loader.physical_block(idx_b, k_tile);
+        slot = params.tail.block_to_slot[physical];
+        rec = slot < 0
+                  ? params.kvarn.cache +
+                        std::int64_t(physical) * params.kvarn.block_stride +
+                        std::int64_t(kv_head) * params.kvarn.head_stride
+                  : nullptr;
+      }
       if constexpr (NextPagePrefetch) {
         using Loader = KVarNK4V4FragmentLoader<
             DpasPacked_,
