@@ -840,6 +840,79 @@ def test_r1_p2_dpas_q6_t64_matches_q8_at_262k_high_addresses() -> None:
     assert torch.isfinite(q6).all()
 
 
+@pytest.mark.parametrize(
+    "kernel_variant", [R1_P2_DPAS_Q6, R1_P2_P5_DPAS_Q6_VECTOR_LOAD]
+)
+def test_q6_multisplit_lse_owns_all_six_distinct_query_rows(
+    kernel_variant: int,
+) -> None:
+    """Q6's two Q subtiles must each publish their own split statistics."""
+    seq_len = 4096
+    splits = 16
+    num_blocks = (seq_len + 127) // 128
+    canonical, _ = make_random_cache(num_blocks)
+    swizzled = canonical.clone()
+    layout = KVarNLayout(record_stride=canonical.stride(1))
+    for block in range(num_blocks):
+        for kv_head in range(4):
+            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
+                canonical[block, kv_head], layout
+            )
+
+    generator = torch.Generator().manual_seed(20260905)
+    query = torch.randn((1, 24, 256), generator=generator).half().xpu()
+    # Make each row in a six-head GQA group observably different. Random cache
+    # pages then give those rows distinct, split-dependent logits rather than a
+    # per-head constant that would cancel during split-K reduction.
+    query[0, :, 0] += torch.arange(24, device="xpu", dtype=torch.float16) / 8
+    arguments = (
+        query,
+        swizzled.xpu(),
+        torch.arange(num_blocks, dtype=torch.int32, device="xpu").reshape(
+            1, -1
+        ),
+        torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
+        torch.full((num_blocks,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+    )
+
+    def decode(variant: int) -> tuple[torch.Tensor, torch.Tensor]:
+        temp_output = torch.full(
+            (1, 24 * splits, 256),
+            float("nan"),
+            dtype=torch.float16,
+            device="xpu",
+        )
+        softmax_lse = torch.full(
+            (1, 24, splits), float("nan"), dtype=torch.float32, device="xpu"
+        )
+        legacy_max = torch.full_like(softmax_lse, float("nan"))
+        output = torch.full_like(query, float("nan"))
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            *arguments,
+            temp_output,
+            softmax_lse,
+            legacy_max,
+            output,
+            seq_len,
+            1.0 / 16.0,
+            False,
+            False,
+            splits,
+            variant,
+            True,
+        )
+        return output, softmax_lse
+
+    q8_output, q8_lse = decode(0)
+    q6_output, q6_lse = decode(kernel_variant)
+    assert torch.isfinite(q6_lse).all()
+    # Every row must be independently observable in the control fixture.
+    assert torch.unique(q8_lse[0, :6].cpu(), dim=0).shape[0] == 6
+    torch.testing.assert_close(q6_lse, q8_lse, atol=0, rtol=0)
+    torch.testing.assert_close(q6_output, q8_output, atol=0, rtol=0)
+
+
 def test_full_precision_tail_and_packed_history_share_softmax() -> None:
     cache, _ = make_cache(3)
     pages = [2, 0]
