@@ -343,3 +343,157 @@ def test_kvarn_hadamard_scatter_matches_backend_strides_and_appends(batch_size):
             atol=2e-3,
             rtol=2e-3,
         )
+
+
+def _pack_q4(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.to(torch.uint8) & 0xF
+    return tensor[..., 0::2] | tensor[..., 1::2] << 4
+
+
+def _pack_dpas_k4(tensor: torch.Tensor) -> torch.Tensor:
+    tiles = tensor.shape[0]
+    slots = tensor.reshape(tiles, 4, 32, 2, 2, 4, 2, 8).permute(
+        0, 4, 1, 5, 7, 3, 2, 6
+    )
+    return _pack_q4(slots).reshape(tiles, 256, 64)
+
+
+def _pack_dpas_v4(tensor: torch.Tensor) -> torch.Tensor:
+    tiles = tensor.shape[0]
+    slots = tensor.reshape(tiles, 2, 4, 8, 2, 8, 2, 2, 8).permute(
+        0, 1, 5, 2, 8, 4, 6, 3, 7
+    )
+    return _pack_q4(slots).reshape(tiles, 128, 128)
+
+
+def _balanced_record_reference(
+    key_balanced: torch.Tensor,
+    key_sinkhorn_col: torch.Tensor,
+    key_sinkhorn_row: torch.Tensor,
+    value_balanced: torch.Tensor,
+    value_sinkhorn_col: torch.Tensor,
+    value_sinkhorn_row: torch.Tensor,
+    record_bytes: int,
+) -> torch.Tensor:
+    k_lo = key_balanced.amin(dim=2, keepdim=True)
+    k_scale = ((key_balanced.amax(dim=2, keepdim=True) - k_lo) / 15).clamp_min(
+        1e-10
+    )
+    k_q = torch.clamp(torch.round((key_balanced - k_lo) / k_scale), 0, 15)
+    v_lo = value_balanced.amin(dim=2, keepdim=True)
+    v_scale = (
+        (value_balanced.amax(dim=2, keepdim=True) - v_lo) / 15
+    ).clamp_min(1e-10)
+    v_q = torch.clamp(torch.round((value_balanced - v_lo) / v_scale), 0, 15)
+    parts = [
+        _pack_dpas_k4(k_q).reshape(key_balanced.shape[0], -1),
+        (key_sinkhorn_row * k_scale.squeeze(-1)).half().view(torch.uint8),
+        (key_sinkhorn_row * k_lo.squeeze(-1)).half().view(torch.uint8),
+        key_sinkhorn_col.half().view(torch.uint8),
+        _pack_dpas_v4(v_q).reshape(value_balanced.shape[0], -1),
+        value_sinkhorn_col.half().view(torch.uint8),
+        (value_sinkhorn_row * v_scale.squeeze(-1)).half().view(torch.uint8),
+        (value_sinkhorn_row * v_lo.squeeze(-1)).half().view(torch.uint8),
+    ]
+    record = torch.cat(parts, dim=1)
+    return torch.nn.functional.pad(record, (0, record_bytes - record.shape[1]))
+
+
+@pytest.mark.parametrize("num_flush_blocks", [1, 3])
+@pytest.mark.parametrize("record_bytes", [35072, 65536])
+def test_kvarn_balanced_writer_matches_dpas_record_bytes(
+    num_flush_blocks, record_bytes
+):
+    """Cover full pages, ragged block ids, and the padded-record tail."""
+    _load_op()
+    tiles = num_flush_blocks * 4
+    channel = torch.arange(256, dtype=torch.float32)
+    token = torch.arange(128, dtype=torch.float32)
+    tile = torch.arange(tiles, dtype=torch.float32)
+
+    # Exact integer ranges make the RTN scale exactly one and exercise every
+    # q4 code without admitting a CPU/device transcendental tolerance.
+    key_balanced = (
+        token.remainder(16)[None, None, :]
+        + channel.remainder(5)[None, :, None]
+        + tile.remainder(3)[:, None, None]
+    ).contiguous()
+    value_balanced = (
+        channel.remainder(16)[None, None, :]
+        - token.remainder(7)[None, :, None]
+        + tile.remainder(3)[:, None, None]
+    ).contiguous()
+    key_sinkhorn_col = (
+        (tile[:, None] + token[None, :].remainder(11) + 1) / 16
+    ).contiguous()
+    key_sinkhorn_row = (
+        (tile[:, None] + channel[None, :].remainder(13) + 1) / 16
+    ).contiguous()
+    value_sinkhorn_col = (
+        (tile[:, None] + channel[None, :].remainder(17) + 1) / 16
+    ).contiguous()
+    value_sinkhorn_row = (
+        (tile[:, None] + token[None, :].remainder(19) + 1) / 16
+    ).contiguous()
+
+    block_ids = torch.tensor([5, 1, 6][:num_flush_blocks], dtype=torch.int64)
+    canary = 0xA5
+    packed_cache = torch.full(
+        (7, 4, record_bytes), canary, dtype=torch.uint8, device="xpu"
+    )
+    torch.ops._vllm_fa2_C.kvarn_pack_balanced_kv(
+        key_balanced.xpu(),
+        key_sinkhorn_col.xpu(),
+        key_sinkhorn_row.xpu(),
+        value_balanced.xpu(),
+        value_sinkhorn_col.xpu(),
+        value_sinkhorn_row.xpu(),
+        block_ids.xpu(),
+        packed_cache,
+        True,
+    )
+    torch.xpu.synchronize()
+
+    expected = _balanced_record_reference(
+        key_balanced,
+        key_sinkhorn_col,
+        key_sinkhorn_row,
+        value_balanced,
+        value_sinkhorn_col,
+        value_sinkhorn_row,
+        record_bytes,
+    ).reshape(num_flush_blocks, 4, record_bytes)
+    actual = packed_cache.cpu()
+    for index, block in enumerate(block_ids.tolist()):
+        assert torch.equal(actual[block], expected[index])
+    untouched = set(range(packed_cache.shape[0])) - set(block_ids.tolist())
+    for block in untouched:
+        assert torch.all(actual[block] == canary)
+
+
+def test_kvarn_balanced_writer_skips_invalid_ragged_block_ids():
+    _load_op()
+    block_ids = torch.tensor([-1, 2], dtype=torch.int64, device="xpu")
+    tiles = block_ids.numel() * 4
+    key_balanced = torch.zeros(tiles, 256, 128, device="xpu")
+    value_balanced = torch.zeros(tiles, 128, 256, device="xpu")
+    key_sinkhorn_col = torch.ones(tiles, 128, device="xpu")
+    key_sinkhorn_row = torch.ones(tiles, 256, device="xpu")
+    value_sinkhorn_col = torch.ones(tiles, 256, device="xpu")
+    value_sinkhorn_row = torch.ones(tiles, 128, device="xpu")
+    packed_cache = torch.full(
+        (1, 4, 35072), 0xA5, dtype=torch.uint8, device="xpu"
+    )
+    torch.ops._vllm_fa2_C.kvarn_pack_balanced_kv(
+        key_balanced,
+        key_sinkhorn_col,
+        key_sinkhorn_row,
+        value_balanced,
+        value_sinkhorn_col,
+        value_sinkhorn_row,
+        block_ids,
+        packed_cache,
+        True,
+    )
+    torch.xpu.synchronize()
+    assert torch.all(packed_cache == 0xA5)

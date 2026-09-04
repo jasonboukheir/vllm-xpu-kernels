@@ -4,6 +4,7 @@
 #include "xpu/attn/attn_interface.h"
 #include "xpu/attn/paged_kv_utils.h"
 #ifdef VLLM_XPU_ENABLE_XE2
+  #include "xpu/attn/xe_2/kvarn_balanced_writer_xe2.h"
   #include "xpu/attn/xe_2/kvarn_decode_xe2.h"
   #include "xpu/attn/xe_2/kvarn_dequant_xe2.h"
   #include "xpu/attn/xe_2/kvarn_hadamard_xe2.h"
@@ -485,6 +486,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "kvarn_hadamard_qkv_scatter",
       torch::kXPU,
       &kvarn_hadamard_qkv_scatter_xe2);
+  ops.def(
+      "kvarn_pack_balanced_kv(Tensor key_balanced, Tensor key_sinkhorn_col, "
+      "Tensor key_sinkhorn_row, Tensor value_balanced, Tensor "
+      "value_sinkhorn_col, Tensor value_sinkhorn_row, Tensor block_ids, "
+      "Tensor! packed_cache, bool dpas_layout=False) -> ()");
+  ops.impl("kvarn_pack_balanced_kv", torch::kXPU, &kvarn_pack_balanced_kv_xe2);
   ops.def("kvarn_hadamard(Tensor input, Tensor! output) -> ()");
   ops.impl("kvarn_hadamard", torch::kXPU, &kvarn_hadamard_xe2);
 #endif
