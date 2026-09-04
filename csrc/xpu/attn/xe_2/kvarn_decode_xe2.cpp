@@ -107,7 +107,8 @@ void kvarn_decode_with_scratch_xe2(
     at::Tensor& output,
     int64_t max_seq_len,
     double softmax_scale,
-    bool unrotate_output) {
+    bool unrotate_output,
+    bool write_bf16_output) {
   check_xpu(query, "query");
   check_xpu(packed_cache, "packed_cache");
   check_xpu(block_table, "block_table");
@@ -135,7 +136,13 @@ void kvarn_decode_with_scratch_xe2(
   TORCH_CHECK(
       query.scalar_type() == at::kHalf, "query must have dtype float16");
   TORCH_CHECK(
-      output.scalar_type() == at::kHalf, "output must have dtype float16");
+      write_bf16_output ? output.scalar_type() == at::kBFloat16
+                        : output.scalar_type() == at::kHalf,
+      "output must have dtype ",
+      write_bf16_output ? "bfloat16" : "float16");
+  TORCH_CHECK(
+      !write_bf16_output || unrotate_output,
+      "write_bf16_output requires unrotate_output");
   TORCH_CHECK(
       packed_cache.scalar_type() == at::kByte,
       "packed_cache must have dtype uint8");
@@ -287,6 +294,7 @@ void kvarn_decode_with_scratch_xe2(
       num_kv_splits,
       static_cast<float>(softmax_scale),
       unrotate_output,
+      write_bf16_output,
       layout};
 
   args.exp_sums = exp_sums.data_ptr<float>();
@@ -312,7 +320,8 @@ void kvarn_decode_xe2(
     at::Tensor& output,
     int64_t max_seq_len,
     double softmax_scale,
-    bool unrotate_output) {
+    bool unrotate_output,
+    bool write_bf16_output) {
   int const num_kv_splits = native_split_count(max_seq_len);
   int64_t const batch = query.size(0);
   auto temp_output = at::empty(
@@ -336,7 +345,8 @@ void kvarn_decode_xe2(
       output,
       max_seq_len,
       softmax_scale,
-      unrotate_output);
+      unrotate_output,
+      write_bf16_output);
 
   // Multi-split decode consumes these function-local tensors asynchronously
   // in both the main kernel and its reducer. Keep their allocations live on

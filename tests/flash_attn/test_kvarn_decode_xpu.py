@@ -1067,6 +1067,92 @@ def test_fused_output_hadamard_rejects_single_split(
         )
 
 
+@pytest.mark.parametrize("with_scratch", [False, True])
+@pytest.mark.parametrize("splits", [16, 24])
+def test_fused_bf16_output_matches_fp16_copy_contract(
+    monkeypatch: pytest.MonkeyPatch, with_scratch: bool, splits: int
+) -> None:
+    """Direct bf16 output must preserve both historical fp16 roundings."""
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
+    seq_len = 6000
+    pages_per_row = (seq_len + 127) // 128
+    cache, _ = make_random_cache(pages_per_row)
+    generator = torch.Generator().manual_seed(20260904 + splits)
+    query = torch.randn((1, 24, 256), generator=generator).half().xpu()
+    arguments = (
+        query,
+        cache.xpu(),
+        torch.arange(pages_per_row, dtype=torch.int32, device="xpu").reshape(
+            1, pages_per_row
+        ),
+        torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
+        torch.full((pages_per_row,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+    )
+    historical = torch.empty_like(query)
+    direct = torch.empty_like(query, dtype=torch.bfloat16)
+
+    if with_scratch:
+        temp_output = torch.empty(
+            (1, 24 * splits, 256), dtype=torch.float16, device="xpu"
+        )
+        exp_sums = torch.empty(
+            (1, 24, splits), dtype=torch.float32, device="xpu"
+        )
+        max_logits = torch.empty_like(exp_sums)
+        scratch = (temp_output, exp_sums, max_logits)
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            *arguments,
+            *scratch,
+            historical,
+            seq_len,
+            1.0 / 16.0,
+            True,
+        )
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            *arguments,
+            *scratch,
+            direct,
+            seq_len,
+            1.0 / 16.0,
+            True,
+            True,
+        )
+    else:
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            *arguments, historical, seq_len, 1.0 / 16.0, True
+        )
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            *arguments, direct, seq_len, 1.0 / 16.0, True, True
+        )
+
+    torch.testing.assert_close(
+        direct, historical.to(torch.bfloat16), atol=0, rtol=0
+    )
+
+
+def test_bf16_output_requires_fused_unrotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    cache, _ = make_random_cache(4)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    with pytest.raises(RuntimeError, match="requires unrotate_output"):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            cache.xpu(),
+            torch.arange(4, dtype=torch.int32, device="xpu").reshape(1, 4),
+            torch.tensor([128], dtype=torch.int32, device="xpu"),
+            torch.full((4,), -1, dtype=torch.int32, device="xpu"),
+            *_tail_tensors(),
+            torch.empty_like(query, dtype=torch.bfloat16),
+            128,
+            1.0 / 16.0,
+            False,
+            True,
+        )
+
+
 @pytest.mark.parametrize("splits", [1, 2, 4, 8, 16, 17, 24, 32])
 def test_long_context_ragged_b4_matches_structured_oracle(
     monkeypatch: pytest.MonkeyPatch, splits: int

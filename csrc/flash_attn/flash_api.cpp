@@ -443,7 +443,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor seq_lens, Tensor block_to_slot, Tensor tail_key, Tensor "
       "tail_value, "
       "Tensor! output, int max_seq_len, float softmax_scale, "
-      "bool unrotate_output=False) -> ()");
+      "bool unrotate_output=False, bool write_bf16_output=False) -> ()");
   ops.impl("kvarn_decode", torch::kXPU, &kvarn_decode_xe2);
   ops.def(
       "kvarn_decode_with_scratch(Tensor query, Tensor packed_cache, Tensor "
@@ -452,7 +452,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "tail_value, "
       "Tensor(a!) temp_output, Tensor(b!) exp_sums, Tensor(c!) max_logits, "
       "Tensor(d!) output, "
-      "int max_seq_len, float softmax_scale, bool unrotate_output=False) "
+      "int max_seq_len, float softmax_scale, bool unrotate_output=False, "
+      "bool write_bf16_output=False) "
       "-> ()");
   ops.impl(
       "kvarn_decode_with_scratch", torch::kXPU, &kvarn_decode_with_scratch_xe2);

@@ -12,7 +12,7 @@
 struct kvarn_decode_args_t {
   void const* query;  // [B, 24, 256] fp16, Hadamard-rotated
   std::uint8_t const* cache;
-  void* output;              // [B,24,256] fp16, Hadamard-rotated
+  void* output;              // [B,24,256] fp16, or bf16 when fused/unrotated
   void* temp_output;         // [B, 24 * splits, 256] fp16 partials
   float* exp_sums;           // [B, 24, splits] scratch
   float* max_logits;         // [B, 24, splits] scratch
@@ -27,6 +27,7 @@ struct kvarn_decode_args_t {
   int num_kv_splits;
   float softmax_scale;
   bool unrotate_output;
+  bool write_bf16_output;
   cutlass::fmha::collective::KVarNK4V4Layout layout;
 };
 
@@ -242,13 +243,14 @@ struct KVarNReduceSplitOutputHadamardKernel {
   static constexpr int kThreads = KVarNDecodeD256G128Policy::HeadDim;
 
   struct Params {
-    Element* output;
+    void* output;
     Element const* partial_output;
     float const* exp_sums;
     float const* max_logits;
     int num_kv_splits;
     int const* seq_lens;
     int kv_tiles_per_split;
+    bool write_bf16_output;
   };
 
   struct SharedStorage {
@@ -336,8 +338,19 @@ struct KVarNReduceSplitOutputHadamardKernel {
         (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) *
             KVarNDecodeD256G128Policy::HeadDim +
         thread;
-    params.output[output_offset] =
+    // Preserve the second fp16 rounding boundary from the historical fused
+    // reducer before optionally converting into the public bf16 output.  This
+    // makes direct-bf16 output bitwise equivalent to fp16 output followed by
+    // Tensor.copy_ into bf16.
+    Element const transformed =
         static_cast<Element>(storage.output_row[thread] * (1.0f / 16.0f));
+    if (params.write_bf16_output) {
+      using BFloat16 = sycl::ext::oneapi::bfloat16;
+      reinterpret_cast<BFloat16*>(params.output)[output_offset] =
+          static_cast<BFloat16>(static_cast<float>(transformed));
+    } else {
+      reinterpret_cast<Element*>(params.output)[output_offset] = transformed;
+    }
   }
 };
 
@@ -567,13 +580,14 @@ struct KVarNDecodeD256G128ConfigImpl {
         args.seq_lens,
         kv_tiles_per_split};
     KVarNReduceSplitOutputHadamardKernel::Params reduce_hadamard_params{
-        out,
+        args.output,
         reinterpret_cast<Element const*>(args.temp_output),
         args.exp_sums,
         args.max_logits,
         args.num_kv_splits,
         args.seq_lens,
-        kv_tiles_per_split};
+        kv_tiles_per_split,
+        args.write_bf16_output};
     launch(
         queue,
         params,
