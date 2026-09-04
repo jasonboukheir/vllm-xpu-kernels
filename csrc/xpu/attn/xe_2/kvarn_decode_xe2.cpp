@@ -297,8 +297,11 @@ void kvarn_decode_with_scratch_xe2(
       write_bf16_output,
       layout};
 
-  args.exp_sums = exp_sums.data_ptr<float>();
-  args.max_logits = max_logits.data_ptr<float>();
+  // Keep the public two-scratch ABI during the upstream LSE migration.  The
+  // first tensor now stores one natural-log LSE per split; the second remains
+  // validated and stream-tracked for extension compatibility but is unused.
+  args.softmax_lse_accum = exp_sums.data_ptr<float>();
+  args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   auto const* dpas_layout = std::getenv("KVARN_NATIVE_XPU_DPAS_LAYOUT");
   auto status = dpas_layout != nullptr && std::atoi(dpas_layout) == 1

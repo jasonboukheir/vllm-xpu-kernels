@@ -14,10 +14,11 @@ struct kvarn_decode_args_t {
   std::uint8_t const* cache;
   void* output;              // [B,24,256] fp16, or bf16 when fused/unrotated
   void* temp_output;         // [B, 24 * splits, 256] fp16 partials
-  float* exp_sums;           // [B, 24, splits] scratch
-  float* max_logits;         // [B, 24, splits] scratch
-  int const* block_table;    // [B, max_pages_per_seq]
-  int const* seq_lens;       // [B], actual length for each batch row
+  float* softmax_lse_accum;  // [B, 24, splits] natural-log LSE scratch
+  float*
+      legacy_max_logits;   // validated ABI scratch; unused after LSE migration
+  int const* block_table;  // [B, max_pages_per_seq]
+  int const* seq_lens;     // [B], actual length for each batch row
   int const* block_to_slot;  // [num_physical_blocks], -1 selects KVarN
   void const* tail_key;      // [slots, 128, 4, 256] fp16, rotated
   void const* tail_value;    // [slots, 128, 4, 256] fp16, rotated
@@ -69,8 +70,7 @@ struct KVarNReduceSplit16Kernel {
   struct Params {
     Element* output;
     Element const* partial_output;
-    float const* exp_sums;
-    float const* max_logits;
+    float const* softmax_lse_accum;
     int const* seq_lens;
     int kv_tiles_per_split;
   };
@@ -101,20 +101,21 @@ struct KVarNReduceSplit16Kernel {
         (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) * kSplits +
         lane;
 
-    float local_exp_sum =
-        lane < active_splits ? params.exp_sums[stats_offset] : 0.0f;
-    bool const valid = local_exp_sum > 0.0f;
-    float local_max = valid
-                          ? params.max_logits[stats_offset]
-                          : cutlass::platform::numeric_limits<float>::lowest();
-    local_exp_sum = valid ? local_exp_sum : 0.0f;
+    float const invalid_lse =
+        cutlass::platform::numeric_limits<float>::lowest();
+    float const local_lse = lane < active_splits
+                                ? params.softmax_lse_accum[stats_offset]
+                                : invalid_lse;
+    bool const valid = local_lse > invalid_lse;
 
-    float const global_max =
-        sycl::reduce_over_group(subgroup, local_max, sycl::maximum<>());
-    float const rescale =
-        valid ? sycl::native::exp2(local_max - global_max) : 0.0f;
-    float const denominator = sycl::reduce_over_group(
-        subgroup, local_exp_sum * rescale, sycl::plus<>());
+    float const global_max_lse =
+        sycl::reduce_over_group(subgroup, local_lse, sycl::maximum<>());
+    constexpr float kLog2e = 1.4426950408889634f;
+    float const weight =
+        valid ? sycl::native::exp2((local_lse - global_max_lse) * kLog2e)
+              : 0.0f;
+    float const denominator =
+        sycl::reduce_over_group(subgroup, weight, sycl::plus<>());
     float const inverse_denominator = 1.0f / denominator;
 
     for (int dim = subgroup_id; dim < KVarNDecodeD256G128Policy::HeadDim;
@@ -126,7 +127,7 @@ struct KVarNReduceSplit16Kernel {
           dim;
       float const partial =
           valid ? static_cast<float>(params.partial_output[partial_offset]) *
-                      local_exp_sum * rescale
+                      weight
                 : 0.0f;
       float const numerator =
           sycl::reduce_over_group(subgroup, partial, sycl::plus<>());
@@ -155,15 +156,14 @@ struct KVarNReduceSplit32Kernel {
   struct Params {
     Element* output;
     Element const* partial_output;
-    float const* exp_sums;
-    float const* max_logits;
+    float const* softmax_lse_accum;
     int const* seq_lens;
     int kv_tiles_per_split;
   };
 
   static constexpr int kSplits = 32;
   static constexpr int kThreads = KVarNDecodeD256G128Policy::HeadDim;
-  static constexpr int SharedStorageSize = 2 * kSplits * sizeof(float);
+  static constexpr int SharedStorageSize = kSplits * sizeof(float);
 
   CUTLASS_DEVICE
   void operator()(Params const& params, char* shared_storage) {
@@ -174,7 +174,6 @@ struct KVarNReduceSplit32Kernel {
     int const thread = int(ThreadIdxX());
     auto workgroup = get_work_group<3>();
     auto* split_weights = reinterpret_cast<float*>(shared_storage);
-    auto* split_exp_sums = split_weights + kSplits;
 
     int const kv_tiles = cute::ceil_div(
         params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
@@ -183,20 +182,20 @@ struct KVarNReduceSplit32Kernel {
     int const stats_offset =
         (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) * kSplits +
         thread;
-    float local_exp_sum =
-        thread < active_splits ? params.exp_sums[stats_offset] : 0.0f;
-    bool const valid = local_exp_sum > 0.0f;
-    float local_max = valid
-                          ? params.max_logits[stats_offset]
-                          : cutlass::platform::numeric_limits<float>::lowest();
-    local_exp_sum = valid ? local_exp_sum : 0.0f;
+    float const invalid_lse =
+        cutlass::platform::numeric_limits<float>::lowest();
+    float const local_lse = thread < active_splits
+                                ? params.softmax_lse_accum[stats_offset]
+                                : invalid_lse;
+    bool const valid = local_lse > invalid_lse;
 
-    float const global_max =
-        sycl::reduce_over_group(workgroup, local_max, sycl::maximum<>());
+    float const global_max_lse =
+        sycl::reduce_over_group(workgroup, local_lse, sycl::maximum<>());
+    constexpr float kLog2e = 1.4426950408889634f;
     if (thread < kSplits) {
       split_weights[thread] =
-          valid ? sycl::native::exp2(local_max - global_max) : 0.0f;
-      split_exp_sums[thread] = local_exp_sum;
+          valid ? sycl::native::exp2((local_lse - global_max_lse) * kLog2e)
+                : 0.0f;
     }
     sycl::group_barrier(workgroup);
 
@@ -204,17 +203,17 @@ struct KVarNReduceSplit32Kernel {
       float numerator = 0.0f;
       float denominator = 0.0f;
       for (int split = 0; split < active_splits; ++split) {
-        float const exp_sum = split_exp_sums[split];
-        if (exp_sum <= 0.0f) continue;
+        float const weight = split_weights[split];
+        if (weight <= 0.0f) continue;
         int const partial_offset =
             ((batch * kSplits + split) *
                  KVarNDecodeD256G128Policy::NumQueryHeads +
              head) *
                 KVarNDecodeD256G128Policy::HeadDim +
             thread;
-        numerator += static_cast<float>(params.partial_output[partial_offset]) *
-                     exp_sum * split_weights[split];
-        denominator += exp_sum * split_weights[split];
+        numerator +=
+            static_cast<float>(params.partial_output[partial_offset]) * weight;
+        denominator += weight;
       }
       int const output_offset =
           (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) *
@@ -245,8 +244,7 @@ struct KVarNReduceSplitOutputHadamardKernel {
   struct Params {
     void* output;
     Element const* partial_output;
-    float const* exp_sums;
-    float const* max_logits;
+    float const* softmax_lse_accum;
     int num_kv_splits;
     int const* seq_lens;
     int kv_tiles_per_split;
@@ -255,7 +253,6 @@ struct KVarNReduceSplitOutputHadamardKernel {
 
   struct SharedStorage {
     cutlass::Array<float, kMaxSplits> split_weights;
-    cutlass::Array<float, kMaxSplits> split_exp_sums;
     cutlass::Array<float, KVarNDecodeD256G128Policy::HeadDim> output_row;
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -278,34 +275,33 @@ struct KVarNReduceSplitOutputHadamardKernel {
         (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) *
             params.num_kv_splits +
         thread;
-    float local_exp_sum =
-        thread < active_splits ? params.exp_sums[stats_offset] : 0.0f;
-    bool const valid = local_exp_sum > 0.0f;
-    float local_max = valid
-                          ? params.max_logits[stats_offset]
-                          : cutlass::platform::numeric_limits<float>::lowest();
-    local_exp_sum = valid ? local_exp_sum : 0.0f;
+    float const invalid_lse =
+        cutlass::platform::numeric_limits<float>::lowest();
+    float const local_lse = thread < active_splits
+                                ? params.softmax_lse_accum[stats_offset]
+                                : invalid_lse;
+    bool const valid = local_lse > invalid_lse;
 
-    float const global_max =
-        sycl::reduce_over_group(workgroup, local_max, sycl::maximum<>());
+    float const global_max_lse =
+        sycl::reduce_over_group(workgroup, local_lse, sycl::maximum<>());
+    constexpr float kLog2e = 1.4426950408889634f;
     if (thread < params.num_kv_splits) {
       storage.split_weights[thread] =
-          valid ? sycl::native::exp2(local_max - global_max) : 0.0f;
-      storage.split_exp_sums[thread] = local_exp_sum;
+          valid ? sycl::native::exp2((local_lse - global_max_lse) * kLog2e)
+                : 0.0f;
     }
     sycl::group_barrier(workgroup);
 
     float numerator = 0.0f;
     float denominator = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
-      float const exp_sum = storage.split_exp_sums[split];
-      if (exp_sum <= 0.0f) continue;
+      float const weight = storage.split_weights[split];
+      if (weight <= 0.0f) continue;
       int const partial_offset = ((batch * params.num_kv_splits + split) *
                                       KVarNDecodeD256G128Policy::NumQueryHeads +
                                   head) *
                                      KVarNDecodeD256G128Policy::HeadDim +
                                  thread;
-      float const weight = exp_sum * storage.split_weights[split];
       numerator +=
           static_cast<float>(params.partial_output[partial_offset]) * weight;
       denominator += weight;
@@ -430,11 +426,11 @@ struct KVarNDecodeD256G128ConfigImpl {
     if (args.batch_size < 1 || args.batch_size > 12 || args.max_seq_len <= 0 ||
         args.max_pages_per_seq <= 0 || args.query == nullptr ||
         args.output == nullptr || args.temp_output == nullptr ||
-        args.exp_sums == nullptr || args.max_logits == nullptr ||
-        args.num_kv_splits < 1 || args.block_table == nullptr ||
-        args.seq_lens == nullptr || args.cache == nullptr ||
-        args.block_to_slot == nullptr || args.tail_key == nullptr ||
-        args.tail_value == nullptr) {
+        args.softmax_lse_accum == nullptr ||
+        args.legacy_max_logits == nullptr || args.num_kv_splits < 1 ||
+        args.block_table == nullptr || args.seq_lens == nullptr ||
+        args.cache == nullptr || args.block_to_slot == nullptr ||
+        args.tail_key == nullptr || args.tail_value == nullptr) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
@@ -516,13 +512,13 @@ struct KVarNDecodeD256G128ConfigImpl {
          stride_v,
          mainloop_out,
          stride_o_accum,
-         args.exp_sums,
-         stride_lse,
-         args.max_logits,
+         args.softmax_lse_accum,
          stride_lse,
          nullptr,
          nullptr,
-         nullptr},
+         nullptr,
+         nullptr,
+         0},
         {{args.softmax_scale,
           nullptr,
           nullptr,
@@ -546,13 +542,13 @@ struct KVarNDecodeD256G128ConfigImpl {
          stride_o,
          reinterpret_cast<Element const*>(args.temp_output),
          stride_o_accum,
-         args.exp_sums,
-         stride_lse,
-         args.max_logits,
+         args.softmax_lse_accum,
          stride_lse,
          -1,
          nullptr,
-         nullptr},
+         nullptr,
+         nullptr,
+         0},
         hw_info,
         args.num_kv_splits};
 
@@ -568,22 +564,19 @@ struct KVarNDecodeD256G128ConfigImpl {
     KVarNReduceSplit16Kernel::Params reduce16_params{
         out,
         reinterpret_cast<Element const*>(args.temp_output),
-        args.exp_sums,
-        args.max_logits,
+        args.softmax_lse_accum,
         args.seq_lens,
         kv_tiles_per_split};
     KVarNReduceSplit32Kernel::Params reduce32_params{
         out,
         reinterpret_cast<Element const*>(args.temp_output),
-        args.exp_sums,
-        args.max_logits,
+        args.softmax_lse_accum,
         args.seq_lens,
         kv_tiles_per_split};
     KVarNReduceSplitOutputHadamardKernel::Params reduce_hadamard_params{
         args.output,
         reinterpret_cast<Element const*>(args.temp_output),
-        args.exp_sums,
-        args.max_logits,
+        args.softmax_lse_accum,
         args.num_kv_splits,
         args.seq_lens,
         kv_tiles_per_split,

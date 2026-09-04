@@ -347,8 +347,7 @@ template <
     class CollectiveMainloop,  // Attention mainloop
     class TileShapeO_,  // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,     // 2D slice of global output tensor
-    class TensorLSE_ = void,   // Optional tensor for storing intermediate exp
-                               // sums and max logits
+    class TensorLSE_ = void,   // Optional intermediate natural-LSE tensor
     class TiledCopyO_ = void,  // Optional TiledCopy for loading O
     bool Sink_ = false>        // Whether to sink softmax into epilogue
 class DecodeFwdEpilogue {
@@ -511,21 +510,22 @@ class DecodeFwdEpilogue {
   // splitK version
   template <typename QVCoord, class TensorSink>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,             // Global O tensor: (q,v)
-      FragA& tArA,                    // O accumulator:   (q,v)
-      FragARow& tA_max,               // Softmax row-wise max accumulator
-      FragARow& tA_sum,               // Softmax row-wise sum accumulator
-      QVCoord blk_qv,                 // WG tile indices: (q,v)
-      int thr_id,                     // Work-item ID
-      const TensorLSE2D& exp_sums,    // Global exp sum tensor
-      const TensorLSE2D& max_logits,  // Global max logits tensor
+      TensorO2D const& O,                    // Global O tensor: (q,v)
+      FragA& tArA,                           // O accumulator:   (q,v)
+      FragARow& tA_max,                      // Softmax row-wise max accumulator
+      FragARow& tA_sum,                      // Softmax row-wise sum accumulator
+      QVCoord blk_qv,                        // WG tile indices: (q,v)
+      int thr_id,                            // Work-item ID
+      const TensorLSE2D& softmax_lse_accum,  // Per-split natural-log LSE
       int idx_kv_split,
       int head_group_q,
       TensorSink& tSink,  // Sink for current head
       int num_kv_splits,
-      bool is_single_split) {
+      ElementLSE* ptr_lse = nullptr,  // softmax_lse row base (null = disabled)
+      int lse_stride = 0) {           // stride between packed GQA rows
     using namespace cute;
     using ElementA = typename FragA::element_type;
+    constexpr float kLn2 = 0.6931471805599453f;
 
     // Decode tiles head_group_q across the grid's Q dimension (blk_qv[0]).
     // The work-item's row within this tile is thr_id; its global head-group
@@ -536,6 +536,14 @@ class DecodeFwdEpilogue {
 
     auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
+    // Softmax denominator for the row this work-item reports statistics for
+    // (q_row). The Sink block below folds the sink into rA_sum(0) using the
+    // *output tile* row mapping, which is what the O normalization needs but
+    // does not agree with the q_row mapping used by the per-split/final LSE
+    // writes. Snapshot the pre-sink denominator here and re-apply the sink for
+    // q_row explicitly so the reported statistics stay correct.
+    ElementA stats_sum = rA_sum(0);
+
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
     Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
     TiledCopyO copy_o{O};
@@ -544,6 +552,10 @@ class DecodeFwdEpilogue {
 
     if constexpr (Sink) {
       constexpr double kLog2e = 1.4426950408889634074;
+      if (row_valid && idx_kv_split == 0) {
+        stats_sum += sycl::native::exp2(
+            static_cast<ElementA>(tSink(q_row) * kLog2e) - rA_max(0));
+      }
       if (active && idx_kv_split == 0) {
         int base_row = cute::get<0>(tOgO(cute::_0{}, cute::_0{}, cute::_0{}));
         int lane =
@@ -557,44 +569,42 @@ class DecodeFwdEpilogue {
       }
     }
 
-    // Always store exp sum and max logits for current KV split.
-    // assume seq_len_qo == 1
-    if (row_valid) {
-      if (is_single_split) {
-        // Sentinel values: make ReduceSplitK a pass-through copy.
-        exp_sums(q_row, idx_kv_split) = ElementA(1);
-        max_logits(q_row, idx_kv_split) = ElementA(0);
-      } else if (num_kv_splits > 1) {
-        // A row-local split can be empty even when the batch-wide scheduler
-        // assigns it work. Keep the producer contract identical to an
-        // explicitly skipped split: positive exp_sum means valid; otherwise
-        // publish the exact zero/-infinity sentinel pair.
-        bool const split_valid = rA_sum(0) > ElementA(0);
-        exp_sums(q_row, idx_kv_split) = split_valid ? rA_sum(0) : ElementA(0);
-        max_logits(q_row, idx_kv_split) =
-            split_valid ? rA_max(0) : ElementA(-INFINITY);
+    // Store one natural-log LSE for this KV split. ReduceSplitK uses it exactly
+    // like CUDA FlashAttention: weight_i = exp(LSE_i - logsumexp(LSE)).
+    // Assume seq_len_qo == 1.
+    if (row_valid && (num_kv_splits > 1 || ptr_lse != nullptr)) {
+      ElementLSE row_lse =
+          stats_sum > ElementA(0)
+              ? static_cast<ElementLSE>(
+                    static_cast<float>(rA_max(0)) * kLn2 +
+                    sycl::log(static_cast<float>(stats_sum)))
+              : cutlass::platform::numeric_limits<ElementLSE>::lowest();
+      if (num_kv_splits > 1) {
+        softmax_lse_accum(q_row, idx_kv_split) = row_lse;
+      }
+
+      // Without a ReduceSplitK pass this work-item holds the complete
+      // softmax statistics for its query row, so write softmax_lse here.
+      if (ptr_lse != nullptr) {
+        ptr_lse[q_row * lse_stride] = row_lse;
       }
     }
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Complete softmax for a direct output, or for a specialized split
-       collective whose fp16 partial scratch cannot safely hold an
-       unnormalized numerator at long context. Its reducer restores the local
-       exp-sum weight when combining normalized partials. */
-    if (is_single_split || num_kv_splits <= 1 ||
-        CollectiveMainloop::NormalizeSplitPartialOutput) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA_sum.size(); i++) {
-        rA_sum(i) =
-            rA_sum(i) > ElementA(0) ? ElementA(1) / rA_sum(i) : ElementA(0);
-      }
+    // Normalize every split independently. ReduceSplitK combines normalized
+    // partial outputs with exp(LSE_i - LSE_global), matching CUDA
+    // FlashAttention's split-K contract.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++) {
+      rA_sum(i) =
+          rA_sum(i) > ElementA(0) ? ElementA(1) / rA_sum(i) : ElementA(0);
+    }
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA.size(); i++) {
-        rA(i) *= broadcast<0>(rA_sum, rA, i);
-      }
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++) {
+      rA(i) *= broadcast<0>(rA_sum, rA, i);
     }
 
     /* Tile output (cO/gO/copy_o/thr_copy_o/tOgO computed above for the sink) */

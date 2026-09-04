@@ -949,8 +949,8 @@ def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
 
     for _ in range(3):
         temp_output.fill_(float("nan"))
-        exp_sums.fill_(1.0)
-        max_logits.fill_(0.0)
+        exp_sums.fill_(float("nan"))
+        max_logits.fill_(float("nan"))
         torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
             *arguments,
             temp_output,
@@ -964,35 +964,36 @@ def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
 
-        exp_sums_cpu = exp_sums.cpu()
-        max_logits_cpu = max_logits.cpu()
+        softmax_lse_cpu = exp_sums.cpu()
+        legacy_max_logits_cpu = max_logits.cpu()
+        invalid_lse = torch.finfo(torch.float32).min
         for row, seq_len in enumerate(seq_lengths):
             kv_tiles = (seq_len + 63) // 64
             active_splits = (kv_tiles + tiles_per_split - 1) // tiles_per_split
             # The producer launches the batch-global split surface. A split
             # empty only for this row must publish its validity sentinel.
             torch.testing.assert_close(
-                exp_sums_cpu[row, :, active_splits:globally_active_splits],
-                torch.zeros((24, globally_active_splits - active_splits)),
+                softmax_lse_cpu[row, :, active_splits:globally_active_splits],
+                torch.full(
+                    (24, globally_active_splits - active_splits),
+                    invalid_lse,
+                ),
                 atol=0,
                 rtol=0,
             )
-            assert torch.isneginf(
-                max_logits_cpu[row, :, active_splits:globally_active_splits]
-            ).all()
+        # The second public scratch tensor is retained for ABI compatibility,
+        # but upstream's natural-LSE producer deliberately leaves it alone.
+        assert torch.isnan(legacy_max_logits_cpu).all()
         # The producer publishes the same validity sentinel for splits outside
         # the batch-global active surface, but deliberately leaves their much
         # larger partial-output rows untouched.  Keeping those rows poisoned
         # proves the specialized reducers never consume an inactive partial.
         torch.testing.assert_close(
-            exp_sums_cpu[:, :, globally_active_splits:],
-            torch.zeros((4, 24, splits - globally_active_splits)),
+            softmax_lse_cpu[:, :, globally_active_splits:],
+            torch.full((4, 24, splits - globally_active_splits), invalid_lse),
             atol=0,
             rtol=0,
         )
-        assert torch.isneginf(
-            max_logits_cpu[:, :, globally_active_splits:]
-        ).all()
         inactive_partials = temp_output.view(4, splits, 24, 256)[
             :, globally_active_splits:
         ]
@@ -1249,8 +1250,9 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     )
     if splits > 1:
         partials_cpu = temp_output.cpu().view(4, splits, 24, 256)
-        exp_sums_cpu = exp_sums.cpu()
-        max_logits_cpu = max_logits.cpu()
+        softmax_lse_cpu = exp_sums.cpu()
+        legacy_max_logits_cpu = max_logits.cpu()
+        invalid_lse = torch.finfo(torch.float32).min
         max_kv_tiles = (max(seq_lengths) + 63) // 64
         tiles_per_split = (max_kv_tiles + splits - 1) // splits
         globally_active_splits = min(
@@ -1263,20 +1265,18 @@ def test_long_context_ragged_b4_matches_structured_oracle(
                 splits, (kv_tiles + tiles_per_split - 1) // tiles_per_split
             )
             assert torch.isfinite(partials_cpu[row, :active_splits]).all()
-            assert torch.isfinite(exp_sums_cpu[row, :, :active_splits]).all()
-            assert (exp_sums_cpu[row, :, :active_splits] > 0).all()
-            assert torch.isfinite(max_logits_cpu[row, :, :active_splits]).all()
+            assert torch.isfinite(softmax_lse_cpu[row, :, :active_splits]).all()
             torch.testing.assert_close(
-                exp_sums_cpu[row, :, active_splits:globally_active_splits],
-                torch.zeros((24, globally_active_splits - active_splits)),
+                softmax_lse_cpu[row, :, active_splits:globally_active_splits],
+                torch.full(
+                    (24, globally_active_splits - active_splits),
+                    invalid_lse,
+                ),
                 atol=0,
                 rtol=0,
             )
-            assert torch.isneginf(
-                max_logits_cpu[row, :, active_splits:globally_active_splits]
-            ).all()
-        assert torch.isnan(exp_sums_cpu[:, :, globally_active_splits:]).all()
-        assert torch.isnan(max_logits_cpu[:, :, globally_active_splits:]).all()
+        assert torch.isnan(softmax_lse_cpu[:, :, globally_active_splits:]).all()
+        assert torch.isnan(legacy_max_logits_cpu).all()
 
         kv_tiles = max(seq_lengths) // 64
         tiles_per_split = (kv_tiles + splits - 1) // splits
@@ -1286,17 +1286,12 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         expected_exp_sum = 128 + (
             (split_end - split_start) * 64 - 128
         ) * math.exp(-8.0)
+        expected_lse = 9.0 + math.log(expected_exp_sum)
         torch.testing.assert_close(
             exp_sums[0, :, target_split].cpu(),
-            torch.full((24,), expected_exp_sum),
-            atol=2e-2,
+            torch.full((24,), expected_lse),
+            atol=2e-4,
             rtol=2e-4,
-        )
-        torch.testing.assert_close(
-            max_logits[0, :, target_split].cpu(),
-            torch.full((24,), 9.0 * math.log2(math.e)),
-            atol=1e-4,
-            rtol=1e-4,
         )
     expected_rows = [
         _long_structured_expected(
