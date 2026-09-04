@@ -451,9 +451,7 @@ void kvarn_decode_with_scratch_xe2(
   // particular, arbitrary caller-owned device memory cannot be inspected or
   // repaired here without synchronizing decode.
   bool const use_q6_b1_short_last_producer =
-      request_q6_b1_short_last_producer && batch == 1 &&
-      max_seq_len <=
-          KVarNB1ShortLastProducerFinalizer::kMaxShortContextSeqLen &&
+      request_q6_b1_short_last_producer && batch == 1 && max_seq_len <= 4096 &&
       num_kv_splits > 1 && unrotate_output && last_producer_state_initialized;
   TORCH_CHECK(
       !unrotate_output || num_kv_splits > 1,
@@ -609,10 +607,7 @@ void kvarn_decode_xe2(
   bool const initialize_last_producer =
       kernel_variant == static_cast<int64_t>(
                             KVarNNativeKernelVariant::kQ6B1ShortLastProducer) &&
-      batch == 1 &&
-      max_seq_len <=
-          KVarNB1ShortLastProducerFinalizer::kMaxShortContextSeqLen &&
-      num_kv_splits > 1 && unrotate_output;
+      batch == 1 && max_seq_len <= 4096 && num_kv_splits > 1 && unrotate_output;
   auto max_logits =
       initialize_last_producer
           ? at::zeros({batch, kQueryHeads, num_kv_splits}, scratch_options)
