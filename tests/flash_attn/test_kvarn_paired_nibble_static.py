@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import struct
 from pathlib import Path
 
@@ -83,6 +84,38 @@ def test_id21_composes_with_id18_without_changing_cache_abi() -> None:
     assert "paired_nibble_half2_lut[256]" in MAINLOOP
     assert "256 * sizeof(std::uint32_t)" in CONFIG
     assert "BaseStorage base;" in MAINLOOP
+
+
+def test_id21_changes_mainloop_type_but_not_epilogue_policy() -> None:
+    paired = "KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue::"
+    reference = (
+        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue::"
+    )
+    for policy in (
+        "Sink",
+        "ScalarOutput",
+        "CacheScalarWeights",
+        "Block2DOutputStore",
+    ):
+        equality = (
+            rf"{re.escape(paired)}\s*{policy}\s*==\s*"
+            rf"{re.escape(reference)}\s*{policy}"
+        )
+        assert re.search(equality, CONFIG)
+    output_policy_equality = (
+        rf"cute::is_same_v<\s*{re.escape(paired)}\s*OutputStorePolicy,\s*"
+        rf"{re.escape(reference)}\s*OutputStorePolicy>"
+    )
+    assert re.search(output_policy_equality, CONFIG)
+
+    # DecodeFwdEpilogue includes Mainloop in its type, and ID21 intentionally
+    # changes that producer. A whole-type equality assertion would reject the
+    # valid isolated experiment before device compilation starts.
+    assert (
+        "PairedNibbleHalf2Config::Epilogue,\n"
+        "              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::"
+        "Epilogue>" not in CONFIG
+    )
 
 
 def test_hot_loop_performs_one_lookup_per_packed_byte() -> None:
