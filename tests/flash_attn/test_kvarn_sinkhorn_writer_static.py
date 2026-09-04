@@ -8,6 +8,9 @@ REPO_ROOT = Path(__file__).parents[2]
 WRITER = (
     REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_sinkhorn_writer_xe2.cpp"
 ).read_text()
+ZERO_WRITER = (
+    REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_sinkhorn_writer_zero_xe2.hpp"
+).read_text()
 REGISTRATION = (REPO_ROOT / "csrc/flash_attn/flash_api.cpp").read_text()
 ESTABLISHED_WRITER = (
     REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_balanced_writer_xe2.cpp"
@@ -70,3 +73,33 @@ def test_launch_and_allocator_use_the_cache_device_current_stream() -> None:
     assert "getCurrentXPUStream().queue()" not in WRITER
     assert "auto& queue = current_stream.queue()" in WRITER
     assert "tensor->storage().data_ptr(), current_stream" in WRITER
+
+
+def test_zero_iteration_packer_is_compile_time_isolated_from_sinkhorn() -> None:
+    assert '#include "kvarn_sinkhorn_writer_zero_xe2.hpp"' in WRITER
+    assert "if (sinkhorn_iterations == 0)" in WRITER
+    assert "submit_kvarn_sinkhorn_zero_writer" in WRITER
+    assert "KVarNSinkhornZeroWriterKernel" in ZERO_WRITER
+    assert "reqd_sub_group_size(kZeroSubgroup)" in ZERO_WRITER
+    assert "kZeroSubgroup = 16" in ZERO_WRITER
+    assert "kLogCol" not in ZERO_WRITER
+    assert "sinkhorn_iterations" not in ZERO_WRITER
+
+
+def test_zero_iteration_packer_mirrors_exact_dpas_writer_arithmetic() -> None:
+    shared_fragments = (
+        "sycl::reduce_over_group(",
+        "subgroup, lane_lo, sycl::minimum<float>()",
+        "subgroup, lane_hi, sycl::maximum<float>()",
+        "(hi - lo) / float(kZeroQMax)",
+        "fraction == 0.5f && (lower & 1)",
+        "q0 | (q1 << 4)",
+    )
+    assert all(fragment in ZERO_WRITER for fragment in shared_fragments)
+    assert "rows = tiles * (kZeroHeadDim + kZeroGroup)" in ZERO_WRITER
+    assert "key_scale[channel] = sycl::half(scale)" in ZERO_WRITER
+    assert "key_zero[channel] = sycl::half(lo)" in ZERO_WRITER
+    assert "key_row[token] = sycl::half(1.0f)" in ZERO_WRITER
+    assert "value_col[channel] = sycl::half(1.0f)" in ZERO_WRITER
+    assert "value_scale[token] = sycl::half(scale)" in ZERO_WRITER
+    assert "value_zero[token] = sycl::half(lo)" in ZERO_WRITER
