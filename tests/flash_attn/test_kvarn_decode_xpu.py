@@ -45,6 +45,7 @@ Q6_SPLIT_REDUCER_SPECIALIZED = 11
 Q6_NEXT_PAGE_PREFETCH = 12
 Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
 Q6_SIMD_UNPACK = 14
+Q6_BLOCK_OUTPUT_STORE = 15
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -58,6 +59,7 @@ Q6_FACTORY_VARIANTS = (
     Q6_NEXT_PAGE_PREFETCH,
     Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
     Q6_SIMD_UNPACK,
+    Q6_BLOCK_OUTPUT_STORE,
 )
 
 
@@ -448,9 +450,8 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, "
-            "and 14 require "
-            "dpas_layout=True"
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, "
+            "and 15 require dpas_layout=True"
         ),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -680,9 +681,8 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, "
-            "and 14 require "
-            "dpas_layout=True"
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, "
+            "and 15 require dpas_layout=True"
         ),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -784,6 +784,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         Q6_NEXT_PAGE_PREFETCH,
         Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
         Q6_SIMD_UNPACK,
+        Q6_BLOCK_OUTPUT_STORE,
     ],
 )
 def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
@@ -808,9 +809,8 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, "
-            "and 14 require "
-            "dpas_layout=True"
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, "
+            "and 15 require dpas_layout=True"
         ),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(*arguments)
@@ -973,6 +973,78 @@ def test_q6_multisplit_lse_owns_all_six_distinct_query_rows(
     else:
         torch.testing.assert_close(q6_lse, q8_lse, atol=0, rtol=0)
     torch.testing.assert_close(q6_output, q8_output, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("batch", "splits"),
+    [
+        pytest.param(1, 1, id="b1-direct"),
+        pytest.param(1, 2, id="b1-split2"),
+        pytest.param(1, 4, id="b1-split4"),
+        pytest.param(4, 8, id="b4-split8"),
+        pytest.param(1, 16, id="b1-split16"),
+        pytest.param(1, 17, id="b1-generic-split17"),
+        pytest.param(1, 24, id="b1-generic-split24"),
+        pytest.param(4, 32, id="b4-split32"),
+    ],
+)
+def test_q6_block_output_store_matches_scalar_across_reducers(
+    batch: int, splits: int
+) -> None:
+    """ID15 changes only the main-kernel output-store policy."""
+    seq_len = 4096
+    pages_per_row = (seq_len + 127) // 128
+    canonical, layout = make_random_cache(pages_per_row)
+    swizzled = canonical.clone()
+    for block in range(pages_per_row):
+        for kv_head in range(4):
+            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
+                canonical[block, kv_head], layout
+            )
+
+    generator = torch.Generator().manual_seed(1500 + batch + splits)
+    query = torch.randn(
+        (batch, 24, 256), generator=generator, dtype=torch.float16
+    ).xpu()
+    pages = torch.arange(pages_per_row, dtype=torch.int32, device="xpu").repeat(
+        batch, 1
+    )
+    seq_lens = torch.arange(
+        seq_len, seq_len - batch, -1, dtype=torch.int32, device="xpu"
+    )
+    arguments = (
+        query,
+        swizzled.xpu(),
+        pages,
+        seq_lens,
+        torch.full((pages_per_row,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+    )
+    scalar_output = torch.empty_like(query)
+    block_output = torch.empty_like(query)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        scalar_output,
+        seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        R1_P2_DPAS_Q6,
+        True,
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        block_output,
+        seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        Q6_BLOCK_OUTPUT_STORE,
+        True,
+    )
+    torch.testing.assert_close(block_output, scalar_output, atol=0, rtol=0)
 
 
 def test_full_precision_tail_and_packed_history_share_softmax() -> None:
@@ -1886,6 +1958,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
                 "q6-next-page-prefetch-split-reducer",
             ),
             (Q6_SIMD_UNPACK, "q6-simd-unpack"),
+            (Q6_BLOCK_OUTPUT_STORE, "q6-block-output-store"),
         )
     ]
 )
