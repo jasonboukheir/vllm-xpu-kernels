@@ -493,7 +493,9 @@ template <
     bool SpecializedSplitReducer = false,
     bool NextPagePrefetch = false,
     bool SimdPackedUnpack = false,
-    bool Block2DOutputStore = false>
+    bool Block2DOutputStore = false,
+    bool CurrentHalfVPrefetch = false,
+    bool ReusePageRecordCursor = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -534,6 +536,11 @@ struct KVarNDecodeD256G128ConfigImpl {
       !Block2DOutputStore ||
           (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
       "block-2D output stores are an exact-Q6 DPAS experiment");
+  static_assert(
+      !CurrentHalfVPrefetch ||
+          (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
+      "current-half V prefetch is an exact-Q6 DPAS experiment");
+  static_assert(!CurrentHalfVPrefetch || !PagePair);
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -599,7 +606,9 @@ struct KVarNDecodeD256G128ConfigImpl {
       ExactLiveRows,
       PagePair,
       NextPagePrefetch,
-      SimdPackedUnpack>;
+      SimdPackedUnpack,
+      CurrentHalfVPrefetch,
+      ReusePageRecordCursor>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -1061,6 +1070,21 @@ using KVarNDecodeD256G128DpasQ6BlockOutputStoreConfig =
         false,
         false,
         true>;
+using KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        true,
+        true,
+        false,
+        false,
+        true>;
 
 // The block-store payload assembly relies on the established interleaved Q6
 // fragment order.  Prove that contract against CuTe at compile time so a
@@ -1220,6 +1244,23 @@ static_assert(
     sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::
                SharedStorage) ==
     sizeof(KVarNDecodeD256G128DpasQ6Config::Mainloop::SharedStorage));
+static_assert(!KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+                  Mainloop::CurrentHalfVPrefetch);
+static_assert(!KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+                  Mainloop::ReusePageRecordCursor);
+static_assert(KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::
+                  NextPagePrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::
+                  CurrentHalfVPrefetch);
+static_assert(!KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::
+                  ReusePageRecordCursor);
+static_assert(KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::
+                  UsesSpecializedSplitReducer);
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::
+               Params) ==
+    sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+               Mainloop::Params));
 static_assert(
     !KVarNDecodeD256G128DpasQ6VectorLoadConfig::Mainloop::SimdPackedUnpack);
 static_assert(

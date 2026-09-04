@@ -44,6 +44,7 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ6NextPagePrefetchSplitReducer = 13,
   kQ6SimdUnpack = 14,
   kQ6BlockOutputStore = 15,
+  kQ6CurrentHalfVPrefetch = 16,
 };
 
 static_assert(static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair) == 9);
@@ -61,6 +62,9 @@ static_assert(
     static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) == 14);
 static_assert(
     static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore) == 15);
+static_assert(
+    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch) ==
+    16);
 
 using KVarNDpasPrefetchLoader =
     cutlass::fmha::collective::KVarNK4V4FragmentLoader<true>;
@@ -321,7 +325,9 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) ||
       kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore);
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore) ||
+      kernel_variant == static_cast<int64_t>(
+                            KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
@@ -367,6 +373,9 @@ void kvarn_decode_with_scratch_xe2(
   bool const use_q6_block_output_store =
       kernel_variant ==
       static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore);
+  bool const use_q6_current_half_v_prefetch =
+      kernel_variant == static_cast<int64_t>(
+                            KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -379,10 +388,11 @@ void kvarn_decode_with_scratch_xe2(
       "(q6_page_pair), 10 (q6_main_grf128), 11 "
       "(q6_split_reducer_specialized), 12 (q6_next_page_prefetch), 13 "
       "(q6_next_page_prefetch_split_reducer), 14 (q6_simd_unpack), and 15 "
-      "(q6_block_output_store)");
+      "(q6_block_output_store), and 16 (q6_current_half_v_prefetch)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, and 15 "
+      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, and "
+      "16 "
       "require "
       "dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
@@ -468,6 +478,9 @@ void kvarn_decode_with_scratch_xe2(
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   auto status =
       use_qk_i8u4 ? KVarNDecodeD256G128DpasQKInt8U4Config::run(queue, args)
+      : use_q6_current_half_v_prefetch
+          ? KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::run(
+                queue, args)
       : use_q6_next_page_prefetch_split_reducer
           ? KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::run(
                 queue, args)
