@@ -1,4 +1,5 @@
 #include "kvarn_sinkhorn_writer_xe2.h"
+#include "kvarn_sinkhorn_writer_zero_xe2.hpp"
 
 #include <ATen/xpu/XPUContext.h>
 #include <c10/xpu/XPUCachingAllocator.h>
@@ -468,13 +469,31 @@ void kvarn_sinkhorn_pack_kv_xe2(
               state));
     });
   };
+  const auto launch_for_type = [&](auto* key_ptr, auto* value_ptr) {
+    if (sinkhorn_iterations == 0) {
+      vllm::kvarn::xe2::submit_kvarn_sinkhorn_zero_writer(
+          queue,
+          key_ptr,
+          value_ptr,
+          pool_slots.data_ptr<int64_t>(),
+          block_ids.data_ptr<int64_t>(),
+          packed_cache.data_ptr<std::uint8_t>(),
+          scheduled_blocks,
+          tail_key.size(0),
+          packed_cache.size(0),
+          packed_cache.stride(1),
+          packed_cache.size(2));
+    } else {
+      launch(key_ptr, value_ptr);
+    }
+  };
   if (tail_key.scalar_type() == at::kHalf) {
-    launch(
+    launch_for_type(
         reinterpret_cast<const sycl::half*>(tail_key.data_ptr<at::Half>()),
         reinterpret_cast<const sycl::half*>(tail_value.data_ptr<at::Half>()));
   } else {
     using bf16 = sycl::ext::oneapi::bfloat16;
-    launch(
+    launch_for_type(
         reinterpret_cast<const bf16*>(tail_key.data_ptr<at::BFloat16>()),
         reinterpret_cast<const bf16*>(tail_value.data_ptr<at::BFloat16>()));
   }

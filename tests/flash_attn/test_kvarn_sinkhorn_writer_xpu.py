@@ -239,6 +239,51 @@ def test_sinkhorn_writer_preserves_rtn_halfway_ties():
     )
 
 
+def test_sinkhorn_writer_zero_iteration_matches_near_tie_scale() -> None:
+    """Exercise random-scale near-half decisions through the isolated path."""
+    _load_op()
+    tokens = (torch.arange(128, dtype=torch.float32) % 16) + 0.5
+    channels = (torch.arange(256, dtype=torch.float32) % 17) / 1024
+    heads = torch.arange(4, dtype=torch.float32) / 2048
+    shape = (1, 128, 4, 256)
+    tail_key = (
+        (
+            tokens[None, :, None, None]
+            + channels[None, None, None, :]
+            + heads[None, None, :, None]
+        )
+        .expand(shape)
+        .half()
+        .contiguous()
+    )
+    tail_value = (
+        (
+            channels[None, None, None, :]
+            + tokens[None, :, None, None] / 16
+            - heads[None, None, :, None]
+        )
+        .expand(shape)
+        .half()
+        .contiguous()
+    )
+    indices = torch.tensor([0], dtype=torch.int64)
+    cache = torch.empty(1, 4, RECORD_BYTES, dtype=torch.uint8, device="xpu")
+    torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
+        tail_key.xpu(),
+        tail_value.xpu(),
+        indices.xpu(),
+        indices.xpu(),
+        cache,
+        0,
+        True,
+    )
+    torch.xpu.synchronize()
+    expected = _record_reference(tail_key, tail_value, indices, 0, RECORD_BYTES)
+    assert torch.equal(cache.cpu(), expected), _byte_mismatch_evidence(
+        cache.cpu()[0], expected[0]
+    )
+
+
 def test_sinkhorn_writer_masks_ragged_ownership():
     _load_op()
     tail_key, tail_value = _tail_fixture(torch.float16)
@@ -309,9 +354,11 @@ def test_sinkhorn_writer_handles_multiple_valid_blocks_at_iteration16():
     )
     actual = cache.cpu()
     for output_block, reference_index in zip([6, 1, 4], range(3)):
-        assert torch.equal(
-            actual[output_block], expected[reference_index]
-        ), _byte_mismatch_evidence(actual[output_block], expected[reference_index])
+        assert torch.equal(actual[output_block], expected[reference_index]), (
+            _byte_mismatch_evidence(
+                actual[output_block], expected[reference_index]
+            )
+        )
     assert torch.all(actual[[0, 2, 3, 5, 7]] == 0xA5)
     assert torch.equal(tail_key_xpu.cpu(), original_key)
     assert torch.equal(tail_value_xpu.cpu(), original_value)
