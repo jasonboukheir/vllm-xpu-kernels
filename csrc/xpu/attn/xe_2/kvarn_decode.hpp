@@ -375,7 +375,8 @@ template <
     bool QKInt8U4 = false,
     bool CacheScalarWeights = false,
     bool ExactLiveRows = false,
-    bool PagePair = false>
+    bool PagePair = false,
+    int MainKernelGrfSize = 256>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -392,6 +393,10 @@ struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!PagePair || cute::is_same_v<QPacked, cute::Int<6>>);
   static_assert(!PagePair || !VectorPackedLoads);
   static_assert(!PagePair || !QKInt8U4);
+  static_assert(
+      MainKernelGrfSize == 128 || MainKernelGrfSize == 256,
+      "KVarN main-kernel GRF size must be 128 or 256");
+  static constexpr int MainGrfSize = MainKernelGrfSize;
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -690,13 +695,19 @@ struct KVarNDecodeD256G128ConfigImpl {
     dim3 const grid = Kernel::get_grid_shape(params);
     compat::experimental::launch_properties launch_props{
         syclex::work_group_scratch_size(Kernel::SharedStorageSize)};
-    compat::experimental::kernel_properties kernel_props{
+    // GRF128 is deliberately a producer-only occupancy experiment. Keeping
+    // the reducer at its established GRF256 policy isolates register pressure
+    // from every output and caller-owned scratch contract.
+    compat::experimental::kernel_properties main_kernel_props{
+        syclex::sub_group_size<cute::intel::sg_size>,
+        intelex::grf_size<MainKernelGrfSize>};
+    compat::experimental::kernel_properties reduce_kernel_props{
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{
         compat::dim3(grid.x, grid.y, grid.z),
         compat::dim3(block.x, block.y, block.z),
         launch_props,
-        kernel_props};
+        main_kernel_props};
     compat::experimental::launch<cutlass::device_kernel<Kernel>>(
         policy, queue, params);
 
@@ -708,7 +719,7 @@ struct KVarNDecodeD256G128ConfigImpl {
           compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
           compat::dim3(ReductionSplitOutputHadamardKernel::kThreads, 1, 1),
           reduce_hadamard_launch_props,
-          kernel_props};
+          reduce_kernel_props};
       compat::experimental::launch<
           cutlass::device_kernel<ReductionSplitOutputHadamardKernel>>(
           reduce_hadamard_policy, queue, reduce_hadamard_params);
@@ -720,7 +731,7 @@ struct KVarNDecodeD256G128ConfigImpl {
           compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
           compat::dim3(ReductionSplit32Kernel::kThreads, 1, 1),
           reduce32_launch_props,
-          kernel_props};
+          reduce_kernel_props};
       compat::experimental::launch<
           cutlass::device_kernel<ReductionSplit32Kernel>>(
           reduce32_policy, queue, reduce32_params);
@@ -732,7 +743,7 @@ struct KVarNDecodeD256G128ConfigImpl {
           compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
           compat::dim3(128, 1, 1),
           reduce16_launch_props,
-          kernel_props};
+          reduce_kernel_props};
       compat::experimental::launch<
           cutlass::device_kernel<ReductionSplit16Kernel>>(
           reduce16_policy, queue, reduce16_params);
@@ -747,7 +758,7 @@ struct KVarNDecodeD256G128ConfigImpl {
           compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z),
           compat::dim3(reduce_block.x, reduce_block.y, reduce_block.z),
           reduce_launch_props,
-          kernel_props};
+          reduce_kernel_props};
       compat::experimental::launch<
           cutlass::device_kernel<ReductionSplitKernel>>(
           reduce_policy, queue, reduce_params);
@@ -763,6 +774,15 @@ using KVarNDecodeD256G128DpasVectorLoadConfig =
     KVarNDecodeD256G128ConfigImpl<true, cute::_8, true>;
 using KVarNDecodeD256G128DpasQ6Config =
     KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>>;
+using KVarNDecodeD256G128DpasQ6MainGrf128Config = KVarNDecodeD256G128ConfigImpl<
+    true,
+    cute::Int<6>,
+    false,
+    false,
+    false,
+    false,
+    false,
+    128>;
 using KVarNDecodeD256G128DpasQ6VectorLoadConfig =
     KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>, true>;
 using KVarNDecodeD256G128DpasQ6CachedWeightsConfig =
@@ -825,6 +845,11 @@ static_assert(cute::is_same_v<
               KVarNDecodeD256G128ConfigImpl<true, cute::_8, false>>);
 static_assert(KVarNDecodeD256G128DpasConfig::SGTileQ == 8);
 static_assert(KVarNDecodeD256G128DpasQ6Config::SGTileQ == 6);
+static_assert(KVarNDecodeD256G128DpasQ6Config::MainGrfSize == 256);
+static_assert(KVarNDecodeD256G128DpasQ6MainGrf128Config::MainGrfSize == 128);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6MainGrf128Config::Kernel,
+              KVarNDecodeD256G128DpasQ6Config::Kernel>);
 static_assert(cute::is_same_v<
               KVarNDecodeD256G128DpasConfig::MMAOperation,
               cute::XE_DPAS_TT<8, float, cutlass::half_t>>);
