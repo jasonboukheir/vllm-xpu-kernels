@@ -40,7 +40,8 @@ void kvarn_decode_with_scratch_xe2(
     bool write_bf16_output,
     int64_t num_kv_splits,
     int64_t kernel_variant,
-    bool dpas_layout);
+    bool dpas_layout,
+    bool last_producer_state_initialized);
 
 void kvarn_materialize_packed_kv_xe2(
     const at::Tensor& packed_cache,
