@@ -439,7 +439,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor seq_lens, Tensor block_to_slot, Tensor tail_key, Tensor "
       "tail_value, "
       "Tensor! output, int max_seq_len, float softmax_scale, "
-      "bool unrotate_output=False, bool write_bf16_output=False) -> ()");
+      "bool unrotate_output=False, bool write_bf16_output=False, "
+      "int num_kv_splits=0, int kernel_variant=0, bool dpas_layout=False) -> "
+      "()");
   ops.impl("kvarn_decode", torch::kXPU, &kvarn_decode_xe2);
   ops.def(
       "kvarn_decode_with_scratch(Tensor query, Tensor packed_cache, Tensor "
@@ -449,7 +451,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(a!) temp_output, Tensor(b!) exp_sums, Tensor(c!) max_logits, "
       "Tensor(d!) output, "
       "int max_seq_len, float softmax_scale, bool unrotate_output=False, "
-      "bool write_bf16_output=False) "
+      "bool write_bf16_output=False, int num_kv_splits=0, "
+      "int kernel_variant=0, bool dpas_layout=False) "
       "-> ()");
   ops.impl(
       "kvarn_decode_with_scratch", torch::kXPU, &kvarn_decode_with_scratch_xe2);
@@ -457,18 +460,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "kvarn_materialize_packed_kv(Tensor packed_cache, Tensor block_table, "
       "Tensor seq_lens, Tensor cu_seqlens_k, Tensor block_to_slot, Tensor "
       "tail_key, Tensor tail_value, Tensor(a!) key_output, Tensor(b!) "
-      "value_output, int max_seq_len) -> ()");
+      "value_output, int max_seq_len, bool dpas_layout=False) -> ()");
   ops.impl(
       "kvarn_materialize_packed_kv",
       torch::kXPU,
       &kvarn_materialize_packed_kv_xe2);
   ops.def(
-      "kvarn_dequant(Tensor packed_cache, Tensor! key_out, Tensor! value_out) "
+      "kvarn_dequant(Tensor packed_cache, Tensor! key_out, Tensor! value_out, "
+      "bool dpas_layout=False) "
       "-> ()");
   ops.impl("kvarn_dequant", torch::kXPU, &kvarn_dequant_xe2);
   ops.def(
       "kvarn_hadamard_scatter(Tensor key, Tensor value, Tensor slot_mapping, "
-      "Tensor block_to_slot, Tensor! tail_key, Tensor! tail_value, int group) "
+      "Tensor block_to_slot, Tensor! tail_key, Tensor! tail_value, int group, "
+      "bool dpas_layout=False) "
       "-> ()");
   ops.impl("kvarn_hadamard_scatter", torch::kXPU, &kvarn_hadamard_scatter_xe2);
   ops.def("kvarn_hadamard(Tensor input, Tensor! output) -> ()");

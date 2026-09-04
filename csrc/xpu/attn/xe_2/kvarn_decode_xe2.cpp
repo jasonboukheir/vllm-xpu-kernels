@@ -5,7 +5,6 @@
 #include <c10/xpu/XPUStream.h>
 
 #include <cmath>
-#include <cstdlib>
 #include <limits>
 
 #include "kvarn_decode.hpp"
@@ -26,20 +25,21 @@ constexpr int kVSRowOffset = kVSColOffset + kHeadDim * 2;
 constexpr int kVZpOffset = kVSRowOffset + kGroup * 2;
 constexpr int kRecordBytes = kVZpOffset + kGroup * 2;
 
-int native_split_count(int64_t max_seq_len) {
-  auto const* value = std::getenv("KVARN_NATIVE_XPU_SPLITS");
-  int splits = value == nullptr ? 16 : std::atoi(value);
+int validated_split_count(int64_t max_seq_len, int64_t requested_splits) {
+  // Zero retains source compatibility for direct extension callers. vLLM's
+  // native path always passes the initialization-time policy result.
+  int64_t const splits = requested_splits == 0 ? 16 : requested_splits;
   TORCH_CHECK(
       splits == 1 || splits == 2 || splits == 4 || splits == 8 ||
           splits == 16 || splits == 17 || splits == 24 || splits == 32,
-      "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32");
+      "num_kv_splits must be one of 1, 2, 4, 8, 16, 17, 24, or 32");
   // Do not launch more splits than the maximum sequence has 64-token work
   // units. Apart from wasting work, empty split partials amplify reduction
   // drift over many short-context model layers. The one-split direct-output
   // path is both faster and more accurate in this regime.
   int64_t const kv_tiles = (max_seq_len + 63) / 64;
   if (splits > 1 && kv_tiles < splits) return 1;
-  return splits;
+  return static_cast<int>(splits);
 }
 
 void check_xpu(const at::Tensor& tensor, const char* name) {
@@ -108,7 +108,10 @@ void kvarn_decode_with_scratch_xe2(
     int64_t max_seq_len,
     double softmax_scale,
     bool unrotate_output,
-    bool write_bf16_output) {
+    bool write_bf16_output,
+    int64_t requested_num_kv_splits,
+    int64_t kernel_variant,
+    bool dpas_layout) {
   check_xpu(query, "query");
   check_xpu(packed_cache, "packed_cache");
   check_xpu(block_table, "block_table");
@@ -224,6 +227,10 @@ void kvarn_decode_with_scratch_xe2(
   TORCH_CHECK(
       std::isfinite(softmax_scale) && softmax_scale > 0.0,
       "softmax_scale must be finite and positive");
+  TORCH_CHECK(
+      kernel_variant == 0,
+      "unsupported native KVarN kernel_variant ",
+      kernel_variant);
 
   cutlass::fmha::collective::KVarNK4V4Layout layout{
       static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
@@ -238,7 +245,8 @@ void kvarn_decode_with_scratch_xe2(
       kVSColOffset,
       kVSRowOffset,
       kVZpOffset};
-  int const num_kv_splits = native_split_count(max_seq_len);
+  int const num_kv_splits =
+      validated_split_count(max_seq_len, requested_num_kv_splits);
   TORCH_CHECK(
       !unrotate_output || num_kv_splits > 1,
       "unrotate_output requires a multi-split KVarN decode");
@@ -303,10 +311,8 @@ void kvarn_decode_with_scratch_xe2(
   args.softmax_lse_accum = exp_sums.data_ptr<float>();
   args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  auto const* dpas_layout = std::getenv("KVARN_NATIVE_XPU_DPAS_LAYOUT");
-  auto status = dpas_layout != nullptr && std::atoi(dpas_layout) == 1
-                    ? KVarNDecodeD256G128DpasConfig::run(queue, args)
-                    : KVarNDecodeD256G128Config::run(queue, args);
+  auto status = dpas_layout ? KVarNDecodeD256G128DpasConfig::run(queue, args)
+                            : KVarNDecodeD256G128Config::run(queue, args);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
       "native KVarN decode rejected the validated problem");
@@ -324,8 +330,12 @@ void kvarn_decode_xe2(
     int64_t max_seq_len,
     double softmax_scale,
     bool unrotate_output,
-    bool write_bf16_output) {
-  int const num_kv_splits = native_split_count(max_seq_len);
+    bool write_bf16_output,
+    int64_t requested_num_kv_splits,
+    int64_t kernel_variant,
+    bool dpas_layout) {
+  int const num_kv_splits =
+      validated_split_count(max_seq_len, requested_num_kv_splits);
   int64_t const batch = query.size(0);
   auto temp_output = at::empty(
       {batch, kQueryHeads * num_kv_splits, kHeadDim}, query.options());
@@ -349,7 +359,10 @@ void kvarn_decode_xe2(
       max_seq_len,
       softmax_scale,
       unrotate_output,
-      write_bf16_output);
+      write_bf16_output,
+      num_kv_splits,
+      kernel_variant,
+      dpas_layout);
 
   // Multi-split decode consumes these function-local tensors asynchronously
   // in both the main kernel and its reducer. Keep their allocations live on
@@ -376,7 +389,8 @@ void kvarn_materialize_packed_kv_xe2(
     const at::Tensor& tail_value,
     at::Tensor& key_output,
     at::Tensor& value_output,
-    int64_t max_seq_len) {
+    int64_t max_seq_len,
+    bool dpas_layout) {
   for (auto const& item :
        {std::pair<at::Tensor const*, char const*>{
             &packed_cache, "packed_cache"},
@@ -461,10 +475,6 @@ void kvarn_materialize_packed_kv_xe2(
   auto* value = static_cast<cutlass::half_t*>(value_output.data_ptr());
   int const max_blocks = static_cast<int>((max_seq_len + kGroup - 1) / kGroup);
   int const table_stride = static_cast<int>(block_table.stride(0));
-  bool const dpas = [] {
-    auto const* text = std::getenv("KVARN_NATIVE_XPU_DPAS_LAYOUT");
-    return text != nullptr && std::atoi(text) == 1;
-  }();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   queue.parallel_for(
       sycl::nd_range<1>(
@@ -496,10 +506,10 @@ void kvarn_materialize_packed_kv_xe2(
           float kval;
           float vval;
           if (slot < 0) {
-            float const kq = dpas
+            float const kq = dpas_layout
                                  ? loader.load_k_dpas_quantized(rec, token, dim)
                                  : loader.load_k_quantized(rec, token, dim);
-            float const vq = dpas
+            float const vq = dpas_layout
                                  ? loader.load_v_dpas_quantized(rec, token, dim)
                                  : loader.load_v_quantized(rec, token, dim);
             float const kcol = decltype(loader)::load_f16(

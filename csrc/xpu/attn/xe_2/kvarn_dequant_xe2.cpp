@@ -4,8 +4,6 @@
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
-#include <cstdlib>
-
 namespace {
 
 constexpr int kHeadDim = 256;
@@ -62,7 +60,8 @@ inline void check_inputs(
 void kvarn_dequant_xe2(
     const at::Tensor& packed_cache,
     at::Tensor& key_out,
-    at::Tensor& value_out) {
+    at::Tensor& value_out,
+    bool dpas_layout) {
   check_inputs(packed_cache, key_out, value_out);
 
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
@@ -76,10 +75,6 @@ void kvarn_dequant_xe2(
   const int64_t items_per_record =
       packed_elements_per_record / kPackedBytesPerItem;
   const int64_t total = records * items_per_record;
-  auto const* dpas_layout_env = std::getenv("KVARN_NATIVE_XPU_DPAS_LAYOUT");
-  bool const dpas_layout =
-      dpas_layout_env != nullptr && std::atoi(dpas_layout_env) == 1;
-
   // One work-item consumes an aligned uint32 from K and V, producing eight
   // adjacent FP16 values from each. K remains [D,G] and V remains [G,D],
   // matching the QK/PV operand orientations. Four packed bytes never cross a

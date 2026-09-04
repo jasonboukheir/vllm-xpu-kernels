@@ -17,7 +17,10 @@ void kvarn_decode_xe2(
     int64_t max_seq_len,
     double softmax_scale,
     bool unrotate_output,
-    bool write_bf16_output);
+    bool write_bf16_output,
+    int64_t num_kv_splits,
+    int64_t kernel_variant,
+    bool dpas_layout);
 
 void kvarn_decode_with_scratch_xe2(
     const at::Tensor& query,
@@ -34,7 +37,10 @@ void kvarn_decode_with_scratch_xe2(
     int64_t max_seq_len,
     double softmax_scale,
     bool unrotate_output,
-    bool write_bf16_output);
+    bool write_bf16_output,
+    int64_t num_kv_splits,
+    int64_t kernel_variant,
+    bool dpas_layout);
 
 void kvarn_materialize_packed_kv_xe2(
     const at::Tensor& packed_cache,
@@ -46,4 +52,5 @@ void kvarn_materialize_packed_kv_xe2(
     const at::Tensor& tail_value,
     at::Tensor& key_output,
     at::Tensor& value_output,
-    int64_t max_seq_len);
+    int64_t max_seq_len,
+    bool dpas_layout);

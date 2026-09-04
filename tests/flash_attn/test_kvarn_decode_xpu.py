@@ -173,21 +173,17 @@ def _long_structured_expected(
 @pytest.mark.parametrize("record_stride", [35072, 65536])
 @pytest.mark.parametrize("dpas_layout", [False, True])
 def test_materialize_random_packed_cache_matches_independent_oracle(
-    monkeypatch: pytest.MonkeyPatch,
     record_stride: int,
     dpas_layout: bool,
 ) -> None:
     canonical_cache, layout = make_random_cache(5, record_stride)
     packed_cache = canonical_cache.clone()
     if dpas_layout:
-        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
         for block in range(packed_cache.size(0)):
             for head in range(packed_cache.size(1)):
                 packed_cache[block, head] = swizzle_record_dpas_k4v4(
                     canonical_cache[block, head], layout
                 )
-    else:
-        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
 
     pages = [[4, 1], [3, 0]]
     lengths = [129, 194]
@@ -210,6 +206,7 @@ def test_materialize_random_packed_cache_matches_independent_oracle(
         key_output,
         value_output,
         max(lengths),
+        dpas_layout,
     )
 
     expected_key = []
@@ -330,7 +327,6 @@ def test_ragged_batch_matches_independent_fp32_oracle(
 @pytest.mark.parametrize("record_stride", [35072, 65536])
 @pytest.mark.parametrize("dpas_layout", [False, True])
 def test_nonuniform_kvarn_factors_across_page_boundary(
-    monkeypatch: pytest.MonkeyPatch,
     record_stride: int,
     dpas_layout: bool,
 ) -> None:
@@ -364,15 +360,12 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
 
     packed_cache = cache
     if dpas_layout:
-        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
         packed_cache = cache.clone()
         for block in range(packed_cache.size(0)):
             for kv_head in range(packed_cache.size(1)):
                 packed_cache[block, kv_head] = swizzle_record_dpas_k4v4(
                     cache[block, kv_head], layout
                 )
-    else:
-        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
 
     generator = torch.Generator().manual_seed(314159)
     query = torch.randn((3, 24, 256), generator=generator).to(torch.float16)
@@ -391,6 +384,11 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
         output,
         max(lengths),
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        0,
+        dpas_layout,
     )
     reference = torch.cat(
         [
@@ -452,15 +450,9 @@ def test_kvarn_dpas_fragment_coordinate_tables_are_bijections() -> None:
 
 @pytest.mark.parametrize("dpas_layout", [False, True])
 def test_k_column_scale_reaches_every_token_subgroup(
-    monkeypatch: pytest.MonkeyPatch, dpas_layout: bool
+    dpas_layout: bool,
 ) -> None:
     """Catch mixing MMA-A scale ownership with MMA-B cache fragments."""
-    if dpas_layout:
-        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    else:
-        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "1")
-
     layout = KVarNLayout(record_stride=35072)
     cache = torch.zeros((2, 4, layout.tile_bytes_aligned), dtype=torch.uint8)
     cache[:, :, : layout.k_packed_bytes] = 0x11
@@ -497,6 +489,11 @@ def test_k_column_scale_reaches_every_token_subgroup(
         output,
         256,
         1.0 / 16.0,
+        False,
+        False,
+        1,
+        0,
+        dpas_layout,
     )
 
     # Page 0 has logit 1 and value 0; page 1 has logit 5 and value 1.
@@ -532,38 +529,40 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
     canonical_output = torch.empty_like(query)
     swizzled_output = torch.empty_like(query)
 
-    old_flag = os.environ.pop("KVARN_NATIVE_XPU_DPAS_LAYOUT", None)
-    try:
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            query,
-            cache.xpu(),
-            pages,
-            lengths,
-            block_to_slot,
-            tail_key,
-            tail_value,
-            canonical_output,
-            257,
-            1.0 / 16.0,
-        )
-        os.environ["KVARN_NATIVE_XPU_DPAS_LAYOUT"] = "1"
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            query,
-            swizzled.xpu(),
-            pages,
-            lengths,
-            block_to_slot,
-            tail_key,
-            tail_value,
-            swizzled_output,
-            257,
-            1.0 / 16.0,
-        )
-    finally:
-        if old_flag is None:
-            os.environ.pop("KVARN_NATIVE_XPU_DPAS_LAYOUT", None)
-        else:
-            os.environ["KVARN_NATIVE_XPU_DPAS_LAYOUT"] = old_flag
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        query,
+        cache.xpu(),
+        pages,
+        lengths,
+        block_to_slot,
+        tail_key,
+        tail_value,
+        canonical_output,
+        257,
+        1.0 / 16.0,
+        False,
+        False,
+        0,
+        0,
+        False,
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        query,
+        swizzled.xpu(),
+        pages,
+        lengths,
+        block_to_slot,
+        tail_key,
+        tail_value,
+        swizzled_output,
+        257,
+        1.0 / 16.0,
+        False,
+        False,
+        0,
+        0,
+        True,
+    )
     torch.testing.assert_close(
         swizzled_output, canonical_output, rtol=0, atol=0
     )
@@ -715,10 +714,8 @@ def test_shared_prefix_is_deterministic() -> None:
 
 
 def test_decode_with_scratch_matches_legacy_and_reuses_storage(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.xpu.synchronize()
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
     cache, _ = make_random_cache(6)
     generator = torch.Generator().manual_seed(20260808)
     query = torch.randn((4, 24, 256), generator=generator).half().xpu()
@@ -748,7 +745,9 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage(
         tensor.data_ptr() for tensor in (temp_output, exp_sums, max_logits)
     )
 
-    torch.ops._vllm_fa2_C.kvarn_decode(*arguments, legacy, 129, 1.0 / 16.0)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments, legacy, 129, 1.0 / 16.0, False, False, 16, 0, False
+    )
     for _ in range(3):
         torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
             *arguments,
@@ -758,6 +757,11 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage(
             actual,
             129,
             1.0 / 16.0,
+            False,
+            False,
+            16,
+            0,
+            False,
         )
         assert pointers == tuple(
             tensor.data_ptr() for tensor in (temp_output, exp_sums, max_logits)
@@ -767,10 +771,9 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage(
 
 @pytest.mark.parametrize("oversized", ["temp_output", "statistics"])
 def test_multisplit_scratch_requires_exact_split_extent(
-    monkeypatch: pytest.MonkeyPatch, oversized: str
+    oversized: str,
 ) -> None:
     """Raw packed reducer strides cannot address oversized split extents."""
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "2")
     cache, _ = make_random_cache(16)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     arguments = (
@@ -802,16 +805,20 @@ def test_multisplit_scratch_requires_exact_split_extent(
             torch.empty_like(query),
             2048,
             1.0 / 16.0,
+            False,
+            False,
+            2,
+            0,
+            False,
         )
 
 
 @pytest.mark.parametrize("record_stride", [35072, 65536])
 @pytest.mark.parametrize("splits", [16, 32])
 def test_split_local_scratch_survives_allocator_pressure(
-    monkeypatch: pytest.MonkeyPatch, record_stride: int, splits: int
+    record_stride: int, splits: int
 ) -> None:
     """The asynchronous reducer must retain legacy wrapper scratch storage."""
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     cache, _ = make_random_cache(188, record_stride)
     generator = torch.Generator().manual_seed(16000 + record_stride)
     query = torch.randn((4, 24, 256), generator=generator).half().xpu()
@@ -833,10 +840,14 @@ def test_split_local_scratch_survives_allocator_pressure(
         tail_value,
     )
 
-    torch.ops._vllm_fa2_C.kvarn_decode(*arguments, expected, 6000, 1.0 / 16.0)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments, expected, 6000, 1.0 / 16.0, False, False, splits, 0, False
+    )
     torch.xpu.synchronize()
     for _ in range(16):
-        torch.ops._vllm_fa2_C.kvarn_decode(*arguments, actual, 6000, 1.0 / 16.0)
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            *arguments, actual, 6000, 1.0 / 16.0, False, False, splits, 0, False
+        )
         # Match all three local scratch allocation classes before consuming
         # the result, maximizing the chance of premature allocator reuse.
         torch.empty(
@@ -855,7 +866,6 @@ def test_split_local_scratch_survives_allocator_pressure(
 @pytest.mark.parametrize("seq_len", [128, 129, 6000])
 @pytest.mark.parametrize("splits", [16, 32])
 def test_split_matches_split1(
-    monkeypatch: pytest.MonkeyPatch,
     record_stride: int,
     seq_len: int,
     splits: int,
@@ -882,11 +892,19 @@ def test_split_matches_split1(
     )
     split1 = torch.empty_like(query)
     split_output = torch.empty_like(query)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "1")
-    torch.ops._vllm_fa2_C.kvarn_decode(*arguments, split1, seq_len, 1.0 / 16.0)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, split_output, seq_len, 1.0 / 16.0
+        *arguments, split1, seq_len, 1.0 / 16.0, False, False, 1, 0, False
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        split_output,
+        seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        0,
+        False,
     )
     torch.testing.assert_close(split_output, split1, atol=2e-2, rtol=2e-2)
 
@@ -894,10 +912,9 @@ def test_split_matches_split1(
 @pytest.mark.parametrize("splits", [16, 32])
 @pytest.mark.parametrize("fused_hadamard", [False, True])
 def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
-    monkeypatch: pytest.MonkeyPatch, splits: int, fused_hadamard: bool
+    splits: int, fused_hadamard: bool
 ) -> None:
     """Reducers must ignore split lanes the producer does not schedule."""
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     max_seq_len = 3073
     seq_lengths = (3070, 3071, 3072, max_seq_len)
     pages_per_row = (max_seq_len + 127) // 128
@@ -960,6 +977,10 @@ def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
             max_seq_len,
             1.0 / 16.0,
             fused_hadamard,
+            False,
+            splits,
+            0,
+            False,
         )
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
@@ -1002,10 +1023,9 @@ def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
 
 @pytest.mark.parametrize("splits", [2, 4, 8, 16, 17, 24, 32])
 def test_fused_output_hadamard_matches_separate_transform(
-    monkeypatch: pytest.MonkeyPatch, splits: int
+    splits: int,
 ) -> None:
     """The reducer fusion preserves the established fp16/H256 boundary."""
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     max_seq_len = 4096
     pages_per_row = max_seq_len // 128
     blocks = 4 * pages_per_row
@@ -1034,13 +1054,29 @@ def test_fused_output_hadamard_matches_separate_transform(
     expected = torch.empty_like(query)
     fused = torch.empty_like(query)
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, rotated, max_seq_len, 1.0 / 16.0
+        *arguments,
+        rotated,
+        max_seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        0,
+        False,
     )
     torch.ops._vllm_fa2_C.kvarn_hadamard(
         rotated.view(-1, 256), expected.view(-1, 256)
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, fused, max_seq_len, 1.0 / 16.0, True
+        *arguments,
+        fused,
+        max_seq_len,
+        1.0 / 16.0,
+        True,
+        False,
+        splits,
+        0,
+        False,
     )
 
     assert torch.isfinite(fused).all()
@@ -1048,9 +1084,7 @@ def test_fused_output_hadamard_matches_separate_transform(
 
 
 def test_fused_output_hadamard_rejects_single_split(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "1")
     cache, _ = make_random_cache(4)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(RuntimeError, match="requires a multi-split"):
@@ -1065,16 +1099,19 @@ def test_fused_output_hadamard_rejects_single_split(
             128,
             1.0 / 16.0,
             True,
+            False,
+            1,
+            0,
+            False,
         )
 
 
 @pytest.mark.parametrize("with_scratch", [False, True])
 @pytest.mark.parametrize("splits", [16, 24])
 def test_fused_bf16_output_matches_fp16_copy_contract(
-    monkeypatch: pytest.MonkeyPatch, with_scratch: bool, splits: int
+    with_scratch: bool, splits: int
 ) -> None:
     """Direct bf16 output must preserve both historical fp16 roundings."""
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     seq_len = 6000
     pages_per_row = (seq_len + 127) // 128
     cache, _ = make_random_cache(pages_per_row)
@@ -1109,6 +1146,10 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
             seq_len,
             1.0 / 16.0,
             True,
+            False,
+            splits,
+            0,
+            False,
         )
         torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
             *arguments,
@@ -1118,13 +1159,32 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
             1.0 / 16.0,
             True,
             True,
+            splits,
+            0,
+            False,
         )
     else:
         torch.ops._vllm_fa2_C.kvarn_decode(
-            *arguments, historical, seq_len, 1.0 / 16.0, True
+            *arguments,
+            historical,
+            seq_len,
+            1.0 / 16.0,
+            True,
+            False,
+            splits,
+            0,
+            False,
         )
         torch.ops._vllm_fa2_C.kvarn_decode(
-            *arguments, direct, seq_len, 1.0 / 16.0, True, True
+            *arguments,
+            direct,
+            seq_len,
+            1.0 / 16.0,
+            True,
+            True,
+            splits,
+            0,
+            False,
         )
 
     torch.testing.assert_close(
@@ -1133,9 +1193,7 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
 
 
 def test_bf16_output_requires_fused_unrotation(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
     cache, _ = make_random_cache(4)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(RuntimeError, match="requires unrotate_output"):
@@ -1151,6 +1209,9 @@ def test_bf16_output_requires_fused_unrotation(
             1.0 / 16.0,
             False,
             True,
+            16,
+            0,
+            False,
         )
 
 
@@ -1167,14 +1228,9 @@ _LONG_CONTEXT_LAYOUT_SPLITS = [
     ("dpas_layout", "splits"), _LONG_CONTEXT_LAYOUT_SPLITS
 )
 def test_long_context_ragged_b4_matches_structured_oracle(
-    monkeypatch: pytest.MonkeyPatch, dpas_layout: bool, splits: int
+    dpas_layout: bool, splits: int
 ) -> None:
     """Exercise packed and hybrid traversal through the 262K boundary."""
-    if dpas_layout:
-        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    else:
-        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     num_blocks = 2048
     cache, layout, page_scores, value_rows, column_scales = (
         _make_long_structured_cache(num_blocks)
@@ -1279,9 +1335,22 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         output,
         max(seq_lengths),
         1.0 / 16.0,
+        False,
+        False,
+        splits,
+        0,
+        dpas_layout,
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, repeat, max(seq_lengths), 1.0 / 16.0
+        *arguments,
+        repeat,
+        max(seq_lengths),
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        0,
+        dpas_layout,
     )
     if splits > 1:
         partials_cpu = temp_output.cpu().view(4, splits, 24, 256)
