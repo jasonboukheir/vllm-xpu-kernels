@@ -256,19 +256,27 @@ void kvarn_decode_with_scratch_xe2(
   TORCH_CHECK(
       std::isfinite(softmax_scale) && softmax_scale > 0.0,
       "softmax_scale must be finite and positive");
+  bool const use_q6 =
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6Scalar) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad);
   bool const use_dpas_vector_load =
       kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad);
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
-          use_dpas_vector_load,
+          use_q6 || use_dpas_vector_load,
       "unsupported native KVarN kernel_variant ",
       kernel_variant,
-      "; implemented variants are 0 (q8 scalar) and 3 (q8 vector load)");
+      "; implemented variants are 0 (q8 scalar), 2 (q6 scalar), 3 (q8 "
+      "vector load), and 4 (q6 vector load)");
   TORCH_CHECK(
-      !use_dpas_vector_load || dpas_layout,
-      "kernel_variant=3 requires dpas_layout=True");
+      (!use_q6 && !use_dpas_vector_load) || dpas_layout,
+      "kernel variants 2, 3, and 4 require dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
 
   cutlass::fmha::collective::KVarNK4V4Layout layout{
@@ -350,10 +358,14 @@ void kvarn_decode_with_scratch_xe2(
   args.softmax_lse_accum = exp_sums.data_ptr<float>();
   args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  auto status = use_dpas_vector_load
-                    ? KVarNDecodeD256G128DpasVectorLoadConfig::run(queue, args)
-                : dpas_layout ? KVarNDecodeD256G128DpasConfig::run(queue, args)
-                              : KVarNDecodeD256G128Config::run(queue, args);
+  auto status =
+      use_q6 && use_dpas_vector_load
+          ? KVarNDecodeD256G128DpasQ6VectorLoadConfig::run(queue, args)
+      : use_q6 ? KVarNDecodeD256G128DpasQ6Config::run(queue, args)
+      : use_dpas_vector_load
+          ? KVarNDecodeD256G128DpasVectorLoadConfig::run(queue, args)
+      : dpas_layout ? KVarNDecodeD256G128DpasConfig::run(queue, args)
+                    : KVarNDecodeD256G128Config::run(queue, args);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
       "native KVarN decode rejected the validated problem");

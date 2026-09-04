@@ -38,9 +38,13 @@ struct kvarn_decode_args_t {
  * tile-128/ReduceK=8 path has a known cross-subgroup reduction correctness
  * issue, while tile 64 visits each KVarN page in exactly two iterations.
  */
-struct KVarNDecodeD256G128Policy {
-  using BasePolicy =
-      decode_policy_qpacked_head<cute::_8, cute::_256, cute::_64>;
+template <class QPacked>
+struct KVarNDecodeD256G128PolicyImpl {
+  static_assert(
+      cute::is_same_v<QPacked, cute::Int<6>> ||
+          cute::is_same_v<QPacked, cute::_8>,
+      "KVarN D256/G128 supports only the exact GQA-6 and legacy Q8 tiles");
+  using BasePolicy = decode_policy_qpacked_head<QPacked, cute::_256, cute::_64>;
   using ShapeQK = typename BasePolicy::ShapeQK;
   using ShapePV = typename BasePolicy::ShapePV;
   using ShapeOut = typename BasePolicy::ShapeOut;
@@ -53,6 +57,9 @@ struct KVarNDecodeD256G128Policy {
   static constexpr int NumKVHeads = 4;
   static constexpr int QueryHeadsPerKV = 6;
 };
+
+using KVarNDecodeD256G128Policy = KVarNDecodeD256G128PolicyImpl<cute::_8>;
+using KVarNDecodeD256G128Q6Policy = KVarNDecodeD256G128PolicyImpl<cute::Int<6>>;
 
 static_assert(cute::size<1>(KVarNDecodeD256G128Policy::ShapeQK{}) == 64);
 static_assert(cute::size<1>(KVarNDecodeD256G128Policy::ShapeOut{}) == 256);
@@ -358,11 +365,14 @@ struct KVarNReduceSplitOutputHadamardKernel {
  * the surrounding XeFMHA kernel's type contract and are never dereferenced by
  * the custom mainloop.
  */
-template <bool DpasPacked = false, bool VectorPackedLoads = false>
+template <
+    bool DpasPacked = false,
+    class QPacked = cute::_8,
+    bool VectorPackedLoads = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
 
-  using Policy = KVarNDecodeD256G128Policy;
+  using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
   using TileShapePV = typename Policy::ShapePV;
   using TileShapeO = typename Policy::ShapeOut;
@@ -411,8 +421,14 @@ struct KVarNDecodeD256G128ConfigImpl {
       TensorV,
       DpasPacked,
       VectorPackedLoads>;
-  using Epilogue = cutlass::fmha::collective::
-      DecodeFwdEpilogue<Mainloop, TileShapeO, TensorO, TensorLSE, void, false>;
+  using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
+      Mainloop,
+      TileShapeO,
+      TensorO,
+      TensorLSE,
+      void,
+      false,
+      cute::is_same_v<QPacked, cute::Int<6>>>;
   using ProblemShape = cutlass::fmha::kernel::DecodeProblemShape<false>;
   using Kernel = cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
       ProblemShape,
@@ -691,4 +707,76 @@ struct KVarNDecodeD256G128ConfigImpl {
 using KVarNDecodeD256G128Config = KVarNDecodeD256G128ConfigImpl<false>;
 using KVarNDecodeD256G128DpasConfig = KVarNDecodeD256G128ConfigImpl<true>;
 using KVarNDecodeD256G128DpasVectorLoadConfig =
-    KVarNDecodeD256G128ConfigImpl<true, true>;
+    KVarNDecodeD256G128ConfigImpl<true, cute::_8, true>;
+using KVarNDecodeD256G128DpasQ6Config =
+    KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>>;
+using KVarNDecodeD256G128DpasQ6VectorLoadConfig =
+    KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>, true>;
+
+// Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
+// of the established four Reduce-K subgroups.  Prove against the actual CuTe
+// fragment layout that a subgroup covers its subtile exactly once.  The shape
+// assertions below then prove the 2x2 subtile grid partitions the 6x256 tile.
+constexpr bool r1_p2_q6_fragment_is_bijective() {
+  using Epilogue = KVarNDecodeD256G128DpasQ6Config::Epilogue;
+  using Fragment = Epilogue::ReduceFragA;
+  constexpr int kQ = cute::size<0>(typename Epilogue::SGTileShapeO{});
+  constexpr int kV = cute::size<1>(typename Epilogue::SGTileShapeO{});
+  constexpr int kSubgroupSize = cute::intel::sg_size;
+  bool visited[kQ * kV]{};
+
+  for (int lane = 0; lane < kSubgroupSize; ++lane) {
+    for (int value = 0; value < Fragment{}.size(); ++value) {
+      auto coord = Fragment{}.tv_layout()(lane, value);
+      int const q = int(cute::get<0>(coord));
+      int const v = int(cute::get<1>(coord));
+      if (q < 0 || q >= kQ || v < 0 || v >= kV || visited[q * kV + v]) {
+        return false;
+      }
+      visited[q * kV + v] = true;
+    }
+  }
+  for (bool element : visited) {
+    if (!element) return false;
+  }
+  return true;
+}
+
+// The old natural and q8 aliases retain their original template arguments,
+// DPAS repeat, and generic block-copy epilogue.  Q6 alone opts into repeat-2
+// DPAS and the scalar output adapter.
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128Config,
+              KVarNDecodeD256G128ConfigImpl<false, cute::_8, false>>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasConfig,
+              KVarNDecodeD256G128ConfigImpl<true, cute::_8, false>>);
+static_assert(KVarNDecodeD256G128DpasConfig::SGTileQ == 8);
+static_assert(KVarNDecodeD256G128DpasQ6Config::SGTileQ == 6);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasConfig::MMAOperation,
+              cute::XE_DPAS_TT<8, float, cutlass::half_t>>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6Config::MMAOperation,
+              cute::XE_DPAS_TT<2, float, cutlass::half_t>>);
+static_assert(!KVarNDecodeD256G128DpasConfig::Epilogue::ScalarOutput);
+static_assert(KVarNDecodeD256G128DpasQ6Config::Epilogue::ScalarOutput);
+static_assert(
+    cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
+    6);
+static_assert(
+    cute::size<1>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
+    256);
+static_assert(
+    cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::SGTileShapeO{}) ==
+    3);
+static_assert(
+    cute::size<1>(KVarNDecodeD256G128DpasQ6Config::Epilogue::SGTileShapeO{}) ==
+    128);
+static_assert(
+    cute::size<0>(cute::shape(
+        KVarNDecodeD256G128DpasQ6Config::Epilogue::ReduceSGLayout{})) == 2);
+static_assert(
+    cute::size<1>(cute::shape(
+        KVarNDecodeD256G128DpasQ6Config::Epilogue::ReduceSGLayout{})) == 2);
+static_assert(r1_p2_q6_fragment_is_bijective());

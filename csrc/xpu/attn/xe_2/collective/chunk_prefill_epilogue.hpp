@@ -347,9 +347,10 @@ template <
     class CollectiveMainloop,  // Attention mainloop
     class TileShapeO_,  // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,     // 2D slice of global output tensor
-    class TensorLSE_ = void,   // Optional intermediate natural-LSE tensor
-    class TiledCopyO_ = void,  // Optional TiledCopy for loading O
-    bool Sink_ = false>        // Whether to sink softmax into epilogue
+    class TensorLSE_ = void,     // Optional intermediate natural-LSE tensor
+    class TiledCopyO_ = void,    // Optional TiledCopy for loading O
+    bool Sink_ = false,          // Whether to sink softmax into epilogue
+    bool ScalarOutput_ = false>  // Whether to use coordinate scalar stores
 class DecodeFwdEpilogue {
  public:
   //
@@ -409,8 +410,18 @@ class DecodeFwdEpilogue {
       make_layout(select<1, 0>(SGTileShapeO{}), Stride<E<1>, E<0>>{})));
   using ReduceFragARow = decltype(reduce<1>(ReduceFragA{}, sycl::plus<void>{}));
 
+  // Xe block stores require a power-of-two-compatible Q extent. KVarN's
+  // exact GQA-6 experiment deliberately uses a six-row DPAS tile, whose
+  // cross-subgroup reduction produces 3x128 output subtiles. Keep the
+  // existing block-store path identical for established policies and use a
+  // narrow coordinate scatter only for that Q6 tile.
+  static constexpr bool ScalarOutput = ScalarOutput_;
+  struct ScalarCopyO {};
+
   static auto default_tiled_copy_O_helper() {
-    if constexpr (ReduceK{} == _1{})
+    if constexpr (ScalarOutput)
+      return ScalarCopyO{};
+    else if constexpr (ReduceK{} == _1{})
       return make_block_2d_copy_D(TiledMMAPV{}, TensorO2D{});
     else
       return make_block_2d_copy_D_subtiled(
@@ -423,6 +434,46 @@ class DecodeFwdEpilogue {
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
   using TiledCopyO =
       conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
+
+  template <typename OutputFragment, typename QVCoord>
+  CUTLASS_DEVICE static void store_scalar_output(
+      TensorO2D const& O,
+      OutputFragment const& rA,
+      QVCoord blk_qv,
+      int thr_id) {
+    auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk())
+                       .get_flat_coord(assert_uniform(thr_id));
+    int q_subtile;
+    int v_subtile;
+    if constexpr (ReduceK{} == _1{}) {
+      // group<1,3> flattens the MMA M/N subgroup coordinate as a_tile.
+      // Q6 uses three M subgroups and one N subgroup, so a_tile is exactly
+      // the two-row Q-subtile index.
+      q_subtile = int(get<1>(thr_vak));
+      v_subtile = 0;
+    } else {
+      auto reduction_subtile = get<2>(thr_vak);
+      auto subtile_coord = idx2crd(reduction_subtile, shape(ReduceSGLayout{}));
+      q_subtile = int(get<0>(subtile_coord));
+      v_subtile = int(get<1>(subtile_coord));
+    }
+    int const lane =
+        sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+    int const q_base = int(get<0>(blk_qv)) * size<0>(TileShapeO{}) +
+                       q_subtile * size<0>(SGTileShapeO{});
+    int const v_base = int(get<1>(blk_qv)) * size<1>(TileShapeO{}) +
+                       v_subtile * size<1>(SGTileShapeO{});
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); ++i) {
+      auto coord = rA.tv_layout()(lane, i);
+      int const q = q_base + int(get<0>(coord));
+      int const v = v_base + int(get<1>(coord));
+      if (q < size<0>(O.shape()) && v < size<1>(O.shape())) {
+        O(q, v) = static_cast<ElementO>(rA(i));
+      }
+    }
+  }
 
   // Stateless design -- no arguments or parameters.
   struct Arguments {};
@@ -544,13 +595,13 @@ class DecodeFwdEpilogue {
     // q_row explicitly so the reported statistics stay correct.
     ElementA stats_sum = rA_sum(0);
 
-    Tensor cO = make_identity_tensor(O.shape());       // (q,v)
-    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
-    TiledCopyO copy_o{O};
-    auto thr_copy_o = copy_o.get_slice(thr_id);
-    auto tOgO = thr_copy_o.partition_D(gO);  // fragment coords (q,v)
-
     if constexpr (Sink) {
+      static_assert(!ScalarOutput, "Q6 KVarN decode does not use softmax sink");
+      Tensor cO = make_identity_tensor(O.shape());       // (q,v)
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOgO = thr_copy_o.partition_D(gO);  // fragment coords (q,v)
       constexpr double kLog2e = 1.4426950408889634074;
       if (row_valid && idx_kv_split == 0) {
         stats_sum += sycl::native::exp2(
@@ -607,12 +658,20 @@ class DecodeFwdEpilogue {
       rA(i) *= broadcast<0>(rA_sum, rA, i);
     }
 
-    /* Tile output (cO/gO/copy_o/thr_copy_o/tOgO computed above for the sink) */
-    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    if constexpr (ScalarOutput) {
+      store_scalar_output(O, rA, blk_qv, thr_id);
+    } else {
+      Tensor cO = make_identity_tensor(O.shape());       // (q,v)
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOgO = thr_copy_o.partition_D(gO);
 
-    /* Reorder tile and write out */
-    reorder(rA, tOrO);
-    copy(copy_o, tOrO, tOgO);
+      /* Reorder tile and write out */
+      reorder(rA, tOrO);
+      copy(copy_o, tOrO, tOgO);
+    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.
@@ -629,6 +688,95 @@ class DecodeFwdEpilogue {
 
     if constexpr (ReduceK{} == _1{}) {
       return std::make_tuple(tArA, tA_max, tA_sum, true);
+    } else if constexpr (ScalarOutput) {
+      // Q6 retains KVarN's established four-subgroup K64 decomposition. The
+      // generic block-copy reduction requires power-of-two-compatible row
+      // subtiles, while Q6 redistributes those subgroups as 2x2 output
+      // subtiles of 3x128. Scatter the same source fragments to the existing
+      // SLM storage and perform the same max/rescale/sum reduction explicitly.
+      constexpr int kQ = size<0>(TileShapeO{});
+      constexpr int kV = size<1>(TileShapeO{});
+      constexpr int kAlignedQ = decltype(AlignedSGTileA_Q{})::value;
+      constexpr int kReduceK = decltype(ReduceK{})::value;
+      static_assert(kQ == 6 && kV == 256 && kReduceK == 4);
+
+      auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk())
+                         .get_flat_coord(assert_uniform(thr_id));
+      int const source_k = int(get<2>(thr_vak));
+      int const lane =
+          sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tArA.size(); ++i) {
+        auto coord = tArA.tv_layout()(lane, i);
+        int const q = int(get<0>(coord));
+        int const v = int(get<1>(coord));
+        shared.a_data[(source_k * kQ + q) * kV + v] = tArA(i);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tA_max.size(); ++i) {
+        int const q = int(tA_max.tv_layout()(lane).value());
+        if (q < kQ) {
+          shared.a_max_data[source_k * kAlignedQ + q] = tA_max(i);
+          shared.a_sum_data[source_k * kAlignedQ + q] = tA_sum(i);
+        }
+      }
+
+      barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+      barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+
+      ReduceFragA rA;
+      ReduceFragARow rA_sum, rA_max;
+      auto output_subtile = idx2crd(source_k, shape(ReduceSGLayout{}));
+      int const q_offset =
+          int(get<0>(output_subtile)) * size<0>(SGTileShapeO{});
+      int const v_offset =
+          int(get<1>(output_subtile)) * size<1>(SGTileShapeO{});
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_max.size(); ++i) {
+        int const q_local = int(rA_max.tv_layout()(lane).value());
+        int const q = q_offset + q_local;
+        if (q < kQ) {
+          float global_max = shared.a_max_data[q];
+          CUTLASS_PRAGMA_UNROLL
+          for (int kr = 1; kr < kReduceK; ++kr) {
+            global_max =
+                sycl::fmax(global_max, shared.a_max_data[kr * kAlignedQ + q]);
+          }
+          float global_sum = 0.0f;
+          CUTLASS_PRAGMA_UNROLL
+          for (int kr = 0; kr < kReduceK; ++kr) {
+            float const weight = sycl::native::exp2(
+                shared.a_max_data[kr * kAlignedQ + q] - global_max);
+            global_sum += shared.a_sum_data[kr * kAlignedQ + q] * weight;
+          }
+          rA_max(i) = global_max;
+          rA_sum(i) = global_sum;
+        }
+      }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); ++i) {
+        auto coord = rA.tv_layout()(lane, i);
+        int const q = q_offset + int(get<0>(coord));
+        int const v = v_offset + int(get<1>(coord));
+        float global_max = shared.a_max_data[q];
+        CUTLASS_PRAGMA_UNROLL
+        for (int kr = 1; kr < kReduceK; ++kr) {
+          global_max =
+              sycl::fmax(global_max, shared.a_max_data[kr * kAlignedQ + q]);
+        }
+        float value = 0.0f;
+        CUTLASS_PRAGMA_UNROLL
+        for (int kr = 0; kr < kReduceK; ++kr) {
+          float const weight = sycl::native::exp2(
+              shared.a_max_data[kr * kAlignedQ + q] - global_max);
+          value += shared.a_data[(kr * kQ + q) * kV + v] * weight;
+        }
+        rA(i) = value;
+      }
+      return std::make_tuple(rA, rA_max, rA_sum, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk())
