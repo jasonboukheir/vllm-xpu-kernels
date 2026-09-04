@@ -33,7 +33,9 @@ from benchmark.kvarn_utils import (  # noqa: E402
     swizzle_record_dpas_k4v4,
 )
 
+R1_P2_DPAS_Q6 = 2
 R1_P5_DPAS_VECTOR_LOAD = 3
+R1_P2_P5_DPAS_Q6_VECTOR_LOAD = 4
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -505,7 +507,7 @@ def test_k_column_scale_reaches_every_token_subgroup(
     assert torch.isfinite(output).all()
 
 
-def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
+def test_round1_dpas_variants_match_canonical_ragged_and_hybrid() -> None:
     cache, layout = make_random_cache(6)
     swizzled = cache.clone()
     for block in range(6):
@@ -529,12 +531,16 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
         (1, 128, 4, 256), generator=generator, dtype=torch.float16
     ).xpu()
     canonical_output = torch.empty_like(query)
-    swizzled_output = torch.empty_like(query)
-    vector_output = torch.empty_like(query)
+    q8_output = torch.empty_like(query)
+    q6_output = torch.empty_like(query)
+    q8_vector_output = torch.empty_like(query)
+    q6_vector_output = torch.empty_like(query)
+    canonical_xpu = cache.xpu()
+    swizzled_xpu = swizzled.xpu()
 
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
-        cache.xpu(),
+        canonical_xpu,
         pages,
         lengths,
         block_to_slot,
@@ -558,7 +564,7 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
         block_to_slot,
         tail_key,
         tail_value,
-        swizzled_output,
+        q8_output,
         257,
         1.0 / 16.0,
         False,
@@ -575,7 +581,7 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
         block_to_slot,
         tail_key,
         tail_value,
-        vector_output,
+        q8_vector_output,
         257,
         1.0 / 16.0,
         False,
@@ -584,10 +590,31 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
         R1_P5_DPAS_VECTOR_LOAD,
         True,
     )
-    torch.testing.assert_close(
-        swizzled_output, canonical_output, rtol=0, atol=0
-    )
-    torch.testing.assert_close(vector_output, swizzled_output, rtol=0, atol=0)
+    for kernel_variant, output in (
+        (R1_P2_DPAS_Q6, q6_output),
+        (R1_P2_P5_DPAS_Q6_VECTOR_LOAD, q6_vector_output),
+    ):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            swizzled_xpu,
+            pages,
+            lengths,
+            block_to_slot,
+            tail_key,
+            tail_value,
+            output,
+            257,
+            1.0 / 16.0,
+            False,
+            False,
+            0,
+            kernel_variant,
+            True,
+        )
+    torch.testing.assert_close(q8_output, canonical_output, rtol=0, atol=0)
+    torch.testing.assert_close(q8_vector_output, q8_output, rtol=0, atol=0)
+    torch.testing.assert_close(q6_output, q8_output, rtol=0, atol=0)
+    torch.testing.assert_close(q6_vector_output, q8_output, rtol=0, atol=0)
 
 
 def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
@@ -595,7 +622,7 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(
         RuntimeError,
-        match="kernel_variant=3 requires dpas_layout=True",
+        match="kernel variants 2, 3, and 4 require dpas_layout=True",
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
             query,
@@ -655,7 +682,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [1, 2, 4, 5, -1, 6])
+@pytest.mark.parametrize("kernel_variant", [1, 5, -1, 6])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -679,6 +706,107 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
             kernel_variant,
             True,
         )
+
+
+@pytest.mark.parametrize(
+    "kernel_variant",
+    [R1_P2_DPAS_Q6, R1_P5_DPAS_VECTOR_LOAD, R1_P2_P5_DPAS_Q6_VECTOR_LOAD],
+)
+def test_round1_variants_are_dpas_only(kernel_variant: int) -> None:
+    cache, _ = make_cache(1)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    arguments = (
+        query,
+        cache.xpu(),
+        torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+        torch.ones((1,), dtype=torch.int32, device="xpu"),
+        torch.full((1,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+        torch.empty_like(query),
+        1,
+        1.0 / 16.0,
+        False,
+        False,
+        1,
+        kernel_variant,
+        False,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="kernel variants 2, 3, and 4 require dpas_layout=True",
+    ):
+        torch.ops._vllm_fa2_C.kvarn_decode(*arguments)
+
+
+def test_r1_p2_dpas_q6_t64_matches_q8_at_262k_high_addresses() -> None:
+    """Keep Q6 exact across the service limit and high cache addresses."""
+    num_blocks = 2048
+    cache, _, _, _, _ = _make_long_structured_cache(num_blocks)
+    base = torch.arange(num_blocks, dtype=torch.int64)
+    page_rows = torch.stack(
+        (
+            base,
+            (base * 5 + 17) % num_blocks,
+            base.flip(0),
+            torch.cat((torch.tensor([2047, 1023]), base[2:])),
+        )
+    )
+    seq_lengths = (262144, 131071, 65536, 192)
+    generator = torch.Generator().manual_seed(20260903)
+    query = torch.randn((4, 24, 256), generator=generator).half().xpu()
+    cache_xpu = cache.xpu()
+    arguments = (
+        query,
+        cache_xpu,
+        page_rows.to(dtype=torch.int32, device="xpu"),
+        torch.tensor(seq_lengths, dtype=torch.int32, device="xpu"),
+        torch.full((num_blocks,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+    )
+    natural = torch.empty_like(query)
+    q8 = torch.empty_like(query)
+    q6 = torch.empty_like(query)
+    q8_vector = torch.empty_like(query)
+    q6_vector = torch.empty_like(query)
+
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        natural,
+        max(seq_lengths),
+        1.0 / 16.0,
+        False,
+        False,
+        16,
+        0,
+        False,
+    )
+
+    # The structured cache uses uniform nibbles in each packed K/V payload,
+    # so its canonical and DPAS byte orders are identical. Metadata and page
+    # addressing remain nonuniform and exercise the high-address path.
+    for kernel_variant, output in (
+        (0, q8),
+        (R1_P2_DPAS_Q6, q6),
+        (R1_P5_DPAS_VECTOR_LOAD, q8_vector),
+        (R1_P2_P5_DPAS_Q6_VECTOR_LOAD, q6_vector),
+    ):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            *arguments,
+            output,
+            max(seq_lengths),
+            1.0 / 16.0,
+            False,
+            False,
+            16,
+            kernel_variant,
+            True,
+        )
+
+    torch.testing.assert_close(q8, natural, rtol=0, atol=0)
+    torch.testing.assert_close(q6, q8, rtol=0, atol=0)
+    torch.testing.assert_close(q8_vector, q8, rtol=0, atol=0)
+    torch.testing.assert_close(q6_vector, q8, rtol=0, atol=0)
+    assert torch.isfinite(q6).all()
 
 
 def test_full_precision_tail_and_packed_history_share_softmax() -> None:
@@ -1338,8 +1466,16 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
         pytest.param(
             True,
             24,
-            R1_P5_DPAS_VECTOR_LOAD,
-            id="r1-p5-dpas-vector-load",
+            kernel_variant,
+            id=variant_id,
+        )
+        for kernel_variant, variant_id in (
+            (R1_P2_DPAS_Q6, "r1-p2-dpas-q6"),
+            (R1_P5_DPAS_VECTOR_LOAD, "r1-p5-dpas-vector-load"),
+            (
+                R1_P2_P5_DPAS_Q6_VECTOR_LOAD,
+                "r1-p2-p5-dpas-q6-vector-load",
+            ),
         )
     ]
 )
