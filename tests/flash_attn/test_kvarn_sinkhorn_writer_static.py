@@ -62,3 +62,11 @@ def test_existing_balanced_writer_remains_an_independent_control() -> None:
     assert "class KVarNBalancedWriterKernel" in ESTABLISHED_WRITER
     assert "void kvarn_pack_balanced_kv_xe2" in ESTABLISHED_WRITER
     assert "KVarNSinkhornWriterKernel" not in ESTABLISHED_WRITER
+
+
+def test_launch_and_allocator_use_the_cache_device_current_stream() -> None:
+    selector = "getCurrentXPUStream(packed_cache.device().index())"
+    assert WRITER.count(selector) == 1
+    assert "getCurrentXPUStream().queue()" not in WRITER
+    assert "auto& queue = current_stream.queue()" in WRITER
+    assert "tensor->storage().data_ptr(), current_stream" in WRITER

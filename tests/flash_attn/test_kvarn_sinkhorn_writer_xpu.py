@@ -30,6 +30,7 @@ def _load_op() -> None:
 def xpu_runtime() -> None:
     if not torch.xpu.is_available():
         pytest.skip("an XPU is not available")
+    assert torch.xpu.get_device_name(0) == "Intel(R) Arc(TM) Pro B70 Graphics"
 
 
 def _imbalance(tile: torch.Tensor) -> torch.Tensor:
@@ -279,6 +280,63 @@ def test_sinkhorn_writer_uses_int64_long_context_record_addressing():
     assert torch.all(cache[long_block - 1] == 0xA5)
 
 
+def test_sinkhorn_writer_handles_multiple_valid_blocks_at_iteration16():
+    _load_op()
+    tail_key, tail_value = _tail_fixture(torch.float16, pool_size=4)
+    original_key = tail_key.clone()
+    original_value = tail_value.clone()
+    pool_slots_cpu = torch.tensor([3, 0, 2], dtype=torch.int64)
+    block_ids = torch.tensor([6, 1, 4], dtype=torch.int64, device="xpu")
+    tail_key_xpu = tail_key.xpu()
+    tail_value_xpu = tail_value.xpu()
+    cache = torch.full(
+        (8, 4, RECORD_BYTES), 0xA5, dtype=torch.uint8, device="xpu"
+    )
+
+    torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
+        tail_key_xpu,
+        tail_value_xpu,
+        pool_slots_cpu.xpu(),
+        block_ids,
+        cache,
+        16,
+        True,
+    )
+    torch.xpu.synchronize()
+
+    expected = _record_reference(
+        tail_key, tail_value, pool_slots_cpu, 16, RECORD_BYTES
+    )
+    actual = cache.cpu()
+    for output_block, reference_index in zip([6, 1, 4], range(3)):
+        assert torch.equal(
+            actual[output_block], expected[reference_index]
+        ), _byte_mismatch_evidence(actual[output_block], expected[reference_index])
+    assert torch.all(actual[[0, 2, 3, 5, 7]] == 0xA5)
+    assert torch.equal(tail_key_xpu.cpu(), original_key)
+    assert torch.equal(tail_value_xpu.cpu(), original_value)
+
+
+def test_sinkhorn_writer_empty_schedule_is_noop():
+    _load_op()
+    tail_key, tail_value = _tail_fixture(torch.float16, pool_size=1)
+    tail_key_xpu = tail_key.xpu()
+    tail_value_xpu = tail_value.xpu()
+    empty = torch.empty(0, dtype=torch.int64, device="xpu")
+    cache = torch.full(
+        (2, 4, RECORD_BYTES), 0xA5, dtype=torch.uint8, device="xpu"
+    )
+
+    torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
+        tail_key_xpu, tail_value_xpu, empty, empty, cache, 16, True
+    )
+    torch.xpu.synchronize()
+
+    assert torch.all(cache == 0xA5)
+    assert torch.equal(tail_key_xpu.cpu(), tail_key)
+    assert torch.equal(tail_value_xpu.cpu(), tail_value)
+
+
 def test_sinkhorn_writer_rejects_non_abi_inputs():
     _load_op()
     tail_key, tail_value = _tail_fixture(torch.float16, pool_size=1)
@@ -291,4 +349,8 @@ def test_sinkhorn_writer_rejects_non_abi_inputs():
     with pytest.raises(RuntimeError, match="between 0 and 64"):
         torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
             tail_key.xpu(), tail_value.xpu(), zero, zero, cache, 65, True
+        )
+    with pytest.raises(RuntimeError, match="between 0 and 64"):
+        torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
+            tail_key.xpu(), tail_value.xpu(), zero, zero, cache, -1, True
         )

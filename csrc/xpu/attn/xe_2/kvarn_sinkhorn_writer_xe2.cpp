@@ -441,7 +441,9 @@ void kvarn_sinkhorn_pack_kv_xe2(
       "sinkhorn_iterations must be between 0 and 64");
   if (block_ids.numel() == 0) return;
 
-  auto& queue = c10::xpu::getCurrentXPUStream().queue();
+  const auto current_stream =
+      c10::xpu::getCurrentXPUStream(packed_cache.device().index());
+  auto& queue = current_stream.queue();
   const int64_t scheduled_blocks = block_ids.size(0);
   const int64_t tiles = scheduled_blocks * kKvHeads;
   const auto launch = [&](auto* key_ptr, auto* value_ptr) {
@@ -477,8 +479,6 @@ void kvarn_sinkhorn_pack_kv_xe2(
         reinterpret_cast<const bf16*>(tail_value.data_ptr<at::BFloat16>()));
   }
 
-  const auto current_stream =
-      c10::xpu::getCurrentXPUStream(packed_cache.device().index());
   const at::Tensor* tensors[] = {
       &tail_key, &tail_value, &pool_slots, &block_ids, &packed_cache};
   for (const at::Tensor* tensor : tensors) {
