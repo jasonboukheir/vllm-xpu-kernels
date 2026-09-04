@@ -70,6 +70,7 @@ static_assert(cute::size<1>(KVarNDecodeD256G128Policy::ShapeOut{}) == 256);
  * generic paged-decode reducer forces every attention configuration to be
  * re-instantiated during each KVarN tuning iteration.
  */
+template <int KVWorkUnitTokens>
 struct KVarNReduceSplit16Kernel {
   using Element = cutlass::half_t;
   static_assert(cute::intel::sg_size == 16);
@@ -100,8 +101,8 @@ struct KVarNReduceSplit16Kernel {
     int const subgroup_id = thread / cute::intel::sg_size;
     auto subgroup = get_sub_group();
 
-    int const kv_tiles = cute::ceil_div(
-        params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
+    int const kv_tiles =
+        cute::ceil_div(params.seq_lens[batch], KVWorkUnitTokens);
     int const active_splits =
         cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
     int const stats_offset =
@@ -157,6 +158,7 @@ struct KVarNReduceSplit16Kernel {
  * split statistics in a small shared array, so one workgroup completes each
  * (batch, query-head) row without another scheduling level.
  */
+template <int KVWorkUnitTokens>
 struct KVarNReduceSplit32Kernel {
   using Element = cutlass::half_t;
 
@@ -182,8 +184,8 @@ struct KVarNReduceSplit32Kernel {
     auto workgroup = get_work_group<3>();
     auto* split_weights = reinterpret_cast<float*>(shared_storage);
 
-    int const kv_tiles = cute::ceil_div(
-        params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
+    int const kv_tiles =
+        cute::ceil_div(params.seq_lens[batch], KVWorkUnitTokens);
     int const active_splits =
         cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
     int const stats_offset =
@@ -242,6 +244,7 @@ struct KVarNReduceSplit32Kernel {
  * stage.  This removes one launch without repeating the transform in every
  * producer split workgroup.
  */
+template <int KVWorkUnitTokens>
 struct KVarNReduceSplitOutputHadamardKernel {
   using Element = cutlass::half_t;
 
@@ -274,8 +277,8 @@ struct KVarNReduceSplitOutputHadamardKernel {
     auto workgroup = get_work_group<3>();
     auto& storage = *reinterpret_cast<SharedStorage*>(shared_storage);
 
-    int const kv_tiles = cute::ceil_div(
-        params.seq_lens[batch], KVarNDecodeD256G128Policy::KVTile);
+    int const kv_tiles =
+        cute::ceil_div(params.seq_lens[batch], KVWorkUnitTokens);
     int const active_splits =
         cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
     int const stats_offset =
@@ -371,7 +374,8 @@ template <
     bool VectorPackedLoads = false,
     bool QKInt8U4 = false,
     bool CacheScalarWeights = false,
-    bool ExactLiveRows = false>
+    bool ExactLiveRows = false,
+    bool PagePair = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -384,6 +388,10 @@ struct KVarNDecodeD256G128ConfigImpl {
   static_assert(
       !ExactLiveRows || cute::is_same_v<QPacked, cute::Int<6>>,
       "exact live-row loops are an exact-Q6 experiment");
+  static_assert(!PagePair || DpasPacked);
+  static_assert(!PagePair || cute::is_same_v<QPacked, cute::Int<6>>);
+  static_assert(!PagePair || !VectorPackedLoads);
+  static_assert(!PagePair || !QKInt8U4);
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -446,7 +454,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       DpasPacked,
       VectorPackedLoads,
       QKInt8U4,
-      ExactLiveRows>;
+      ExactLiveRows,
+      PagePair>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -466,6 +475,12 @@ struct KVarNDecodeD256G128ConfigImpl {
       ProblemShape,
       cutlass::fmha::kernel::XeReduceSplitKTileScheduler,
       Kernel>;
+  static constexpr int KVWorkUnitTokens =
+      PagePair ? Policy::PageSize : Policy::KVTile;
+  using ReductionSplit16Kernel = KVarNReduceSplit16Kernel<KVWorkUnitTokens>;
+  using ReductionSplit32Kernel = KVarNReduceSplit32Kernel<KVWorkUnitTokens>;
+  using ReductionSplitOutputHadamardKernel =
+      KVarNReduceSplitOutputHadamardKernel<KVWorkUnitTokens>;
 
   static cutlass::Status
   run(sycl::queue& queue, kvarn_decode_args_t const& args) {
@@ -492,12 +507,20 @@ struct KVarNDecodeD256G128ConfigImpl {
       }
     }
 
+    // DecodeTileScheduler derives its work ranges from ShapeQK's K64 tile.
+    // For PagePair, present one synthetic K64 scheduling unit per physical
+    // 128-token page; the specialized mainloop expands each unit back into
+    // the two immutable xe2_dpas cache halves.
+    int const scheduler_seq_len =
+        PagePair ? cute::ceil_div(args.max_seq_len, Policy::PageSize) *
+                       Policy::KVTile
+                 : args.max_seq_len;
     ProblemShape shape{
         args.batch_size,
         Policy::NumQueryHeads,
         Policy::NumKVHeads,
         1,
-        args.max_seq_len,
+        scheduler_seq_len,
         Policy::HeadDim,
         Policy::HeadDim};
 
@@ -616,22 +639,22 @@ struct KVarNDecodeD256G128ConfigImpl {
     auto params = Kernel::to_underlying_arguments(kernel_args, nullptr);
     auto reduce_params =
         ReductionSplitKernel::to_underlying_arguments(reduce_args, nullptr);
-    int const max_kv_tiles = cute::ceil_div(args.max_seq_len, Policy::KVTile);
+    int const max_kv_tiles = cute::ceil_div(args.max_seq_len, KVWorkUnitTokens);
     int const kv_tiles_per_split =
         cute::ceil_div(max_kv_tiles, args.num_kv_splits);
-    KVarNReduceSplit16Kernel::Params reduce16_params{
+    typename ReductionSplit16Kernel::Params reduce16_params{
         out,
         reinterpret_cast<Element const*>(args.temp_output),
         args.softmax_lse_accum,
         args.seq_lens,
         kv_tiles_per_split};
-    KVarNReduceSplit32Kernel::Params reduce32_params{
+    typename ReductionSplit32Kernel::Params reduce32_params{
         out,
         reinterpret_cast<Element const*>(args.temp_output),
         args.softmax_lse_accum,
         args.seq_lens,
         kv_tiles_per_split};
-    KVarNReduceSplitOutputHadamardKernel::Params reduce_hadamard_params{
+    typename ReductionSplitOutputHadamardKernel::Params reduce_hadamard_params{
         args.output,
         reinterpret_cast<Element const*>(args.temp_output),
         args.softmax_lse_accum,
@@ -655,9 +678,10 @@ struct KVarNDecodeD256G128ConfigImpl {
       sycl::queue& queue,
       typename Kernel::Params params,
       typename ReductionSplitKernel::Params reduce_params,
-      KVarNReduceSplit16Kernel::Params reduce16_params,
-      KVarNReduceSplit32Kernel::Params reduce32_params,
-      KVarNReduceSplitOutputHadamardKernel::Params reduce_hadamard_params,
+      typename ReductionSplit16Kernel::Params reduce16_params,
+      typename ReductionSplit32Kernel::Params reduce32_params,
+      typename ReductionSplitOutputHadamardKernel::Params
+          reduce_hadamard_params,
       int num_kv_splits,
       bool unrotate_output) {
     namespace syclex = sycl::ext::oneapi::experimental;
@@ -679,38 +703,38 @@ struct KVarNDecodeD256G128ConfigImpl {
     if (unrotate_output) {
       compat::experimental::launch_properties reduce_hadamard_launch_props{
           syclex::work_group_scratch_size(
-              KVarNReduceSplitOutputHadamardKernel::SharedStorageSize)};
+              ReductionSplitOutputHadamardKernel::SharedStorageSize)};
       compat::experimental::launch_policy reduce_hadamard_policy{
           compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
-          compat::dim3(KVarNReduceSplitOutputHadamardKernel::kThreads, 1, 1),
+          compat::dim3(ReductionSplitOutputHadamardKernel::kThreads, 1, 1),
           reduce_hadamard_launch_props,
           kernel_props};
       compat::experimental::launch<
-          cutlass::device_kernel<KVarNReduceSplitOutputHadamardKernel>>(
+          cutlass::device_kernel<ReductionSplitOutputHadamardKernel>>(
           reduce_hadamard_policy, queue, reduce_hadamard_params);
     } else if (num_kv_splits == 32) {
       compat::experimental::launch_properties reduce32_launch_props{
           syclex::work_group_scratch_size(
-              KVarNReduceSplit32Kernel::SharedStorageSize)};
+              ReductionSplit32Kernel::SharedStorageSize)};
       compat::experimental::launch_policy reduce32_policy{
           compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
-          compat::dim3(KVarNReduceSplit32Kernel::kThreads, 1, 1),
+          compat::dim3(ReductionSplit32Kernel::kThreads, 1, 1),
           reduce32_launch_props,
           kernel_props};
       compat::experimental::launch<
-          cutlass::device_kernel<KVarNReduceSplit32Kernel>>(
+          cutlass::device_kernel<ReductionSplit32Kernel>>(
           reduce32_policy, queue, reduce32_params);
     } else if (num_kv_splits == 16) {
       compat::experimental::launch_properties reduce16_launch_props{
           syclex::work_group_scratch_size(
-              KVarNReduceSplit16Kernel::SharedStorageSize)};
+              ReductionSplit16Kernel::SharedStorageSize)};
       compat::experimental::launch_policy reduce16_policy{
           compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
           compat::dim3(128, 1, 1),
           reduce16_launch_props,
           kernel_props};
       compat::experimental::launch<
-          cutlass::device_kernel<KVarNReduceSplit16Kernel>>(
+          cutlass::device_kernel<ReductionSplit16Kernel>>(
           reduce16_policy, queue, reduce16_params);
     } else if (num_kv_splits > 1) {
       dim3 const reduce_block = ReductionSplitKernel::get_block_shape();
@@ -752,6 +776,14 @@ using KVarNDecodeD256G128DpasQ6ExactRowsConfig = KVarNDecodeD256G128ConfigImpl<
     true>;
 using KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig =
     KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>, false, false, true, true>;
+using KVarNDecodeD256G128DpasQ6PagePairConfig = KVarNDecodeD256G128ConfigImpl<
+    true,
+    cute::Int<6>,
+    false,
+    false,
+    false,
+    false,
+    true>;
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -805,12 +837,18 @@ static_assert(!KVarNDecodeD256G128DpasQ6Config::Epilogue::CacheScalarWeights);
 static_assert(
     KVarNDecodeD256G128DpasQ6CachedWeightsConfig::Epilogue::CacheScalarWeights);
 static_assert(!KVarNDecodeD256G128DpasQ6Config::Mainloop::ExactLiveRows);
+static_assert(!KVarNDecodeD256G128DpasQ6Config::Mainloop::PagePair);
 static_assert(
     KVarNDecodeD256G128DpasQ6ExactRowsConfig::Mainloop::ExactLiveRows);
 static_assert(KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::Epilogue::
                   CacheScalarWeights);
 static_assert(KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::Mainloop::
                   ExactLiveRows);
+static_assert(KVarNDecodeD256G128DpasQ6PagePairConfig::Mainloop::PagePair);
+static_assert(KVarNDecodeD256G128DpasQ6PagePairConfig::KVWorkUnitTokens == 128);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6PagePairConfig::MMAOperation,
+              KVarNDecodeD256G128DpasQ6Config::MMAOperation>);
 static_assert(
     cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
     6);
