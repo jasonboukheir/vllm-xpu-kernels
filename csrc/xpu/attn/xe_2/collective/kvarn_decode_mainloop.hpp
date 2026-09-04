@@ -71,6 +71,15 @@ struct KVarNK4V4FragmentLoader {
       kKPackedLaneWords * sizeof(std::uint32_t);
   static constexpr int kVPackedLaneBytes =
       kVPackedLaneWords * sizeof(std::uint32_t);
+  static constexpr int kPackedBytes = kHeadDim * kGroup / 2;
+  static constexpr int kColumnBytes = kHeadDim * sizeof(cutlass::half_t);
+  static constexpr int kRowBytes = kGroup * sizeof(cutlass::half_t);
+  static constexpr int kHalfRowBytes = kRowBytes / 2;
+  static constexpr int kKMetadataBytes = 2 * kColumnBytes + kRowBytes;
+  static constexpr int kVMetadataBytes = kColumnBytes + 2 * kRowBytes;
+  static constexpr int kActiveRecordBytes =
+      2 * kPackedBytes + kKMetadataBytes + kVMetadataBytes;
+  static constexpr int kPagePrefetchThreads = 4 * cute::intel::sg_size;
 
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(kKPackedLaneBytes == 32);
@@ -79,6 +88,11 @@ struct KVarNK4V4FragmentLoader {
       sizeof(sycl::vec<std::uint32_t, kKPackedLaneWords>) == kKPackedLaneBytes);
   static_assert(
       sizeof(sycl::vec<std::uint32_t, kVPackedLaneWords>) == kVPackedLaneBytes);
+  static_assert(kPackedBytes == 16384);
+  static_assert(kActiveRecordBytes == 35072);
+  static_assert(kPackedBytes % kPagePrefetchThreads == 0);
+  static_assert(kKMetadataBytes % kPagePrefetchThreads == 0);
+  static_assert(kVMetadataBytes % kPagePrefetchThreads == 0);
 
   KVarNK4V4Layout layout;
   KVarNHybridTailLayout tail;
@@ -126,6 +140,60 @@ struct KVarNK4V4FragmentLoader {
 
   CUTLASS_DEVICE static int unpack_nibble(std::uint32_t word, int index) {
     return int((word >> (4 * index)) & 0xfu);
+  }
+
+  template <int RangeBytes>
+  CUTLASS_DEVICE static void
+  prefetch_lane_partition_l2(std::uint8_t const* range, int thread) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    static_assert(RangeBytes % kPagePrefetchThreads == 0);
+    constexpr int kBytesPerThread = RangeBytes / kPagePrefetchThreads;
+    syclex::prefetch(
+        range + thread * kBytesPerThread,
+        kBytesPerThread,
+        syclex::properties{syclex::prefetch_hint_L2});
+  }
+
+  /** Prefetch exactly the packed-cache ranges used by the next physical page.
+   *
+   * All 64 work-items own disjoint byte ranges.  The partial-page form omits
+   * the second K/V half and the row metadata belonging exclusively to it.
+   * Column metadata remains necessary because the first half opens and closes
+   * its own V scale frame at a split or sequence boundary.
+   */
+  template <bool BothHalves>
+  CUTLASS_DEVICE void
+  prefetch_dpas_page_l2(std::uint8_t const* rec, int thread) const {
+    static_assert(DpasPacked);
+    constexpr int kPackedRangeBytes =
+        BothHalves ? kPackedBytes : kPackedBytes / 2;
+    prefetch_lane_partition_l2<kPackedRangeBytes>(
+        rec + layout.k_packed_offset, thread);
+
+    if constexpr (BothHalves) {
+      prefetch_lane_partition_l2<kKMetadataBytes>(
+          rec + layout.k_s_col_offset, thread);
+    } else {
+      // K column scale + zero point + the first 64 row scales are contiguous.
+      constexpr int kFirstHalfKMetadataBytes = 2 * kColumnBytes + kHalfRowBytes;
+      prefetch_lane_partition_l2<kFirstHalfKMetadataBytes>(
+          rec + layout.k_s_col_offset, thread);
+    }
+
+    prefetch_lane_partition_l2<kPackedRangeBytes>(
+        rec + layout.v_packed_offset, thread);
+    if constexpr (BothHalves) {
+      prefetch_lane_partition_l2<kVMetadataBytes>(
+          rec + layout.v_s_col_offset, thread);
+    } else {
+      // V column scale and first-half row scales are contiguous; first-half
+      // zero points form a second exact range after the unused row-scale half.
+      constexpr int kFirstHalfVScaleBytes = kColumnBytes + kHalfRowBytes;
+      prefetch_lane_partition_l2<kFirstHalfVScaleBytes>(
+          rec + layout.v_s_col_offset, thread);
+      prefetch_lane_partition_l2<kHalfRowBytes>(
+          rec + layout.v_zp_offset, thread);
+    }
   }
 
   template <int WordCount, class Fragment>
@@ -348,7 +416,8 @@ template <
     bool VectorPackedLoads_ = false,
     bool QKInt8U4_ = false,
     bool ExactLiveRows_ = false,
-    bool PagePair_ = false>
+    bool PagePair_ = false,
+    bool NextPagePrefetch_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -406,9 +475,12 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool InitializeSplitScratchSentinels = true;
   static constexpr bool ExactLiveRows = ExactLiveRows_;
   static constexpr bool PagePair = PagePair_;
+  static constexpr bool NextPagePrefetch = NextPagePrefetch_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
   static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
   static_assert(QueryRows <= 8);
+  static_assert(!NextPagePrefetch || DpasPacked_);
+  static_assert(!NextPagePrefetch || !PagePair);
   // Each split stores a bounded normalized partial. KVarN reducers combine
   // it using weights reconstructed from the producer-written natural LSE.
 
@@ -854,6 +926,40 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                          std::int64_t(physical) * params.kvarn.block_stride +
                          std::int64_t(kv_head) * params.kvarn.head_stride
                    : nullptr;
+      if constexpr (NextPagePrefetch) {
+        using Loader = KVarNK4V4FragmentLoader<DpasPacked_, VectorPackedLoads_>;
+        static_assert(
+            SGPerWG::value * cute::intel::sg_size ==
+            Loader::kPagePrefetchThreads);
+        // Issue one prefetch per physical page, early enough to overlap both
+        // 64-token halves. A split beginning on an odd tile gets one-half-page
+        // lead time. The two bounds prove the page-table entry is required by
+        // both this split and this batch row before it is dereferenced.
+        bool const first_owned_tile_in_page =
+            (k_tile & 1) == 0 || k_tile == blk_k0;
+        int const next_page_tile = (k_tile & ~1) + 2;
+        bool const consumes_next_first_half =
+            next_page_tile < blk_k1 && next_page_tile * 64 < actual_seq_len;
+        if (first_owned_tile_in_page && consumes_next_first_half) {
+          int const next_physical =
+              loader.physical_block(idx_b, next_page_tile);
+          int const next_slot = params.tail.block_to_slot[next_physical];
+          if (next_slot < 0) {
+            auto const* next_rec =
+                params.kvarn.cache +
+                std::int64_t(next_physical) * params.kvarn.block_stride +
+                std::int64_t(kv_head) * params.kvarn.head_stride;
+            bool const consumes_next_second_half =
+                next_page_tile + 1 < blk_k1 &&
+                (next_page_tile + 1) * 64 < actual_seq_len;
+            if (consumes_next_second_half) {
+              loader.template prefetch_dpas_page_l2<true>(next_rec, thr_id);
+            } else {
+              loader.template prefetch_dpas_page_l2<false>(next_rec, thr_id);
+            }
+          }
+        }
+      }
       clear(tSrS);
       float k_zp_bias[BiasRows] = {};
       if constexpr (QKInt8U4_) {

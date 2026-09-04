@@ -40,6 +40,7 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ6PagePair = 9,
   kQ6MainGrf128 = 10,
   kQ6SplitReducerSpecialized = 11,
+  kQ6NextPagePrefetch = 12,
 };
 
 static_assert(static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair) == 9);
@@ -48,10 +49,15 @@ static_assert(
 static_assert(
     static_cast<int64_t>(
         KVarNNativeKernelVariant::kQ6SplitReducerSpecialized) == 11);
+static_assert(
+    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6NextPagePrefetch) == 12);
 
+using KVarNDpasPrefetchLoader =
+    cutlass::fmha::collective::KVarNK4V4FragmentLoader<true>;
 static_assert(kPackedBytes % kDpasKVectorAlignment == 0);
 static_assert(kVPackedOffset % kDpasVVectorAlignment == 0);
 static_assert(kRecordBytes % kDpasKVectorAlignment == 0);
+static_assert(kRecordBytes == KVarNDpasPrefetchLoader::kActiveRecordBytes);
 
 void check_dpas_vector_load_alignment(const at::Tensor& packed_cache) {
   auto const address = reinterpret_cast<std::uintptr_t>(
@@ -296,7 +302,9 @@ void kvarn_decode_with_scratch_xe2(
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128) ||
       kernel_variant ==
           static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6SplitReducerSpecialized);
+              KVarNNativeKernelVariant::kQ6SplitReducerSpecialized) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6NextPagePrefetch);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
@@ -324,6 +332,9 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant ==
       static_cast<int64_t>(
           KVarNNativeKernelVariant::kQ6SplitReducerSpecialized);
+  bool const use_q6_next_page_prefetch =
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6NextPagePrefetch);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -333,11 +344,11 @@ void kvarn_decode_with_scratch_xe2(
       "; implemented variants are 0 (q8 scalar), 1 (integer QK), 2 (q6 "
       "scalar), 3 (q8 vector load), 4 (q6 vector load), 6 (q6 cached "
       "weights), 7 (q6 exact rows), 8 (q6 cached weights + exact rows), 9 "
-      "(q6_page_pair), 10 (q6_main_grf128), and 11 "
-      "(q6_split_reducer_specialized)");
+      "(q6_page_pair), 10 (q6_main_grf128), 11 "
+      "(q6_split_reducer_specialized), and 12 (q6_next_page_prefetch)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
+      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
       "dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
 
@@ -425,6 +436,8 @@ void kvarn_decode_with_scratch_xe2(
       : use_q6_split_reducer_specialized
           ? KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::run(
                 queue, args)
+      : use_q6_next_page_prefetch
+          ? KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::run(queue, args)
       : use_q6 && use_dpas_vector_load
           ? KVarNDecodeD256G128DpasQ6VectorLoadConfig::run(queue, args)
       : use_q6_page_pair
