@@ -1106,6 +1106,22 @@ using KVarNDecodeD256G128DpasQ6PageRecordCursorConfig =
         false,
         false,
         true>;
+using KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true>;
 
 // The block-store payload assembly relies on the established interleaved Q6
 // fragment order.  Prove that contract against CuTe at compile time so a
@@ -1292,6 +1308,19 @@ static_assert(KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::
                   UsesSpecializedSplitReducer);
 static_assert(
     sizeof(KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::Params) ==
+    sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+               Mainloop::Params));
+static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+                  NextPagePrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+                  CurrentHalfVPrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+                  ReusePageRecordCursor);
+static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::
+                  UsesSpecializedSplitReducer);
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+               Params) ==
     sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
                Mainloop::Params));
 static_assert(
