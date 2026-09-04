@@ -76,6 +76,64 @@ def test_kvarn_hadamard_scatter_matches_fp32(dtype, tokens):
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_kvarn_fused_qkv_hadamard_scatter_matches_separate_ops(dtype, tokens):
+    _load_op()
+    generator = torch.Generator().manual_seed(20260904 + tokens)
+    qkv = torch.randn(
+        tokens, 24 * 256 + 2 * 4 * 256, generator=generator
+    ).to(dtype)
+    query = qkv[:, : 24 * 256].view(tokens, 24, 256).xpu()
+    key = qkv[:, 24 * 256 : 28 * 256].view(tokens, 4, 256).xpu()
+    value = qkv[:, 28 * 256 :].view(tokens, 4, 256).xpu()
+    slots = torch.arange(tokens, dtype=torch.int64, device="xpu") * 129
+    blocks = (tokens - 1) * 129 // 128 + 1
+    lookup = torch.arange(blocks, dtype=torch.int32, device="xpu").flip(0)
+
+    separate_query = torch.empty(
+        tokens, 24, 256, dtype=torch.float16, device="xpu"
+    )
+    fused_query = torch.empty_like(separate_query)
+    separate_key = torch.full(
+        (blocks, 128, 4, 256), -123.0, dtype=torch.float16, device="xpu"
+    )
+    separate_value = torch.full_like(separate_key, -123.0)
+    fused_key = separate_key.clone()
+    fused_value = separate_value.clone()
+
+    torch.ops._vllm_fa2_C.kvarn_hadamard(
+        query.reshape(-1, 256), separate_query.reshape(-1, 256)
+    )
+    torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+        key,
+        value,
+        slots,
+        lookup,
+        separate_key,
+        separate_value,
+        128,
+        False,
+    )
+    torch.ops._vllm_fa2_C.kvarn_hadamard_qkv_scatter(
+        query,
+        key,
+        value,
+        slots,
+        lookup,
+        fused_query,
+        fused_key,
+        fused_value,
+        128,
+        False,
+    )
+    torch.xpu.synchronize()
+
+    assert torch.equal(fused_query.cpu(), separate_query.cpu())
+    assert torch.equal(fused_key.cpu(), separate_key.cpu())
+    assert torch.equal(fused_value.cpu(), separate_value.cpu())
+
+
 def test_kvarn_hadamard_scatter_structured_and_invalid_rows():
     _load_op()
     key = torch.zeros(6, 4, 256, dtype=torch.float16)

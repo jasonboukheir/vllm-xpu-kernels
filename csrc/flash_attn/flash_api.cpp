@@ -476,6 +476,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool dpas_layout=False) "
       "-> ()");
   ops.impl("kvarn_hadamard_scatter", torch::kXPU, &kvarn_hadamard_scatter_xe2);
+  ops.def(
+      "kvarn_hadamard_qkv_scatter(Tensor query, Tensor key, Tensor value, "
+      "Tensor slot_mapping, Tensor block_to_slot, Tensor! query_output, "
+      "Tensor! tail_key, Tensor! tail_value, int group, "
+      "bool dpas_layout=False) -> ()");
+  ops.impl(
+      "kvarn_hadamard_qkv_scatter",
+      torch::kXPU,
+      &kvarn_hadamard_qkv_scatter_xe2);
   ops.def("kvarn_hadamard(Tensor input, Tensor! output) -> ()");
   ops.impl("kvarn_hadamard", torch::kXPU, &kvarn_hadamard_xe2);
 #endif
