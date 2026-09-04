@@ -48,6 +48,7 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ6PageRecordCursor = 17,
   kQ6PrefetchRecordCursor = 18,
   kQ6PageMetadataCursor = 20,
+  kQ6PairedNibbleHalf2 = 21,
 };
 
 static_assert(static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair) == 9);
@@ -76,6 +77,8 @@ static_assert(
 static_assert(
     static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor) ==
     20);
+static_assert(
+    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2) == 21);
 
 using KVarNDpasPrefetchLoader =
     cutlass::fmha::collective::KVarNK4V4FragmentLoader<true>;
@@ -346,14 +349,18 @@ void kvarn_decode_with_scratch_xe2(
           static_cast<int64_t>(
               KVarNNativeKernelVariant::kQ6PrefetchRecordCursor) ||
       kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor);
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad) ||
       kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack);
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2);
   bool const use_qk_i8u4 =
       kernel_variant == static_cast<int64_t>(KVarNNativeKernelVariant::kQkI8U4);
   bool const use_q6_cached_weights =
@@ -404,6 +411,9 @@ void kvarn_decode_with_scratch_xe2(
   bool const use_q6_page_metadata_cursor =
       kernel_variant ==
       static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor);
+  bool const use_q6_paired_nibble_half2 =
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -418,11 +428,11 @@ void kvarn_decode_with_scratch_xe2(
       "(q6_next_page_prefetch_split_reducer), 14 (q6_simd_unpack), and 15 "
       "(q6_block_output_store), 16 (q6_current_half_v_prefetch), and 17 "
       "(q6_page_record_cursor), 18 (q6_prefetch_record_cursor), and 20 "
-      "(q6_page_metadata_cursor)");
+      "(q6_page_metadata_cursor), and 21 (q6_paired_nibble_half2)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
       "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, and "
-      "16, 17, 18, and 20 "
+      "16, 17, 18, 20, and 21 "
       "require "
       "dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
@@ -510,6 +520,8 @@ void kvarn_decode_with_scratch_xe2(
       use_qk_i8u4 ? KVarNDecodeD256G128DpasQKInt8U4Config::run(queue, args)
       : use_q6_page_metadata_cursor
           ? KVarNDecodeD256G128DpasQ6PageMetadataCursorConfig::run(queue, args)
+      : use_q6_paired_nibble_half2
+          ? KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::run(queue, args)
       : use_q6_prefetch_record_cursor
           ? KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(
                 queue, args)

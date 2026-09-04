@@ -496,7 +496,8 @@ template <
     bool Block2DOutputStore = false,
     bool CurrentHalfVPrefetch = false,
     bool ReusePageRecordCursor = false,
-    bool ReusePageMetadataCursor = false>
+    bool ReusePageMetadataCursor = false,
+    bool PairedNibbleHalf2 = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -553,6 +554,14 @@ struct KVarNDecodeD256G128ConfigImpl {
            SpecializedSplitReducer && NextPagePrefetch &&
            CurrentHalfVPrefetch && ReusePageRecordCursor),
       "page-metadata cursor is isolated to the complete ID18 reader");
+  static_assert(
+      !PairedNibbleHalf2 ||
+          (DpasPacked && VectorPackedLoads &&
+           cute::is_same_v<QPacked, cute::Int<6>> && SpecializedSplitReducer &&
+           NextPagePrefetch && CurrentHalfVPrefetch && ReusePageRecordCursor &&
+           !SimdPackedUnpack && !PagePair),
+      "paired-nibble half2 expansion is isolated to the complete ID18 "
+      "producer with aligned vector cache loads");
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -621,7 +630,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       SimdPackedUnpack,
       CurrentHalfVPrefetch,
       ReusePageRecordCursor,
-      ReusePageMetadataCursor>;
+      ReusePageMetadataCursor,
+      PairedNibbleHalf2>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -1147,6 +1157,24 @@ using KVarNDecodeD256G128DpasQ6PageMetadataCursorConfig =
         true,
         true,
         true>;
+using KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        true,
+        false,
+        false,
+        false,
+        false,
+        256,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true,
+        false,
+        true>;
 
 // The block-store payload assembly relies on the established interleaved Q6
 // fragment order.  Prove that contract against CuTe at compile time so a
@@ -1345,6 +1373,8 @@ static_assert(!KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
                   ReusePageMetadataCursor);
 static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::
                   UsesSpecializedSplitReducer);
+static_assert(!KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+                  PairedNibbleHalf2);
 static_assert(KVarNDecodeD256G128DpasQ6PageMetadataCursorConfig::Mainloop::
                   NextPagePrefetch);
 static_assert(KVarNDecodeD256G128DpasQ6PageMetadataCursorConfig::Mainloop::
@@ -1370,11 +1400,86 @@ static_assert(
                SharedStorage) ==
     sizeof(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
                SharedStorage));
+static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+                  PairedNibbleHalf2);
+static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+                  NextPagePrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+                  CurrentHalfVPrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+                  ReusePageRecordCursor);
+static_assert(!KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+                  SimdPackedUnpack);
+static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::
+                  UsesSpecializedSplitReducer);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::TiledMMAQK,
+              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::TiledMMAQK>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::TiledMMAPV,
+              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::TiledMMAPV>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue,
+              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue>);
+static_assert(
+    sizeof(
+        KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::Params) ==
+    sizeof(
+        KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::Params));
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+               Arguments) ==
+    sizeof(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+               Arguments));
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+               SharedStorage::paired_nibble_half2_lut) ==
+    256 * sizeof(std::uint32_t));
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+               SharedStorage) >= 256 * sizeof(std::uint32_t));
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
+               SharedStorage) ==
+    sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+               Mainloop::SharedStorage));
 static_assert(
     sizeof(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
                Params) ==
     sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
                Mainloop::Params));
+
+constexpr bool q6_paired_nibble_half2_lut_is_exact() {
+  using Loader = cutlass::fmha::collective::
+      KVarNK4V4FragmentLoader<true, true, false, true>;
+  constexpr std::uint16_t kExpectedHalfBits[16] = {
+      0x0000,
+      0x3c00,
+      0x4000,
+      0x4200,
+      0x4400,
+      0x4500,
+      0x4600,
+      0x4700,
+      0x4800,
+      0x4880,
+      0x4900,
+      0x4980,
+      0x4a00,
+      0x4a80,
+      0x4b00,
+      0x4b80};
+  for (int packed = 0; packed < 256; ++packed) {
+    std::uint32_t const pair =
+        Loader::paired_nibble_half2_bits(static_cast<std::uint8_t>(packed));
+    if (std::uint16_t(pair) != kExpectedHalfBits[packed & 0x0f] ||
+        std::uint16_t(pair >> 16) != kExpectedHalfBits[packed >> 4]) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(q6_paired_nibble_half2_lut_is_exact());
 static_assert(
     !KVarNDecodeD256G128DpasQ6VectorLoadConfig::Mainloop::SimdPackedUnpack);
 static_assert(

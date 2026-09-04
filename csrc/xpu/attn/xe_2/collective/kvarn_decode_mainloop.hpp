@@ -60,7 +60,8 @@ struct KVarNHybridTailLayout {
 template <
     bool DpasPacked = false,
     bool VectorPackedLoads = false,
-    bool SimdPackedUnpack = false>
+    bool SimdPackedUnpack = false,
+    bool PairedNibbleHalf2 = false>
 struct KVarNK4V4FragmentLoader {
   static constexpr int kHeadDim = 256;
   static constexpr int kGroup = 128;
@@ -87,6 +88,8 @@ struct KVarNK4V4FragmentLoader {
 
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!SimdPackedUnpack || (DpasPacked && VectorPackedLoads));
+  static_assert(!PairedNibbleHalf2 || (DpasPacked && VectorPackedLoads));
+  static_assert(!PairedNibbleHalf2 || !SimdPackedUnpack);
   static_assert(kKPackedLaneBytes == 32);
   static_assert(kVPackedLaneBytes == 16);
   static_assert(
@@ -103,6 +106,34 @@ struct KVarNK4V4FragmentLoader {
   KVarNHybridTailLayout tail;
   int const* page_table;
   int max_pages_per_seq;
+  std::uint32_t const* paired_nibble_half2_lut = nullptr;
+
+  /** Exact binary16 encoding for one unsigned four-bit cache value.
+   *
+   * Quantized K/V values are integers in [0, 15].  Constructing their half
+   * encodings with integer operations keeps the once-per-workgroup LUT setup
+   * independent of floating-point conversion modes.
+   */
+  CUTLASS_HOST_DEVICE static constexpr std::uint16_t
+  nibble_half_bits(std::uint8_t value) {
+    if (value == 0) return 0;
+    int const exponent = value >= 8 ? 3 : value >= 4 ? 2 : value >= 2 ? 1 : 0;
+    return static_cast<std::uint16_t>(
+        ((15 + exponent) << 10) +
+        ((int(value) - (1 << exponent)) << (10 - exponent)));
+  }
+
+  /** Pack the two little-endian nibbles of one cache byte as one half2 word.
+   *
+   * The low nibble occupies the low binary16 lane and the high nibble the
+   * high lane.  One SLM lookup therefore replaces two independent nibble
+   * expansions without changing the immutable xe2_dpas cache representation.
+   */
+  CUTLASS_HOST_DEVICE static constexpr std::uint32_t
+  paired_nibble_half2_bits(std::uint8_t packed) {
+    return std::uint32_t(nibble_half_bits(packed & 0x0f)) |
+           (std::uint32_t(nibble_half_bits(packed >> 4)) << 16);
+  }
 
   CUTLASS_DEVICE std::uint8_t const*
   record(int batch, int kv_head, int logical_tile) const {
@@ -238,6 +269,39 @@ struct KVarNK4V4FragmentLoader {
   }
 
   template <int WordCount, class Fragment>
+  CUTLASS_DEVICE void fill_paired_nibble_half2_fragment(
+      Fragment& dst, std::uint8_t const* lane_bytes) const {
+    static_assert(PairedNibbleHalf2);
+    static_assert(
+        WordCount == kKPackedLaneWords || WordCount == kVPackedLaneWords);
+    // Read the unchanged packed cache in 16-byte vectors, then expand each
+    // byte with one SLM lookup to an exact binary16 pair.  Compared with a
+    // per-nibble table this halves lookup traffic; compared with ID18 it
+    // removes all shift/mask/integer-to-half operations from the hot loop.
+    // The table is shared by the complete 64-thread producer workgroup and
+    // costs exactly 1 KiB of SLM for this isolated specialization.
+    constexpr int kBytesPerChunk = 16;
+    constexpr int kLaneBytes = WordCount * sizeof(std::uint32_t);
+    static_assert(kLaneBytes % kBytesPerChunk == 0);
+    using ByteVector = sycl::vec<std::uint8_t, kBytesPerChunk>;
+    using Half2 = sycl::vec<sycl::half, 2>;
+    static_assert(sizeof(Half2) == sizeof(std::uint32_t));
+    CUTLASS_PRAGMA_UNROLL
+    for (int chunk = 0; chunk < kLaneBytes / kBytesPerChunk; ++chunk) {
+      ByteVector const bytes = *reinterpret_cast<ByteVector const*>(
+          lane_bytes + chunk * kBytesPerChunk);
+      CUTLASS_PRAGMA_UNROLL
+      for (int byte = 0; byte < kBytesPerChunk; ++byte) {
+        Half2 const pair =
+            sycl::bit_cast<Half2>(paired_nibble_half2_lut[bytes[byte]]);
+        int const output = chunk * (2 * kBytesPerChunk) + 2 * byte;
+        dst(output) = static_cast<typename Fragment::value_type>(pair[0]);
+        dst(output + 1) = static_cast<typename Fragment::value_type>(pair[1]);
+      }
+    }
+  }
+
+  template <int WordCount, class Fragment>
   CUTLASS_DEVICE static void
   fill_packed_lane_fragment(Fragment& dst, std::uint8_t const* lane_bytes) {
     static_assert(
@@ -368,7 +432,11 @@ struct KVarNK4V4FragmentLoader {
         auto const* lane_bytes =
             rec + layout.k_packed_offset +
             (((half * 4 + dim_tile / 64) * 4 + subgroup) * 16 + lane) * 32;
-        fill_packed_lane_fragment<kKPackedLaneWords>(dst, lane_bytes);
+        if constexpr (PairedNibbleHalf2) {
+          fill_paired_nibble_half2_fragment<kKPackedLaneWords>(dst, lane_bytes);
+        } else {
+          fill_packed_lane_fragment<kKPackedLaneWords>(dst, lane_bytes);
+        }
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < dst.size(); ++i) {
@@ -440,7 +508,11 @@ struct KVarNK4V4FragmentLoader {
         auto const* lane_bytes =
             rec + layout.v_packed_offset +
             (((half * 8 + value_tile / 32) * 4 + subgroup) * 16 + lane) * 16;
-        fill_packed_lane_fragment<kVPackedLaneWords>(dst, lane_bytes);
+        if constexpr (PairedNibbleHalf2) {
+          fill_paired_nibble_half2_fragment<kVPackedLaneWords>(dst, lane_bytes);
+        } else {
+          fill_packed_lane_fragment<kVPackedLaneWords>(dst, lane_bytes);
+        }
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < dst.size(); ++i) {
@@ -464,6 +536,24 @@ struct KVarNK4V4FragmentLoader {
       }
     }
   }
+};
+
+/** Conditional mainloop SLM which leaves all established variants unchanged.
+ *
+ * The disabled specialization intentionally retains the original `base`
+ * member instead of inheriting it: the surrounding kernel observes whether
+ * mainloop storage is empty when deciding its epilogue barrier.  Only the
+ * explicitly instantiated paired-nibble candidate reserves the 1 KiB table.
+ */
+template <class BaseStorage, bool PairedNibbleHalf2>
+struct KVarNDecodeSharedStorage {
+  BaseStorage base;
+};
+
+template <class BaseStorage>
+struct KVarNDecodeSharedStorage<BaseStorage, true> {
+  std::uint32_t paired_nibble_half2_lut[256];
+  BaseStorage base;
 };
 
 /** D256/G128/K4V4 specialization of the Xe decode collective.
@@ -490,7 +580,8 @@ template <
     bool SimdPackedUnpack_ = false,
     bool CurrentHalfVPrefetch_ = false,
     bool ReusePageRecordCursor_ = false,
-    bool ReusePageMetadataCursor_ = false>
+    bool ReusePageMetadataCursor_ = false,
+    bool PairedNibbleHalf2_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -553,6 +644,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool CurrentHalfVPrefetch = CurrentHalfVPrefetch_;
   static constexpr bool ReusePageRecordCursor = ReusePageRecordCursor_;
   static constexpr bool ReusePageMetadataCursor = ReusePageMetadataCursor_;
+  static constexpr bool PairedNibbleHalf2 = PairedNibbleHalf2_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
   static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
   static_assert(QueryRows <= 8);
@@ -565,6 +657,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static_assert(!ReusePageMetadataCursor || DpasPacked_);
   static_assert(!ReusePageMetadataCursor || ReusePageRecordCursor_);
   static_assert(!ReusePageMetadataCursor || !PagePair);
+  static_assert(
+      !PairedNibbleHalf2 ||
+      (DpasPacked_ && VectorPackedLoads_ && !SimdPackedUnpack_ && !PagePair));
   static_assert(
       !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
   // Each split stores a bounded normalized partial. KVarN reducers combine
@@ -588,14 +683,20 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     int window_size_left;
   };
 
-  struct SharedStorage {
-    typename Base::SharedStorage base;
-  };
+  using SharedStorage =
+      KVarNDecodeSharedStorage<typename Base::SharedStorage, PairedNibbleHalf2>;
 
   Params params;
+  std::uint32_t* paired_nibble_half2_lut;
 
   KVarNDecodeFwdMainloop(Params const& params_, SharedStorage& storage)
-      : Base(params_.base, storage.base), params(params_) {}
+      : Base(params_.base, storage.base),
+        params(params_),
+        paired_nibble_half2_lut(nullptr) {
+    if constexpr (PairedNibbleHalf2) {
+      paired_nibble_half2_lut = storage.paired_nibble_half2_lut;
+    }
+  }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
     return args.kvarn.cache != nullptr && args.seq_lens != nullptr &&
@@ -638,6 +739,20 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     static_assert(get<2>(TileShapeQK{}) == 64);
     static_assert(get<2>(TileShapePV{}) == 64);
 
+    if constexpr (PairedNibbleHalf2) {
+      // All active workgroups have exactly 64 threads.  Four disjoint stores
+      // per thread initialize the complete table before any subgroup reads it.
+      constexpr int kThreads = SGPerWG::value * cute::intel::sg_size;
+      static_assert(kThreads == 64);
+      for (int packed = thr_id; packed < 256; packed += kThreads) {
+        paired_nibble_half2_lut[packed] =
+            KVarNK4V4FragmentLoader<true, true, false, true>::
+                paired_nibble_half2_bits(static_cast<std::uint8_t>(packed));
+      }
+      sycl::group_barrier(
+          sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    }
+
     Tensor cQ = make_identity_tensor(Q_2D.shape());
     Tensor cK = make_identity_tensor(select<1, 2>(TileShapeQK{}));  // (k,d)
     Tensor cV = make_identity_tensor(select<1, 2>(TileShapePV{}));  // (v,k)
@@ -676,12 +791,17 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
-    KVarNK4V4FragmentLoader<DpasPacked_, VectorPackedLoads_, SimdPackedUnpack_>
+    KVarNK4V4FragmentLoader<
+        DpasPacked_,
+        VectorPackedLoads_,
+        SimdPackedUnpack_,
+        PairedNibbleHalf2_>
         loader{
             params.kvarn,
             params.tail,
             params.base.ptr_page_table,
-            params.base.max_pages_per_seq};
+            params.base.max_pages_per_seq,
+            paired_nibble_half2_lut};
     int const actual_seq_len = params.seq_lens[idx_b];
     // Legacy single-split scheduler orders grid.z batch-major:
     //   flat = batch * num_kv_heads + kv_head.
@@ -1099,7 +1219,8 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         using Loader = KVarNK4V4FragmentLoader<
             DpasPacked_,
             VectorPackedLoads_,
-            SimdPackedUnpack_>;
+            SimdPackedUnpack_,
+            PairedNibbleHalf2_>;
         static_assert(
             SGPerWG::value * cute::intel::sg_size ==
             Loader::kPagePrefetchThreads);
