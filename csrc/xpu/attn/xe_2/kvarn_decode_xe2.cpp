@@ -34,6 +34,9 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ8VectorLoad = 3,
   kQ6VectorLoad = 4,
   kPage128 = 5,
+  kQ6CachedWeights = 6,
+  kQ6ExactRows = 7,
+  kQ6CachedWeightsExactRows = 8,
 };
 
 static_assert(kPackedBytes % kDpasKVectorAlignment == 0);
@@ -260,7 +263,14 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6Scalar) ||
       kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad);
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CachedWeights) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6ExactRows) ||
+      kernel_variant ==
+          static_cast<int64_t>(
+              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
@@ -268,6 +278,18 @@ void kvarn_decode_with_scratch_xe2(
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad);
   bool const use_qk_i8u4 =
       kernel_variant == static_cast<int64_t>(KVarNNativeKernelVariant::kQkI8U4);
+  bool const use_q6_cached_weights =
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CachedWeights) ||
+      kernel_variant ==
+          static_cast<int64_t>(
+              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
+  bool const use_q6_exact_rows =
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6ExactRows) ||
+      kernel_variant ==
+          static_cast<int64_t>(
+              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -275,10 +297,11 @@ void kvarn_decode_with_scratch_xe2(
       "unsupported native KVarN kernel_variant ",
       kernel_variant,
       "; implemented variants are 0 (q8 scalar), 1 (integer QK), 2 (q6 "
-      "scalar), 3 (q8 vector load), and 4 (q6 vector load)");
+      "scalar), 3 (q8 vector load), 4 (q6 vector load), 6 (q6 cached "
+      "weights), 7 (q6 exact rows), and 8 (q6 cached weights + exact rows)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, and 4 require dpas_layout=True");
+      "kernel variants 1, 2, 3, 4, 6, 7, and 8 require dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
 
   cutlass::fmha::collective::KVarNK4V4Layout layout{
@@ -364,6 +387,13 @@ void kvarn_decode_with_scratch_xe2(
       use_qk_i8u4 ? KVarNDecodeD256G128DpasQKInt8U4Config::run(queue, args)
       : use_q6 && use_dpas_vector_load
           ? KVarNDecodeD256G128DpasQ6VectorLoadConfig::run(queue, args)
+      : use_q6_cached_weights && use_q6_exact_rows
+          ? KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::run(
+                queue, args)
+      : use_q6_cached_weights
+          ? KVarNDecodeD256G128DpasQ6CachedWeightsConfig::run(queue, args)
+      : use_q6_exact_rows
+          ? KVarNDecodeD256G128DpasQ6ExactRowsConfig::run(queue, args)
       : use_q6 ? KVarNDecodeD256G128DpasQ6Config::run(queue, args)
       : use_dpas_vector_load
           ? KVarNDecodeD256G128DpasVectorLoadConfig::run(queue, args)

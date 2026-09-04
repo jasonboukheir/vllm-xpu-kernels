@@ -346,7 +346,8 @@ template <
     class TensorV_,
     bool DpasPacked_ = false,
     bool VectorPackedLoads_ = false,
-    bool QKInt8U4_ = false>
+    bool QKInt8U4_ = false,
+    bool ExactLiveRows_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -402,6 +403,10 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool CausalMask = false;
   static constexpr bool LocalMask = false;
   static constexpr bool InitializeSplitScratchSentinels = true;
+  static constexpr bool ExactLiveRows = ExactLiveRows_;
+  static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
+  static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
+  static_assert(QueryRows <= 8);
   // Each split stores a bounded normalized partial. KVarN reducers combine
   // it using weights reconstructed from the producer-written natural LSE.
 
@@ -539,7 +544,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                          std::int64_t(kv_head) * params.kvarn.head_stride
                    : nullptr;
       clear(tSrS);
-      float k_zp_bias[8] = {};
+      float k_zp_bias[BiasRows] = {};
       if constexpr (QKInt8U4_) {
         if (slot < 0) {
           // Variant 1 keeps the PV path and cache ABI unchanged. Only packed
@@ -668,7 +673,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       if (slot < 0) {
         auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
         CUTLASS_PRAGMA_UNROLL
-        for (int query_row = 0; query_row < 8; ++query_row) {
+        for (int query_row = 0; query_row < BiasRows; ++query_row) {
           k_zp_bias[query_row] = sycl::reduce_over_group(
               subgroup, k_zp_bias[query_row], sycl::plus<float>());
         }
@@ -720,7 +725,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         bool const leave_v_scale_frame = (k_tile & 1) == 1 ||
                                          k_tile + 1 == blk_k1 ||
                                          (k_tile + 1) * 64 >= actual_seq_len;
-        float v_zp_bias[8] = {};
+        float v_zp_bias[BiasRows] = {};
         int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
                              .get_local_id()[0];
         using VTokenFragment = decltype(reduce<0>(tArP, sycl::plus<void>{}));
@@ -748,7 +753,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         }
         auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
         CUTLASS_PRAGMA_UNROLL
-        for (int query_row = 0; query_row < 8; ++query_row) {
+        for (int query_row = 0; query_row < BiasRows; ++query_row) {
           v_zp_bias[query_row] = sycl::reduce_over_group(
               subgroup, v_zp_bias[query_row], sycl::plus<float>());
         }
