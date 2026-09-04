@@ -38,7 +38,13 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ6ExactRows = 7,
   kQ6CachedWeightsExactRows = 8,
   kQ6PagePair = 9,
+  kQ6MainGrf128 = 10,
 };
+
+static_assert(
+    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair) == 9);
+static_assert(
+    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128) == 10);
 
 static_assert(kPackedBytes % kDpasKVectorAlignment == 0);
 static_assert(kVPackedOffset % kDpasVVectorAlignment == 0);
@@ -282,7 +288,9 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant ==
           static_cast<int64_t>(
               KVarNNativeKernelVariant::kQ6CachedWeightsExactRows) ||
-      is_q6_page_pair_variant(kernel_variant);
+      is_q6_page_pair_variant(kernel_variant) ||
+      kernel_variant ==
+          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
@@ -303,6 +311,9 @@ void kvarn_decode_with_scratch_xe2(
           static_cast<int64_t>(
               KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
   bool const use_q6_page_pair = is_q6_page_pair_variant(kernel_variant);
+  bool const use_q6_main_grf128 =
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -311,11 +322,11 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant,
       "; implemented variants are 0 (q8 scalar), 1 (integer QK), 2 (q6 "
       "scalar), 3 (q8 vector load), 4 (q6 vector load), 6 (q6 cached "
-      "weights), 7 (q6 exact rows), 8 (q6 cached weights + exact rows), and "
-      "9 (q6_page_pair)");
+      "weights), 7 (q6 exact rows), 8 (q6 cached weights + exact rows), 9 "
+      "(q6_page_pair), and 10 (q6_main_grf128)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, 4, 6, 7, 8, and 9 require "
+      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
       "dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
 
@@ -411,6 +422,8 @@ void kvarn_decode_with_scratch_xe2(
           ? KVarNDecodeD256G128DpasQ6CachedWeightsConfig::run(queue, args)
       : use_q6_exact_rows
           ? KVarNDecodeD256G128DpasQ6ExactRowsConfig::run(queue, args)
+      : use_q6_main_grf128
+          ? KVarNDecodeD256G128DpasQ6MainGrf128Config::run(queue, args)
       : use_q6 ? KVarNDecodeD256G128DpasQ6Config::run(queue, args)
       : use_dpas_vector_load
           ? KVarNDecodeD256G128DpasVectorLoadConfig::run(queue, args)

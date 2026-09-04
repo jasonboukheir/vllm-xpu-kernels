@@ -40,6 +40,7 @@ R2_Q6_CACHED_WEIGHTS = 6
 R2_Q6_EXACT_ROWS = 7
 R2_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
 Q6_PAGE_PAIR = 9
+Q6_MAIN_GRF128 = 10
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -48,6 +49,7 @@ Q6_FACTORY_VARIANTS = (
     R2_Q6_EXACT_ROWS,
     R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
     Q6_PAGE_PAIR,
+    Q6_MAIN_GRF128,
 )
 
 
@@ -438,7 +440,7 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, and 9 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
             "dpas_layout=True"
         ),
     ):
@@ -669,7 +671,7 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, and 9 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
             "dpas_layout=True"
         ),
     ):
@@ -731,7 +733,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [5, -1, 10])
+@pytest.mark.parametrize("kernel_variant", [5, -1, 11])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -767,6 +769,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         R2_Q6_EXACT_ROWS,
         R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
         Q6_PAGE_PAIR,
+        Q6_MAIN_GRF128,
     ],
 )
 def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
@@ -791,7 +794,7 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, and 9 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
             "dpas_layout=True"
         ),
     ):
@@ -1618,6 +1621,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
                 "r2-q6-cached-weights-exact-rows",
             ),
             (Q6_PAGE_PAIR, "q6-page-pair"),
+            (Q6_MAIN_GRF128, "q6_main_grf128"),
         )
     ]
 )
