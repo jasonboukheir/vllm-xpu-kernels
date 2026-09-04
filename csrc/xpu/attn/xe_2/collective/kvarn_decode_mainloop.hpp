@@ -57,7 +57,10 @@ struct KVarNHybridTailLayout {
  * what makes the register assignment independent of undocumented fragment
  * linear order.
  */
-template <bool DpasPacked = false, bool VectorPackedLoads = false>
+template <
+    bool DpasPacked = false,
+    bool VectorPackedLoads = false,
+    bool SimdPackedUnpack = false>
 struct KVarNK4V4FragmentLoader {
   static constexpr int kHeadDim = 256;
   static constexpr int kGroup = 128;
@@ -82,6 +85,7 @@ struct KVarNK4V4FragmentLoader {
   static constexpr int kPagePrefetchThreads = 4 * cute::intel::sg_size;
 
   static_assert(!VectorPackedLoads || DpasPacked);
+  static_assert(!SimdPackedUnpack || (DpasPacked && VectorPackedLoads));
   static_assert(kKPackedLaneBytes == 32);
   static_assert(kVPackedLaneBytes == 16);
   static_assert(
@@ -201,7 +205,35 @@ struct KVarNK4V4FragmentLoader {
   fill_packed_lane_fragment(Fragment& dst, std::uint8_t const* lane_bytes) {
     static_assert(
         WordCount == kKPackedLaneWords || WordCount == kVPackedLaneWords);
-    if constexpr (VectorPackedLoads) {
+    if constexpr (SimdPackedUnpack) {
+      // The xe2_dpas lane ABI stores eight uint4 values in each little-endian
+      // word.  View it as bytes so one SIMD operation extracts all low nibbles
+      // and another extracts all high nibbles.  The two vector conversions are
+      // exact for [0, 15] and avoid the old eight scalar shift/mask/converts
+      // per packed word.  Interleaving low/high restores the immutable nibble
+      // order consumed by the FP16 MMA-B fragment.
+      constexpr int kBytesPerChunk = 16;
+      constexpr int kLaneBytes = WordCount * sizeof(std::uint32_t);
+      static_assert(kLaneBytes % kBytesPerChunk == 0);
+      using ByteVector = sycl::vec<std::uint8_t, kBytesPerChunk>;
+      using HalfVector = sycl::vec<sycl::half, kBytesPerChunk>;
+      CUTLASS_PRAGMA_UNROLL
+      for (int chunk = 0; chunk < kLaneBytes / kBytesPerChunk; ++chunk) {
+        ByteVector const bytes = *reinterpret_cast<ByteVector const*>(
+            lane_bytes + chunk * kBytesPerChunk);
+        ByteVector const low_bits = bytes & ByteVector{0x0f};
+        ByteVector const high_bits = bytes >> ByteVector{4};
+        HalfVector const low = low_bits.template convert<sycl::half>();
+        HalfVector const high = high_bits.template convert<sycl::half>();
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < kBytesPerChunk; ++byte) {
+          int const output = chunk * (2 * kBytesPerChunk) + 2 * byte;
+          dst(output) = static_cast<typename Fragment::value_type>(low[byte]);
+          dst(output + 1) =
+              static_cast<typename Fragment::value_type>(high[byte]);
+        }
+      }
+    } else if constexpr (VectorPackedLoads) {
       // The host specialization validates the complete address induction:
       // cache base, block/head strides, field offset, and these fixed lane
       // extents.  Keep this as one explicit vector load per lane so this
@@ -417,7 +449,8 @@ template <
     bool QKInt8U4_ = false,
     bool ExactLiveRows_ = false,
     bool PagePair_ = false,
-    bool NextPagePrefetch_ = false>
+    bool NextPagePrefetch_ = false,
+    bool SimdPackedUnpack_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -476,11 +509,14 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool ExactLiveRows = ExactLiveRows_;
   static constexpr bool PagePair = PagePair_;
   static constexpr bool NextPagePrefetch = NextPagePrefetch_;
+  static constexpr bool SimdPackedUnpack = SimdPackedUnpack_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
   static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
   static_assert(QueryRows <= 8);
   static_assert(!NextPagePrefetch || DpasPacked_);
   static_assert(!NextPagePrefetch || !PagePair);
+  static_assert(
+      !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
   // Each split stores a bounded normalized partial. KVarN reducers combine
   // it using weights reconstructed from the producer-written natural LSE.
 
@@ -590,11 +626,12 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
-    KVarNK4V4FragmentLoader<DpasPacked_, VectorPackedLoads_> loader{
-        params.kvarn,
-        params.tail,
-        params.base.ptr_page_table,
-        params.base.max_pages_per_seq};
+    KVarNK4V4FragmentLoader<DpasPacked_, VectorPackedLoads_, SimdPackedUnpack_>
+        loader{
+            params.kvarn,
+            params.tail,
+            params.base.ptr_page_table,
+            params.base.max_pages_per_seq};
     int const actual_seq_len = params.seq_lens[idx_b];
     // Legacy single-split scheduler orders grid.z batch-major:
     //   flat = batch * num_kv_heads + kv_head.
@@ -969,7 +1006,10 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                          std::int64_t(kv_head) * params.kvarn.head_stride
                    : nullptr;
       if constexpr (NextPagePrefetch) {
-        using Loader = KVarNK4V4FragmentLoader<DpasPacked_, VectorPackedLoads_>;
+        using Loader = KVarNK4V4FragmentLoader<
+            DpasPacked_,
+            VectorPackedLoads_,
+            SimdPackedUnpack_>;
         static_assert(
             SGPerWG::value * cute::intel::sg_size ==
             Loader::kPagePrefetchThreads);
