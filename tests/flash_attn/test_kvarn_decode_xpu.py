@@ -1063,6 +1063,41 @@ def test_two_random_tail_pages_match_fp32_attention_at_first_append() -> None:
     )
 
 
+def test_q6_page_pair_ignores_poisoned_inactive_hybrid_second_half() -> None:
+    """An exact K64 hybrid tail must not execute the page's second PV MMA."""
+    seq_len = 64
+    cache, _ = make_cache(1)
+    tail_key = torch.zeros((1, 128, 4, 256), dtype=torch.float16)
+    tail_value = torch.full_like(tail_key, 0.375)
+    tail_key[:, 64:].fill_(float("nan"))
+    tail_value[:, 64:].fill_(float("nan"))
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    output = torch.full_like(query, float("nan"))
+
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        query,
+        cache.xpu(),
+        torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+        torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
+        torch.zeros((1,), dtype=torch.int32, device="xpu"),
+        tail_key.xpu(),
+        tail_value.xpu(),
+        output,
+        seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        1,
+        Q6_PAGE_PAIR,
+        True,
+    )
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output.cpu(), torch.full_like(output.cpu(), 0.375), atol=2e-3, rtol=2e-3
+    )
+
+
 def test_shared_prefix_is_deterministic() -> None:
     cache, _ = make_random_cache(5)
     generator = torch.Generator().manual_seed(19)
@@ -1836,16 +1871,20 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         softmax_lse_cpu = exp_sums.cpu()
         legacy_max_logits_cpu = max_logits.cpu()
         invalid_lse = torch.finfo(torch.float32).min
-        max_kv_tiles = (max(seq_lengths) + 63) // 64
-        tiles_per_split = (max_kv_tiles + splits - 1) // splits
+        work_unit_tokens = 128 if kernel_variant == Q6_PAGE_PAIR else 64
+        max_work_units = (
+            max(seq_lengths) + work_unit_tokens - 1
+        ) // work_unit_tokens
+        work_units_per_split = (max_work_units + splits - 1) // splits
         globally_active_splits = min(
             splits,
-            (max_kv_tiles + tiles_per_split - 1) // tiles_per_split,
+            (max_work_units + work_units_per_split - 1) // work_units_per_split,
         )
         for row, seq_len in enumerate(seq_lengths):
-            kv_tiles = (seq_len + 63) // 64
+            work_units = (seq_len + work_unit_tokens - 1) // work_unit_tokens
             active_splits = min(
-                splits, (kv_tiles + tiles_per_split - 1) // tiles_per_split
+                splits,
+                (work_units + work_units_per_split - 1) // work_units_per_split,
             )
             assert torch.isfinite(partials_cpu[row, :active_splits]).all()
             assert torch.isfinite(softmax_lse_cpu[row, :, :active_splits]).all()
@@ -1861,14 +1900,22 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         assert torch.isnan(softmax_lse_cpu[:, :, globally_active_splits:]).all()
         assert torch.isnan(legacy_max_logits_cpu).all()
 
-        kv_tiles = max(seq_lengths) // 64
-        tiles_per_split = (kv_tiles + splits - 1) // splits
-        target_split = (kv_tiles - 2) // tiles_per_split
-        split_start = target_split * tiles_per_split
-        split_end = min(split_start + tiles_per_split, kv_tiles)
-        expected_exp_sum = 128 + (
-            (split_end - split_start) * 64 - 128
-        ) * math.exp(-8.0)
+        max_seq_len = max(seq_lengths)
+        # The high-score sentinel occupies the final physical page.  Variants
+        # 0--8 assign its two K64 tiles to a split, while ID9 assigns the page
+        # as one 128-token work unit.  Derive both split ownership and the
+        # low-score token count from that variant-specific unit.
+        target_first_work_unit = (max_seq_len - 128) // work_unit_tokens
+        target_last_work_unit = (max_seq_len - 1) // work_unit_tokens
+        target_split = target_first_work_unit // work_units_per_split
+        assert target_last_work_unit // work_units_per_split == target_split
+        split_start = target_split * work_units_per_split
+        split_end = min(split_start + work_units_per_split, max_work_units)
+        split_token_count = (
+            min(split_end * work_unit_tokens, max_seq_len)
+            - split_start * work_unit_tokens
+        )
+        expected_exp_sum = 128 + (split_token_count - 128) * math.exp(-8.0)
         expected_lse = 9.0 + math.log(expected_exp_sum)
         torch.testing.assert_close(
             exp_sums[0, :, target_split].cpu(),
