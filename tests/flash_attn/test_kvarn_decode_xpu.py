@@ -945,7 +945,21 @@ def test_q6_multisplit_lse_owns_all_six_distinct_query_rows(
     assert torch.isfinite(q6_lse).all()
     # Every row must be independently observable in the control fixture.
     assert torch.unique(q8_lse[0, :6].cpu(), dim=0).shape[0] == 6
-    torch.testing.assert_close(q6_lse, q8_lse, atol=0, rtol=0)
+    if kernel_variant == Q6_PAGE_PAIR:
+        # Pairing two K64 fragments changes the compiler's FP32 evaluation
+        # graph without changing token or query-row ownership. Bound that
+        # permitted reassociation to one representable FP32 value.
+        q8_lse_cpu = q8_lse.cpu()
+        q6_lse_cpu = q6_lse.cpu()
+        lower = torch.nextafter(
+            q8_lse_cpu, torch.full_like(q8_lse_cpu, -torch.inf)
+        )
+        upper = torch.nextafter(
+            q8_lse_cpu, torch.full_like(q8_lse_cpu, torch.inf)
+        )
+        assert torch.all((q6_lse_cpu >= lower) & (q6_lse_cpu <= upper))
+    else:
+        torch.testing.assert_close(q6_lse, q8_lse, atol=0, rtol=0)
     torch.testing.assert_close(q6_output, q8_output, atol=0, rtol=0)
 
 
@@ -1828,6 +1842,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
             ),
             (Q6_PAGE_PAIR, "q6-page-pair"),
             (Q6_MAIN_GRF128, "q6_main_grf128"),
+            (Q6_SPLIT_REDUCER_SPECIALIZED, "q6-split-reducer-specialized"),
             (Q6_NEXT_PAGE_PREFETCH, "q6-next-page-prefetch"),
         )
     ]
