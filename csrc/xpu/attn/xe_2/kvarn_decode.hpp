@@ -1420,9 +1420,33 @@ static_assert(cute::is_same_v<
 static_assert(cute::is_same_v<
               KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::TiledMMAPV,
               KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::TiledMMAPV>);
+// DecodeFwdEpilogue carries its mainloop as a template argument, so the whole
+// epilogue type must differ when ID21 swaps in its paired-nibble producer.
+// Compare every independently selectable epilogue policy instead: this keeps
+// the experiment isolated to the reader without requiring identical mainloop
+// types.
+static_assert(
+    KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue::Sink ==
+    KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue::Sink);
+static_assert(
+    KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue::ScalarOutput ==
+    KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue::
+        ScalarOutput);
+static_assert(
+    KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue::
+        CacheScalarWeights ==
+    KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue::
+        CacheScalarWeights);
+static_assert(
+    KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue::
+        Block2DOutputStore ==
+    KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue::
+        Block2DOutputStore);
 static_assert(cute::is_same_v<
-              KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue,
-              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue>);
+              KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Epilogue::
+                  OutputStorePolicy,
+              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue::
+                  OutputStorePolicy>);
 static_assert(
     sizeof(
         KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::Params) ==
