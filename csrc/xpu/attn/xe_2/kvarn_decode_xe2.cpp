@@ -431,7 +431,7 @@ void kvarn_decode_with_scratch_xe2(
       "(q6_page_metadata_cursor), and 21 (q6_paired_nibble_half2)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, and "
+      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
       "16, 17, 18, 20, and 21 "
       "require "
       "dpas_layout=True");

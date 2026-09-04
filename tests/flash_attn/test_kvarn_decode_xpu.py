@@ -50,6 +50,7 @@ Q6_CURRENT_HALF_V_PREFETCH = 16
 Q6_PAGE_RECORD_CURSOR = 17
 Q6_PREFETCH_RECORD_CURSOR = 18
 Q6_PAGE_METADATA_CURSOR = 20
+Q6_PAIRED_NIBBLE_HALF2 = 21
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -68,6 +69,7 @@ Q6_FACTORY_VARIANTS = (
     Q6_PAGE_RECORD_CURSOR,
     Q6_PREFETCH_RECORD_CURSOR,
     Q6_PAGE_METADATA_CURSOR,
+    Q6_PAIRED_NIBBLE_HALF2,
 )
 
 
@@ -458,8 +460,8 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, "
-            "and 15 require dpas_layout=True"
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
+            "16, 17, 18, 20, and 21 require dpas_layout=True"
         ),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -689,8 +691,8 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, "
-            "and 15 require dpas_layout=True"
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
+            "16, 17, 18, 20, and 21 require dpas_layout=True"
         ),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -817,8 +819,8 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, "
-            "and 15 require dpas_layout=True"
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
+            "16, 17, 18, 20, and 21 require dpas_layout=True"
         ),
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(*arguments)
@@ -1791,6 +1793,7 @@ def test_q6_next_page_prefetch_handles_split_parity_and_hybrid_target() -> None:
             Q6_PAGE_RECORD_CURSOR,
             Q6_PREFETCH_RECORD_CURSOR,
             Q6_PAGE_METADATA_CURSOR,
+            Q6_PAIRED_NIBBLE_HALF2,
         )
     }
     torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1975,6 +1978,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
             (Q6_PAGE_RECORD_CURSOR, "q6-page-record-cursor"),
             (Q6_PREFETCH_RECORD_CURSOR, "q6-prefetch-record-cursor"),
             (Q6_PAGE_METADATA_CURSOR, "q6-page-metadata-cursor"),
+            (Q6_PAIRED_NIBBLE_HALF2, "q6-paired-nibble-half2"),
         )
     ]
 )
