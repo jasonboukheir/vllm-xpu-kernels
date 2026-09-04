@@ -24,6 +24,35 @@ constexpr int kVSColOffset = kVPackedOffset + kPackedBytes;
 constexpr int kVSRowOffset = kVSColOffset + kHeadDim * 2;
 constexpr int kVZpOffset = kVSRowOffset + kGroup * 2;
 constexpr int kRecordBytes = kVZpOffset + kGroup * 2;
+constexpr std::uintptr_t kDpasKVectorAlignment = 32;
+constexpr int64_t kDpasVVectorAlignment = 16;
+
+enum class KVarNNativeKernelVariant : int64_t {
+  kQ8Scalar = 0,
+  kQkI8U4 = 1,
+  kQ6Scalar = 2,
+  kQ8VectorLoad = 3,
+  kQ6VectorLoad = 4,
+  kPage128 = 5,
+};
+
+static_assert(kPackedBytes % kDpasKVectorAlignment == 0);
+static_assert(kVPackedOffset % kDpasVVectorAlignment == 0);
+static_assert(kRecordBytes % kDpasKVectorAlignment == 0);
+
+void check_dpas_vector_load_alignment(const at::Tensor& packed_cache) {
+  auto const address = reinterpret_cast<std::uintptr_t>(
+      packed_cache.const_data_ptr<std::uint8_t>());
+  TORCH_CHECK(
+      address % kDpasKVectorAlignment == 0,
+      "DPAS vector-load kernel variant requires a 32-byte-aligned "
+      "packed_cache base");
+  TORCH_CHECK(
+      packed_cache.stride(0) % kDpasKVectorAlignment == 0 &&
+          packed_cache.stride(1) % kDpasKVectorAlignment == 0,
+      "DPAS vector-load kernel variant requires 32-byte-aligned packed_cache "
+      "block and head strides");
+}
 
 int validated_split_count(int64_t max_seq_len, int64_t requested_splits) {
   // Zero retains source compatibility for direct extension callers. vLLM's
@@ -227,10 +256,20 @@ void kvarn_decode_with_scratch_xe2(
   TORCH_CHECK(
       std::isfinite(softmax_scale) && softmax_scale > 0.0,
       "softmax_scale must be finite and positive");
+  bool const use_dpas_vector_load =
+      kernel_variant ==
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad);
   TORCH_CHECK(
-      kernel_variant == 0,
+      kernel_variant ==
+              static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
+          use_dpas_vector_load,
       "unsupported native KVarN kernel_variant ",
-      kernel_variant);
+      kernel_variant,
+      "; implemented variants are 0 (q8 scalar) and 3 (q8 vector load)");
+  TORCH_CHECK(
+      !use_dpas_vector_load || dpas_layout,
+      "kernel_variant=3 requires dpas_layout=True");
+  if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
 
   cutlass::fmha::collective::KVarNK4V4Layout layout{
       static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
@@ -311,8 +350,10 @@ void kvarn_decode_with_scratch_xe2(
   args.softmax_lse_accum = exp_sums.data_ptr<float>();
   args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  auto status = dpas_layout ? KVarNDecodeD256G128DpasConfig::run(queue, args)
-                            : KVarNDecodeD256G128Config::run(queue, args);
+  auto status = use_dpas_vector_load
+                    ? KVarNDecodeD256G128DpasVectorLoadConfig::run(queue, args)
+                : dpas_layout ? KVarNDecodeD256G128DpasConfig::run(queue, args)
+                              : KVarNDecodeD256G128Config::run(queue, args);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
       "native KVarN decode rejected the validated problem");

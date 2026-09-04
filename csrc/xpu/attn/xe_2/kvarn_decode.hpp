@@ -358,8 +358,10 @@ struct KVarNReduceSplitOutputHadamardKernel {
  * the surrounding XeFMHA kernel's type contract and are never dereferenced by
  * the custom mainloop.
  */
-template <bool DpasPacked = false>
+template <bool DpasPacked = false, bool VectorPackedLoads = false>
 struct KVarNDecodeD256G128ConfigImpl {
+  static_assert(!VectorPackedLoads || DpasPacked);
+
   using Policy = KVarNDecodeD256G128Policy;
   using TileShapeQK = typename Policy::ShapeQK;
   using TileShapePV = typename Policy::ShapePV;
@@ -407,7 +409,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       TensorQ,
       TensorK,
       TensorV,
-      DpasPacked>;
+      DpasPacked,
+      VectorPackedLoads>;
   using Epilogue = cutlass::fmha::collective::
       DecodeFwdEpilogue<Mainloop, TileShapeO, TensorO, TensorLSE, void, false>;
   using ProblemShape = cutlass::fmha::kernel::DecodeProblemShape<false>;
@@ -432,6 +435,18 @@ struct KVarNDecodeD256G128ConfigImpl {
         args.cache == nullptr || args.block_to_slot == nullptr ||
         args.tail_key == nullptr || args.tail_value == nullptr) {
       return cutlass::Status::kErrorInvalidProblem;
+    }
+    if constexpr (VectorPackedLoads) {
+      constexpr std::uintptr_t kKVectorAlignment = 32;
+      constexpr std::int64_t kVVectorAlignment = 16;
+      auto const cache_address = reinterpret_cast<std::uintptr_t>(args.cache);
+      if (cache_address % kKVectorAlignment != 0 ||
+          args.layout.block_stride % kKVectorAlignment != 0 ||
+          args.layout.head_stride % kKVectorAlignment != 0 ||
+          args.layout.k_packed_offset % kKVectorAlignment != 0 ||
+          args.layout.v_packed_offset % kVVectorAlignment != 0) {
+        return cutlass::Status::kErrorInvalidProblem;
+      }
     }
 
     ProblemShape shape{
@@ -675,3 +690,5 @@ struct KVarNDecodeD256G128ConfigImpl {
 
 using KVarNDecodeD256G128Config = KVarNDecodeD256G128ConfigImpl<false>;
 using KVarNDecodeD256G128DpasConfig = KVarNDecodeD256G128ConfigImpl<true>;
+using KVarNDecodeD256G128DpasVectorLoadConfig =
+    KVarNDecodeD256G128ConfigImpl<true, true>;
