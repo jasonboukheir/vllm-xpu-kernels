@@ -40,6 +40,19 @@ def test_id16_selects_only_current_half_v_prefetch_over_id13() -> None:
     ) in CONFIG
 
 
+def test_id17_selects_only_page_record_cursor_over_id13() -> None:
+    assert "kQ6PageRecordCursor = 17" in DISPATCH
+    assert "use_q6_page_record_cursor" in DISPATCH
+    assert (
+        "!KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::\n"
+        "                  CurrentHalfVPrefetch"
+    ) in CONFIG
+    assert (
+        "KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::\n"
+        "                  ReusePageRecordCursor"
+    ) in CONFIG
+
+
 def test_half_local_v_prefetch_ranges_match_xe2_dpas_record() -> None:
     packed_bytes = 256 * 128 // 2
     column_bytes = 256 * 2
@@ -64,3 +77,23 @@ def test_half_local_v_prefetch_ranges_match_xe2_dpas_record() -> None:
 
     assert "prefetch_dpas_v_half_l1" in MAINLOOP
     assert "syclex::prefetch_hint_L1" in MAINLOOP
+
+
+def test_page_record_cursor_refreshes_once_per_touched_page() -> None:
+    def refresh_tiles(first_tile: int, last_tile: int) -> list[int]:
+        return [
+            tile
+            for tile in range(first_tile, last_tile)
+            if tile == first_tile or tile % 2 == 0
+        ]
+
+    for first_tile, last_tile in ((0, 8), (1, 8), (5, 6), (5, 11)):
+        touched_pages = {tile // 2 for tile in range(first_tile, last_tile)}
+        refreshed_pages = {
+            tile // 2 for tile in refresh_tiles(first_tile, last_tile)
+        }
+        assert refreshed_pages == touched_pages
+        assert len(refresh_tiles(first_tile, last_tile)) == len(touched_pages)
+
+    assert "bool const refresh_record =" in MAINLOOP
+    assert "(k_tile & 1) == 0 || k_tile == blk_k0" in MAINLOOP

@@ -541,6 +541,11 @@ struct KVarNDecodeD256G128ConfigImpl {
           (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
       "current-half V prefetch is an exact-Q6 DPAS experiment");
   static_assert(!CurrentHalfVPrefetch || !PagePair);
+  static_assert(
+      !ReusePageRecordCursor ||
+          (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
+      "page-record cursor reuse is an exact-Q6 DPAS experiment");
+  static_assert(!ReusePageRecordCursor || !PagePair);
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -1085,6 +1090,22 @@ using KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig =
         false,
         false,
         true>;
+using KVarNDecodeD256G128DpasQ6PageRecordCursorConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        true,
+        true,
+        false,
+        false,
+        false,
+        true>;
 
 // The block-store payload assembly relies on the established interleaved Q6
 // fragment order.  Prove that contract against CuTe at compile time so a
@@ -1259,6 +1280,18 @@ static_assert(KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::
 static_assert(
     sizeof(KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::
                Params) ==
+    sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+               Mainloop::Params));
+static_assert(KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::
+                  NextPagePrefetch);
+static_assert(!KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::
+                  CurrentHalfVPrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::
+                  ReusePageRecordCursor);
+static_assert(KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::
+                  UsesSpecializedSplitReducer);
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::Params) ==
     sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
                Mainloop::Params));
 static_assert(
