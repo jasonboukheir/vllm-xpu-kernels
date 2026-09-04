@@ -102,6 +102,42 @@ def test_completion_protocol_has_release_sequence_and_no_spin() -> None:
     assert "if (!shared_.is_last_producer) return" in finalizer
 
 
+def test_scheduler_passes_only_nonempty_producers_to_finalizer() -> None:
+    """Model the legacy rectangular scheduler's ragged split contract."""
+    assert "int active_producer_count;" in KERNEL
+    assert (
+        "active_producer_count =\n"
+        "              cute::ceil_div(windowed_k_blocks, num_blocks_per_split);"
+        in KERNEL
+    )
+    assert (
+        "idx_b, head, idx_kv_split, active_producer_count" in KERNEL
+    )
+    assert (
+        "finalizer(\n"
+        "            idx_b, head, idx_kv_split, "
+        "is_single_split ? 1 : seq_num_kv_splits);"
+        not in KERNEL
+    )
+
+    def active_producers(seq_len: int, requested_splits: int) -> int:
+        kv_blocks = (seq_len + 63) // 64
+        if kv_blocks < 32:
+            return 1
+        blocks_per_split = (
+            kv_blocks + requested_splits - 1
+        ) // requested_splits
+        return (kv_blocks + blocks_per_split - 1) // blocks_per_split
+
+    assert active_producers(1536, 16) == 1
+    assert active_producers(4095, 16) == 16
+    assert active_producers(4096, 16) == 16
+    assert active_producers(4097, 16) == 13
+    assert active_producers(4608, 16) == 15
+    assert active_producers(8191, 32) == 32
+    assert active_producers(8192, 32) == 32
+
+
 def test_last_producer_preserves_output_contract() -> None:
     assert "kQueryHeadsPerKV = 6" in CONFIG
     assert "query_in_group < kQueryHeadsPerKV" in CONFIG

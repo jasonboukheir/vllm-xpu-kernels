@@ -413,6 +413,7 @@ class XeFMHAFwdSplitKVKernel {
       int kv_split_offset;
       int num_effective_kv_blocks;
       int seq_num_kv_splits;
+      int active_producer_count;
       bool is_single_split;
 
       if (wl_tile_start >= 0) {
@@ -425,6 +426,10 @@ class XeFMHAFwdSplitKVKernel {
                                 ? p.splits_per_seq[idx_b]
                                 : num_kv_splits;
         is_single_split = (seq_num_kv_splits <= 1);
+        // A compact plan contains exactly splits_per_seq[idx_b] non-empty
+        // work items for the row.  Its split count is therefore already the
+        // producer count, unlike the legacy rectangular grid below.
+        active_producer_count = seq_num_kv_splits;
       } else {
         // Legacy path: compute split range on the fly
         seq_num_kv_splits = (p.splits_per_seq != nullptr)
@@ -444,12 +449,20 @@ class XeFMHAFwdSplitKVKernel {
             (seq_num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
 
         if (is_single_split) {
+          active_producer_count = 1;
           if (idx_kv_split > 0) {
             continue;
           }
           kv_split_offset = k_block0;
           num_effective_kv_blocks = windowed_k_blocks;
         } else {
+          // ceil_div assigns the same block count to every requested split
+          // except the tail.  For ragged rows this can leave one or more
+          // rectangular-grid workgroups empty (for example K65/S16 has 13
+          // active producers).  The last-producer protocol must wait for the
+          // number of non-empty workgroups, not the requested scratch stride.
+          active_producer_count =
+              cute::ceil_div(windowed_k_blocks, num_blocks_per_split);
           kv_split_offset = k_block0 + idx_kv_split * num_blocks_per_split;
           num_effective_kv_blocks = cute::min(
               windowed_k_blocks - idx_kv_split * num_blocks_per_split,
@@ -600,8 +613,7 @@ class XeFMHAFwdSplitKVKernel {
       if constexpr (HasLastProducerFinalizer) {
         LastProducerFinalizer finalizer{
             params.finalizer, shared_storage.finalizer};
-        finalizer(
-            idx_b, head, idx_kv_split, is_single_split ? 1 : seq_num_kv_splits);
+        finalizer(idx_b, head, idx_kv_split, active_producer_count);
       }
     }
   }
