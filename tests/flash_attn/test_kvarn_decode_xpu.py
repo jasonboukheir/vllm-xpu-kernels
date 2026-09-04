@@ -1523,8 +1523,12 @@ def test_fused_output_hadamard_rejects_single_split() -> None:
 @pytest.mark.parametrize(
     ("batch", "splits"),
     [
+        pytest.param(1, 2, id="policy-split2"),
+        pytest.param(1, 4, id="policy-split4"),
         pytest.param(1, 32, id="b1-split32"),
         pytest.param(4, 8, id="b4-split8"),
+        pytest.param(12, 16, id="b12-split16"),
+        pytest.param(1, 17, id="generic-fallback-split17"),
         pytest.param(1, 24, id="generic-fallback-split24"),
     ],
 )
@@ -1587,6 +1591,98 @@ def test_q6_specialized_fused_reducer_matches_runtime_reducer(
     torch.testing.assert_close(
         specialized_output, runtime_output, atol=0, rtol=0
     )
+
+
+def test_q6_next_page_prefetch_handles_split_parity_and_hybrid_target() -> None:
+    """An odd split start may look ahead to a hybrid next physical page."""
+    batch = 4
+    splits = 8
+    max_seq_len = 33 * 64
+    pages_per_row = (max_seq_len + 127) // 128
+    canonical, layout = make_random_cache(pages_per_row)
+    swizzled = canonical.clone()
+    for block in range(pages_per_row):
+        for kv_head in range(4):
+            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
+                canonical[block, kv_head], layout
+            )
+
+    max_kv_tiles = (max_seq_len + 63) // 64
+    tiles_per_split = (max_kv_tiles + splits - 1) // splits
+    split_starts = [
+        split * tiles_per_split
+        for split in range(splits)
+        if split * tiles_per_split < max_kv_tiles
+    ]
+    assert tiles_per_split == 5
+    assert {start % 2 for start in split_starts} == {0, 1}
+
+    # Split 1 starts on the second half of page 2. Its first prefetch target
+    # is page 3, which deliberately resides in the full-precision tail pool.
+    odd_split_start = split_starts[1]
+    next_page_tile = (odd_split_start & ~1) + 2
+    hybrid_page = next_page_tile // 2
+    assert odd_split_start % 2 == 1
+    assert hybrid_page == 3
+
+    tail_key = torch.empty((1, 128, 4, 256), dtype=torch.float16)
+    tail_value = torch.empty_like(tail_key)
+    for kv_head in range(4):
+        key_page, value_page = dequant_record(
+            canonical[hybrid_page, kv_head], layout
+        )
+        tail_key[0, :, kv_head] = key_page
+        tail_value[0, :, kv_head] = value_page
+
+    generator = torch.Generator().manual_seed(12008)
+    query = torch.randn(
+        (batch, 24, 256), generator=generator, dtype=torch.float16
+    ).xpu()
+    pages = torch.arange(pages_per_row, dtype=torch.int32, device="xpu").repeat(
+        batch, 1
+    )
+    seq_lens = torch.tensor(
+        [max_seq_len, 2049, 1985, 1921], dtype=torch.int32, device="xpu"
+    )
+    block_to_slot = torch.full(
+        (pages_per_row,), -1, dtype=torch.int32, device="xpu"
+    )
+    block_to_slot[hybrid_page] = 0
+    arguments = (
+        query,
+        swizzled.xpu(),
+        pages,
+        seq_lens,
+        block_to_slot,
+        tail_key.xpu(),
+        tail_value.xpu(),
+    )
+    baseline = torch.empty_like(query)
+    prefetched = torch.empty_like(query)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        baseline,
+        max_seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        R1_P2_DPAS_Q6,
+        True,
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        prefetched,
+        max_seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        Q6_NEXT_PAGE_PREFETCH,
+        True,
+    )
+    assert torch.isfinite(prefetched).all()
+    torch.testing.assert_close(prefetched, baseline, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("with_scratch", [False, True])
@@ -1732,6 +1828,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
             ),
             (Q6_PAGE_PAIR, "q6-page-pair"),
             (Q6_MAIN_GRF128, "q6_main_grf128"),
+            (Q6_NEXT_PAGE_PREFETCH, "q6-next-page-prefetch"),
         )
     ]
 )
