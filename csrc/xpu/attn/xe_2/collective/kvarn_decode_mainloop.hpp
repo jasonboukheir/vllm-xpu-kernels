@@ -80,6 +80,7 @@ struct KVarNK4V4FragmentLoader {
   static constexpr int kHalfRowBytes = kRowBytes / 2;
   static constexpr int kKMetadataBytes = 2 * kColumnBytes + kRowBytes;
   static constexpr int kVMetadataBytes = kColumnBytes + 2 * kRowBytes;
+  static constexpr int kPackedHalfBytes = kPackedBytes / 2;
   static constexpr int kActiveRecordBytes =
       2 * kPackedBytes + kKMetadataBytes + kVMetadataBytes;
   static constexpr int kPagePrefetchThreads = 4 * cute::intel::sg_size;
@@ -158,6 +159,18 @@ struct KVarNK4V4FragmentLoader {
         syclex::properties{syclex::prefetch_hint_L2});
   }
 
+  template <int RangeBytes>
+  CUTLASS_DEVICE static void
+  prefetch_lane_partition_l1(std::uint8_t const* range, int thread) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    static_assert(RangeBytes % kPagePrefetchThreads == 0);
+    constexpr int kBytesPerThread = RangeBytes / kPagePrefetchThreads;
+    syclex::prefetch(
+        range + thread * kBytesPerThread,
+        kBytesPerThread,
+        syclex::properties{syclex::prefetch_hint_L1});
+  }
+
   /** Prefetch exactly the packed-cache ranges used by the next physical page.
    *
    * All 64 work-items own disjoint byte ranges.  The partial-page form omits
@@ -198,6 +211,27 @@ struct KVarNK4V4FragmentLoader {
       prefetch_lane_partition_l2<kHalfRowBytes>(
           rec + layout.v_zp_offset, thread);
     }
+  }
+
+  /** Stage only the V ranges consumed by one current K64 half into L1.
+   *
+   * Unlike next-page L2 prefetch, this is issued after QK has finished and
+   * immediately before online softmax.  Softmax and probability rescaling
+   * provide the overlap window while keeping unrelated K data out of L1.
+   * Column scales are page-wide; packed V, row scales, and zero points are
+   * half-local contiguous ranges in the immutable xe2_dpas cache ABI.
+   */
+  CUTLASS_DEVICE void prefetch_dpas_v_half_l1(
+      std::uint8_t const* rec, int half, int thread) const {
+    static_assert(DpasPacked);
+    prefetch_lane_partition_l1<kPackedHalfBytes>(
+        rec + layout.v_packed_offset + half * kPackedHalfBytes, thread);
+    prefetch_lane_partition_l1<kColumnBytes>(
+        rec + layout.v_s_col_offset, thread);
+    prefetch_lane_partition_l1<kHalfRowBytes>(
+        rec + layout.v_s_row_offset + half * kHalfRowBytes, thread);
+    prefetch_lane_partition_l1<kHalfRowBytes>(
+        rec + layout.v_zp_offset + half * kHalfRowBytes, thread);
   }
 
   template <int WordCount, class Fragment>
@@ -450,7 +484,9 @@ template <
     bool ExactLiveRows_ = false,
     bool PagePair_ = false,
     bool NextPagePrefetch_ = false,
-    bool SimdPackedUnpack_ = false>
+    bool SimdPackedUnpack_ = false,
+    bool CurrentHalfVPrefetch_ = false,
+    bool ReusePageRecordCursor_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -510,11 +546,15 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool PagePair = PagePair_;
   static constexpr bool NextPagePrefetch = NextPagePrefetch_;
   static constexpr bool SimdPackedUnpack = SimdPackedUnpack_;
+  static constexpr bool CurrentHalfVPrefetch = CurrentHalfVPrefetch_;
+  static constexpr bool ReusePageRecordCursor = ReusePageRecordCursor_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
   static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
   static_assert(QueryRows <= 8);
   static_assert(!NextPagePrefetch || DpasPacked_);
   static_assert(!NextPagePrefetch || !PagePair);
+  static_assert(!CurrentHalfVPrefetch || DpasPacked_);
+  static_assert(!CurrentHalfVPrefetch || !PagePair);
   static_assert(
       !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
   // Each split stores a bounded normalized partial. KVarN reducers combine
@@ -1212,6 +1252,12 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); ++i) {
           tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(mask, tSrS, i));
+        }
+      }
+
+      if constexpr (CurrentHalfVPrefetch) {
+        if (slot < 0) {
+          loader.prefetch_dpas_v_half_l1(rec, k_tile & 1, thr_id);
         }
       }
 

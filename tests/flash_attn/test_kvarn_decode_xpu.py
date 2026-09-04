@@ -46,6 +46,7 @@ Q6_NEXT_PAGE_PREFETCH = 12
 Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
 Q6_SIMD_UNPACK = 14
 Q6_BLOCK_OUTPUT_STORE = 15
+Q6_CURRENT_HALF_V_PREFETCH = 16
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -60,6 +61,7 @@ Q6_FACTORY_VARIANTS = (
     Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
     Q6_SIMD_UNPACK,
     Q6_BLOCK_OUTPUT_STORE,
+    Q6_CURRENT_HALF_V_PREFETCH,
 )
 
 
@@ -1779,6 +1781,7 @@ def test_q6_next_page_prefetch_handles_split_parity_and_hybrid_target() -> None:
         for variant in (
             Q6_NEXT_PAGE_PREFETCH,
             Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+            Q6_CURRENT_HALF_V_PREFETCH,
         )
     }
     torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1959,6 +1962,7 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
             ),
             (Q6_SIMD_UNPACK, "q6-simd-unpack"),
             (Q6_BLOCK_OUTPUT_STORE, "q6-block-output-store"),
+            (Q6_CURRENT_HALF_V_PREFETCH, "q6-current-half-v-prefetch"),
         )
     ]
 )
