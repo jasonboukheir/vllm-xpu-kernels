@@ -18,14 +18,34 @@ ESTABLISHED_WRITER = (
 
 
 def test_fused_writer_keeps_slm_below_xe2_limit() -> None:
-    # Six D256 vectors plus one scalar; the compact source page remains in
-    # global/L2 storage and no 64 KiB tile accessor is added to SLM.
-    state_floats = 6 * 256 + 1
-    assert state_floats * 4 == 6_148
+    # Six D256 vectors, one scalar, and two D256 moment scratch vectors; the
+    # compact source page remains in global/L2 storage.
+    state_floats = 8 * 256 + 1
+    assert state_floats * 4 == 8_196
     assert state_floats * 4 < 64 * 1024
     assert "kLocalMemoryBytes = kStateFloats * sizeof(float)" in WRITER
     assert "kLocalMemoryBytes <= 64 * 1024" in WRITER
     assert "local_accessor<input_t" not in WRITER
+
+
+def test_iterative_writer_matches_triton_xpu_reduction_topology() -> None:
+    # Artifact-era Triton-XPU 3.7.2 IR uses subgroup32, 32-value lane-local
+    # trees, and SPIR-V clustered reductions of 8 (K) or 4 (V).
+    assert "reqd_sub_group_size(kSubgroup)" in WRITER
+    assert "kSubgroup = 32" in WRITER
+    assert "kValuesPerLane == kSubgroup" in WRITER
+    assert "chunked_partition<kCluster>(subgroup)" in WRITER
+    assert "chunked_partition<2>(subgroup)" in WRITER
+    assert "sycl::reduce_over_group(cluster" in WRITER
+    assert "subgroup, (x0 + x1) + (x2 + x3)" in WRITER
+    assert "half * kGroup + lane * 4" in WRITER
+
+
+def test_iterative_writer_preserves_triton_math_order() -> None:
+    assert "sycl::exp2(log_scale * 1.4426950216293335f)" in WRITER
+    assert "variance *= float(Extent)" in WRITER
+    assert "variance /= float(Extent - 1)" in WRITER
+    assert "float(Extent) / float(Extent - 1)" not in WRITER
 
 
 def test_fused_writer_has_a_distinct_raw_page_schema() -> None:

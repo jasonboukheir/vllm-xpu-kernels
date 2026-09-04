@@ -17,6 +17,7 @@ constexpr int kHeadDim = 256;
 constexpr int kGroup = 128;
 constexpr int kKvHeads = 4;
 constexpr int kWorkgroup = 256;
+constexpr int kSubgroup = 32;
 constexpr int kQMax = 15;
 constexpr int kPackedBytes = kHeadDim * kGroup / 2;
 constexpr int kKSColOffset = kPackedBytes;
@@ -44,7 +45,9 @@ constexpr int kLinearRow = kLinearCol + kHeadDim;
 constexpr int kBestCol = kLinearRow + kHeadDim;
 constexpr int kBestRow = kBestCol + kHeadDim;
 constexpr int kBestImbalance = kBestRow + kHeadDim;
-constexpr int kStateFloats = kBestImbalance + 1;
+constexpr int kMomentSum = kBestImbalance + 1;
+constexpr int kMomentSquareSum = kMomentSum + kHeadDim;
+constexpr int kStateFloats = kMomentSquareSum + kHeadDim;
 constexpr std::size_t kLocalMemoryBytes = kStateFloats * sizeof(float);
 static_assert(
     kLocalMemoryBytes <= 64 * 1024,
@@ -97,7 +100,8 @@ class KVarNSinkhornWriterKernel {
         sinkhorn_iterations_(sinkhorn_iterations),
         state_(state) {}
 
-  void operator()(sycl::nd_item<1> item) const {
+  [[sycl::reqd_sub_group_size(kSubgroup)]] void
+  operator()(sycl::nd_item<1> item) const {
     const int64_t tile_index = item.get_group(0);
     const int thread = item.get_local_id(0);
     if (tile_index >= scheduled_blocks_ * kKvHeads) return;
@@ -153,33 +157,151 @@ class KVarNSinkhornWriterKernel {
            state_[kBestRow + row];
   }
 
-  template <bool Key, int Rows, int Cols>
-  float column_std(const input_t* source, int col) const {
-    float sum = 0.0f;
-    float square_sum = 0.0f;
-    for (int row = 0; row < Rows; ++row) {
-      const float value = current_value<Key, Rows, Cols>(source, row, col);
-      sum += value;
-      square_sum += value * value;
+  // Triton-XPU 3.7.2 lowers the R256/C128 K tile and R128/C256 V tile to
+  // eight 32-lane subgroups.  A column reduction first forms an exact
+  // 32-value binary tree per lane, then uses a SPIR-V ClusteredReduce across
+  // the eight K row warps or four V row warps.  Keeping this structure is
+  // important: a serial accumulator changes fp32 Sinkhorn factors enough to
+  // alter q4 bytes after only two iterations.
+  template <bool Square, bool Key, int Rows, int Cols>
+  float column_tree(const input_t* source, int col, int row_chunk) const {
+    constexpr int kCluster = Rows / kSubgroup;
+    constexpr int kValuesPerLane = Rows / kCluster;
+    static_assert(kValuesPerLane == kSubgroup);
+    float values[kValuesPerLane];
+#pragma unroll
+    for (int i = 0; i < kValuesPerLane; ++i) {
+      const float value =
+          current_value<Key, Rows, Cols>(source, row_chunk + i * kCluster, col);
+      values[i] = Square ? value * value : value;
     }
-    const float mean = sum / float(Rows);
-    const float variance = (square_sum / float(Rows) - mean * mean) *
-                           (float(Rows) / float(Rows - 1));
-    return sycl::sqrt(sycl::fmax(variance, 0.0f));
+#pragma unroll
+    for (int stride = 1; stride < kValuesPerLane; stride *= 2) {
+#pragma unroll
+      for (int i = 0; i < kValuesPerLane; i += 2 * stride) {
+        values[i] = values[i] + values[i + stride];
+      }
+    }
+    return values[0];
   }
 
   template <bool Key, int Rows, int Cols>
-  float row_std(const input_t* source, int row) const {
-    float sum = 0.0f;
-    float square_sum = 0.0f;
-    for (int col = 0; col < Cols; ++col) {
-      const float value = current_value<Key, Rows, Cols>(source, row, col);
-      sum += value;
-      square_sum += value * value;
+  void
+  compute_column_moments(sycl::nd_item<1> item, const input_t* source) const {
+    constexpr int kCluster = Rows / kSubgroup;
+    constexpr int kClustersPerSubgroup = kSubgroup / kCluster;
+    constexpr int kColumnsPerRound =
+        (kWorkgroup / kSubgroup) * kClustersPerSubgroup;
+    static_assert(Rows == 128 || Rows == 256);
+    static_assert(Cols % kColumnsPerRound == 0);
+
+    const int thread = item.get_local_id(0);
+    const int subgroup_id = thread / kSubgroup;
+    const auto subgroup = item.get_sub_group();
+    const auto cluster =
+        sycl::ext::oneapi::experimental::chunked_partition<kCluster>(subgroup);
+    const int cluster_id = cluster.get_group_linear_id();
+    const int row_chunk = cluster.get_local_linear_id();
+
+#pragma unroll
+    for (int round = 0; round < Cols / kColumnsPerRound; ++round) {
+      const int col = round * kColumnsPerRound +
+                      subgroup_id * kClustersPerSubgroup + cluster_id;
+      float sum = column_tree<false, Key, Rows, Cols>(source, col, row_chunk);
+      float square_sum =
+          column_tree<true, Key, Rows, Cols>(source, col, row_chunk);
+      sum = sycl::reduce_over_group(cluster, sum, sycl::plus<float>());
+      square_sum =
+          sycl::reduce_over_group(cluster, square_sum, sycl::plus<float>());
+      if (cluster.leader()) {
+        state_[kMomentSum + col] = sum;
+        state_[kMomentSquareSum + col] = square_sum;
+      }
     }
-    const float mean = sum / float(Cols);
-    const float variance = (square_sum / float(Cols) - mean * mean) *
-                           (float(Cols) / float(Cols - 1));
+    item.barrier(sycl::access::fence_space::local_space);
+  }
+
+  template <bool Key, int Rows, int Cols>
+  void compute_row_moments(sycl::nd_item<1> item, const input_t* source) const {
+    const int thread = item.get_local_id(0);
+    const int lane = thread % kSubgroup;
+    const int subgroup_id = thread / kSubgroup;
+    const auto subgroup = item.get_sub_group();
+
+    if constexpr (Cols == kGroup) {
+      // K: four adjacent columns per lane, then one full-subgroup reduction.
+#pragma unroll
+      for (int round = 0; round < Rows / (kWorkgroup / kSubgroup); ++round) {
+        const int row = round * (kWorkgroup / kSubgroup) + subgroup_id;
+        const int col = lane * 4;
+        const float x0 = current_value<Key, Rows, Cols>(source, row, col);
+        const float x1 = current_value<Key, Rows, Cols>(source, row, col + 1);
+        const float x2 = current_value<Key, Rows, Cols>(source, row, col + 2);
+        const float x3 = current_value<Key, Rows, Cols>(source, row, col + 3);
+        const float sum = sycl::reduce_over_group(
+            subgroup, (x0 + x1) + (x2 + x3), sycl::plus<float>());
+        const float square_sum = sycl::reduce_over_group(
+            subgroup,
+            (x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3),
+            sycl::plus<float>());
+        if (lane == 0) {
+          state_[kMomentSum + row] = sum;
+          state_[kMomentSquareSum + row] = square_sum;
+        }
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+    } else {
+      static_assert(Cols == kHeadDim);
+      // V: Triton's [4,2] warp layout reduces two 128-column halves in full
+      // subgroups, transposes through SLM, then uses ClusteredReduce<2>.
+#pragma unroll
+      for (int round = 0; round < Rows / 4; ++round) {
+        const int row = round * 4 + subgroup_id / 2;
+        const int half = subgroup_id % 2;
+        const int col = half * kGroup + lane * 4;
+        const float x0 = current_value<Key, Rows, Cols>(source, row, col);
+        const float x1 = current_value<Key, Rows, Cols>(source, row, col + 1);
+        const float x2 = current_value<Key, Rows, Cols>(source, row, col + 2);
+        const float x3 = current_value<Key, Rows, Cols>(source, row, col + 3);
+        const float sum = sycl::reduce_over_group(
+            subgroup, (x0 + x1) + (x2 + x3), sycl::plus<float>());
+        const float square_sum = sycl::reduce_over_group(
+            subgroup,
+            (x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3),
+            sycl::plus<float>());
+        if (lane == 0) {
+          state_[kMomentSum + row * 2 + half] = sum;
+          state_[kMomentSquareSum + row * 2 + half] = square_sum;
+        }
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+      const int row = thread / 2;
+      float sum = state_[kMomentSum + thread];
+      float square_sum = state_[kMomentSquareSum + thread];
+      // Every subgroup must capture its SLM inputs before another subgroup's
+      // row leaders overwrite the front half of the scratch vectors.
+      item.barrier(sycl::access::fence_space::local_space);
+      const auto row_pair =
+          sycl::ext::oneapi::experimental::chunked_partition<2>(subgroup);
+      sum = sycl::reduce_over_group(row_pair, sum, sycl::plus<float>());
+      square_sum =
+          sycl::reduce_over_group(row_pair, square_sum, sycl::plus<float>());
+      if (row_pair.leader()) {
+        state_[kMomentSum + row] = sum;
+        state_[kMomentSquareSum + row] = square_sum;
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+    }
+  }
+
+  template <int Extent>
+  float moment_std(int index) const {
+    const float mean = state_[kMomentSum + index] / float(Extent);
+    float variance =
+        state_[kMomentSquareSum + index] / float(Extent) - mean * mean;
+    // Preserve Triton 3.7.2's two operations instead of pre-folding N/(N-1).
+    variance *= float(Extent);
+    variance /= float(Extent - 1);
     return sycl::sqrt(sycl::fmax(variance, 0.0f));
   }
 
@@ -187,8 +309,8 @@ class KVarNSinkhornWriterKernel {
   float imbalance(sycl::nd_item<1> item, const input_t* source) const {
     const int thread = item.get_local_id(0);
     const auto group = item.get_group();
-    const float col_std =
-        thread < Cols ? column_std<Key, Rows, Cols>(source, thread) : 0.0f;
+    compute_column_moments<Key, Rows, Cols>(item, source);
+    const float col_std = thread < Cols ? moment_std<Rows>(thread) : 0.0f;
     const float col_min = sycl::reduce_over_group(
         group,
         thread < Cols ? col_std : std::numeric_limits<float>::infinity(),
@@ -197,8 +319,8 @@ class KVarNSinkhornWriterKernel {
         group,
         thread < Cols ? col_std : -std::numeric_limits<float>::infinity(),
         sycl::maximum<float>());
-    const float row_sigma =
-        thread < Rows ? row_std<Key, Rows, Cols>(source, thread) : 0.0f;
+    compute_row_moments<Key, Rows, Cols>(item, source);
+    const float row_sigma = thread < Rows ? moment_std<Cols>(thread) : 0.0f;
     const float row_min = sycl::reduce_over_group(
         group,
         thread < Rows ? row_sigma : std::numeric_limits<float>::infinity(),
@@ -230,30 +352,31 @@ class KVarNSinkhornWriterKernel {
     item.barrier(sycl::access::fence_space::local_space);
 
     for (int iteration = 0; iteration < sinkhorn_iterations_; ++iteration) {
+      compute_column_moments<Key, Rows, Cols>(item, source);
       if (thread < Cols) {
         const float sigma = sycl::fmin(
-            sycl::fmax(
-                column_std<Key, Rows, Cols>(source, thread), kClipStdMin),
-            kClipStdMax);
+            sycl::fmax(moment_std<Rows>(thread), kClipStdMin), kClipStdMax);
         const float log_scale = sycl::fmin(
             sycl::fmax(
                 state_[kLogCol + thread] + sycl::log(sigma), kLogScaleMin),
             kLogScaleMax);
         state_[kLogCol + thread] = log_scale;
-        state_[kLinearCol + thread] = sycl::exp(log_scale);
+        state_[kLinearCol + thread] =
+            sycl::exp2(log_scale * 1.4426950216293335f);
       }
       item.barrier(sycl::access::fence_space::local_space);
 
+      compute_row_moments<Key, Rows, Cols>(item, source);
       if (thread < Rows) {
         const float sigma = sycl::fmin(
-            sycl::fmax(row_std<Key, Rows, Cols>(source, thread), kClipStdMin),
-            kClipStdMax);
+            sycl::fmax(moment_std<Cols>(thread), kClipStdMin), kClipStdMax);
         const float log_scale = sycl::fmin(
             sycl::fmax(
                 state_[kLogRow + thread] + sycl::log(sigma), kLogScaleMin),
             kLogScaleMax);
         state_[kLogRow + thread] = log_scale;
-        state_[kLinearRow + thread] = sycl::exp(log_scale);
+        state_[kLinearRow + thread] =
+            sycl::exp2(log_scale * 1.4426950216293335f);
       }
       item.barrier(sycl::access::fence_space::local_space);
 
