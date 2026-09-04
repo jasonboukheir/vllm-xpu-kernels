@@ -43,6 +43,7 @@ Q6_PAGE_PAIR = 9
 Q6_MAIN_GRF128 = 10
 Q6_SPLIT_REDUCER_SPECIALIZED = 11
 Q6_NEXT_PAGE_PREFETCH = 12
+Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -54,6 +55,7 @@ Q6_FACTORY_VARIANTS = (
     Q6_MAIN_GRF128,
     Q6_SPLIT_REDUCER_SPECIALIZED,
     Q6_NEXT_PAGE_PREFETCH,
+    Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
 )
 
 
@@ -444,7 +446,8 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, and 13 "
+            "require "
             "dpas_layout=True"
         ),
     ):
@@ -675,7 +678,8 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, and 13 "
+            "require "
             "dpas_layout=True"
         ),
     ):
@@ -737,7 +741,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [5, -1, 13])
+@pytest.mark.parametrize("kernel_variant", [5, -1, 14])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -776,6 +780,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         Q6_MAIN_GRF128,
         Q6_SPLIT_REDUCER_SPECIALIZED,
         Q6_NEXT_PAGE_PREFETCH,
+        Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
     ],
 )
 def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
@@ -800,7 +805,8 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, and 13 "
+            "require "
             "dpas_layout=True"
         ),
     ):
@@ -1546,10 +1552,28 @@ def test_fused_output_hadamard_rejects_single_split() -> None:
         pytest.param(1, 24, id="generic-fallback-split24"),
     ],
 )
+@pytest.mark.parametrize(
+    ("runtime_variant", "specialized_variant"),
+    [
+        pytest.param(
+            R1_P2_DPAS_Q6,
+            Q6_SPLIT_REDUCER_SPECIALIZED,
+            id="base-mainloop",
+        ),
+        pytest.param(
+            Q6_NEXT_PAGE_PREFETCH,
+            Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+            id="next-page-prefetch-mainloop",
+        ),
+    ],
+)
 def test_q6_specialized_fused_reducer_matches_runtime_reducer(
-    batch: int, splits: int
+    batch: int,
+    splits: int,
+    runtime_variant: int,
+    specialized_variant: int,
 ) -> None:
-    """ID 11 changes only the fused reducer selected after Q6 production."""
+    """Specialized variants change only the reducer after Q6 production."""
     seq_len = 4096
     pages_per_row = (seq_len + 127) // 128
     canonical, layout = make_random_cache(pages_per_row)
@@ -1588,7 +1612,7 @@ def test_q6_specialized_fused_reducer_matches_runtime_reducer(
         True,
         False,
         splits,
-        R1_P2_DPAS_Q6,
+        runtime_variant,
         True,
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1599,7 +1623,7 @@ def test_q6_specialized_fused_reducer_matches_runtime_reducer(
         True,
         False,
         splits,
-        Q6_SPLIT_REDUCER_SPECIALIZED,
+        specialized_variant,
         True,
     )
     torch.testing.assert_close(
@@ -1672,7 +1696,13 @@ def test_q6_next_page_prefetch_handles_split_parity_and_hybrid_target() -> None:
         tail_value.xpu(),
     )
     baseline = torch.empty_like(query)
-    prefetched = torch.empty_like(query)
+    prefetched = {
+        variant: torch.empty_like(query)
+        for variant in (
+            Q6_NEXT_PAGE_PREFETCH,
+            Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+        )
+    }
     torch.ops._vllm_fa2_C.kvarn_decode(
         *arguments,
         baseline,
@@ -1684,19 +1714,20 @@ def test_q6_next_page_prefetch_handles_split_parity_and_hybrid_target() -> None:
         R1_P2_DPAS_Q6,
         True,
     )
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        prefetched,
-        max_seq_len,
-        1.0 / 16.0,
-        False,
-        False,
-        splits,
-        Q6_NEXT_PAGE_PREFETCH,
-        True,
-    )
-    assert torch.isfinite(prefetched).all()
-    torch.testing.assert_close(prefetched, baseline, atol=0, rtol=0)
+    for variant, output in prefetched.items():
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            *arguments,
+            output,
+            max_seq_len,
+            1.0 / 16.0,
+            False,
+            False,
+            splits,
+            variant,
+            True,
+        )
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, baseline, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("with_scratch", [False, True])
@@ -1844,6 +1875,10 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
             (Q6_MAIN_GRF128, "q6_main_grf128"),
             (Q6_SPLIT_REDUCER_SPECIALIZED, "q6-split-reducer-specialized"),
             (Q6_NEXT_PAGE_PREFETCH, "q6-next-page-prefetch"),
+            (
+                Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+                "q6-next-page-prefetch-split-reducer",
+            ),
         )
     ]
 )
@@ -2087,3 +2122,26 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     assert torch.isfinite(repeat).all()
     torch.testing.assert_close(output.cpu(), expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(output, repeat, atol=0, rtol=0)
+
+    if kernel_variant == Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER:
+        runtime_fused = torch.empty_like(output)
+        specialized_fused = torch.empty_like(output)
+        for variant, target in (
+            (Q6_NEXT_PAGE_PREFETCH, runtime_fused),
+            (Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER, specialized_fused),
+        ):
+            torch.ops._vllm_fa2_C.kvarn_decode(
+                *arguments,
+                target,
+                max(seq_lengths),
+                1.0 / 16.0,
+                True,
+                False,
+                splits,
+                variant,
+                dpas_layout,
+            )
+        assert torch.isfinite(specialized_fused).all()
+        torch.testing.assert_close(
+            specialized_fused, runtime_fused, atol=0, rtol=0
+        )
