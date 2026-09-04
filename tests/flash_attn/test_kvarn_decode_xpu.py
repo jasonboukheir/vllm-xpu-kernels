@@ -42,6 +42,7 @@ R2_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
 Q6_PAGE_PAIR = 9
 Q6_MAIN_GRF128 = 10
 Q6_SPLIT_REDUCER_SPECIALIZED = 11
+Q6_NEXT_PAGE_PREFETCH = 12
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -52,6 +53,7 @@ Q6_FACTORY_VARIANTS = (
     Q6_PAGE_PAIR,
     Q6_MAIN_GRF128,
     Q6_SPLIT_REDUCER_SPECIALIZED,
+    Q6_NEXT_PAGE_PREFETCH,
 )
 
 
@@ -442,7 +444,7 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
             "dpas_layout=True"
         ),
     ):
@@ -673,7 +675,7 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
             "dpas_layout=True"
         ),
     ):
@@ -735,7 +737,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [5, -1, 12])
+@pytest.mark.parametrize("kernel_variant", [5, -1, 13])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -773,6 +775,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         Q6_PAGE_PAIR,
         Q6_MAIN_GRF128,
         Q6_SPLIT_REDUCER_SPECIALIZED,
+        Q6_NEXT_PAGE_PREFETCH,
     ],
 )
 def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
@@ -797,7 +800,7 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, and 12 require "
             "dpas_layout=True"
         ),
     ):

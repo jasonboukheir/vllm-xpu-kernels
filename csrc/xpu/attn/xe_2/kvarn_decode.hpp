@@ -490,7 +490,8 @@ template <
     bool ExactLiveRows = false,
     bool PagePair = false,
     int MainKernelGrfSize = 256,
-    bool SpecializedSplitReducer = false>
+    bool SpecializedSplitReducer = false,
+    bool NextPagePrefetch = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -517,6 +518,11 @@ struct KVarNDecodeD256G128ConfigImpl {
       "specialized split reduction is an exact-Q6 DPAS experiment");
 
   static constexpr bool UsesSpecializedSplitReducer = SpecializedSplitReducer;
+  static_assert(
+      !NextPagePrefetch ||
+          (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
+      "next-page prefetch is an exact-Q6 DPAS experiment");
+  static_assert(!NextPagePrefetch || !PagePair);
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -580,7 +586,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       VectorPackedLoads,
       QKInt8U4,
       ExactLiveRows,
-      PagePair>;
+      PagePair,
+      NextPagePrefetch>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -988,6 +995,18 @@ using KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig =
         false,
         256,
         true>;
+using KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        false,
+        true>;
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -1077,6 +1096,40 @@ static_assert(
     KVarNReduceSplitOutputHadamardSpecializedKernel<32, 64>::
         SharedStorageSize ==
     KVarNReduceSplitOutputHadamardKernel<64>::SharedStorageSize);
+static_assert(!KVarNDecodeD256G128DpasQ6Config::Mainloop::NextPagePrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::
+                  NextPagePrefetch);
+static_assert(
+    !KVarNDecodeD256G128DpasQ6PagePairConfig::Mainloop::NextPagePrefetch);
+static_assert(
+    !KVarNDecodeD256G128DpasQ6MainGrf128Config::Mainloop::NextPagePrefetch);
+static_assert(!KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::
+                  Mainloop::NextPagePrefetch);
+static_assert(
+    !KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::PagePair);
+static_assert(
+    KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::MainGrfSize == 256);
+static_assert(!KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::
+                  UsesSpecializedSplitReducer);
+static_assert(
+    KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::KVWorkUnitTokens == 64);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::TiledMMAQK,
+              KVarNDecodeD256G128DpasQ6Config::TiledMMAQK>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::TiledMMAPV,
+              KVarNDecodeD256G128DpasQ6Config::TiledMMAPV>);
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::Params) ==
+    sizeof(KVarNDecodeD256G128DpasQ6Config::Mainloop::Params));
+static_assert(
+    sizeof(
+        KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::Arguments) ==
+    sizeof(KVarNDecodeD256G128DpasQ6Config::Mainloop::Arguments));
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop::
+               SharedStorage) ==
+    sizeof(KVarNDecodeD256G128DpasQ6Config::Mainloop::SharedStorage));
 static_assert(
     cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
     6);
