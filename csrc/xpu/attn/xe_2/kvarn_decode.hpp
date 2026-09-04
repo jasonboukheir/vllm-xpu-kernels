@@ -492,7 +492,8 @@ template <
     int MainKernelGrfSize = 256,
     bool SpecializedSplitReducer = false,
     bool NextPagePrefetch = false,
-    bool SimdPackedUnpack = false>
+    bool SimdPackedUnpack = false,
+    bool Block2DOutputStore = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -529,6 +530,10 @@ struct KVarNDecodeD256G128ConfigImpl {
           (DpasPacked && VectorPackedLoads &&
            cute::is_same_v<QPacked, cute::Int<6>> && !QKInt8U4),
       "SIMD packed unpack is an exact-Q6 DPAS vector-load experiment");
+  static_assert(
+      !Block2DOutputStore ||
+          (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
+      "block-2D output stores are an exact-Q6 DPAS experiment");
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -603,7 +608,11 @@ struct KVarNDecodeD256G128ConfigImpl {
       void,
       false,
       cute::is_same_v<QPacked, cute::Int<6>>,
-      CacheScalarWeights>;
+      CacheScalarWeights,
+      cute::conditional_t<
+          Block2DOutputStore,
+          cutlass::fmha::collective::Q6Block2DOutputStorePolicy,
+          cutlass::fmha::collective::Q6CoordinateOutputStorePolicy>>;
   using ProblemShape = cutlass::fmha::kernel::DecodeProblemShape<false>;
   using Kernel = cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
       ProblemShape,
@@ -1038,6 +1047,40 @@ using KVarNDecodeD256G128DpasQ6SimdUnpackConfig = KVarNDecodeD256G128ConfigImpl<
     false,
     false,
     true>;
+using KVarNDecodeD256G128DpasQ6BlockOutputStoreConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        false,
+        false,
+        false,
+        true>;
+
+// The block-store payload assembly relies on the established interleaved Q6
+// fragment order.  Prove that contract against CuTe at compile time so a
+// future MMA-layout change fails compilation instead of silently permuting O.
+constexpr bool q6_block_output_store_fragment_layout_is_compatible() {
+  using Fragment =
+      KVarNDecodeD256G128DpasQ6BlockOutputStoreConfig::Epilogue::ReduceFragA;
+  constexpr int kSubgroupSize = cute::intel::sg_size;
+  for (int lane = 0; lane < kSubgroupSize; ++lane) {
+    for (int value = 0; value < Fragment{}.size(); ++value) {
+      auto coord = Fragment{}.tv_layout()(lane, value);
+      if (int(cute::get<0>(coord)) != value / 8 ||
+          int(cute::get<1>(coord)) != lane + 16 * (value % 8)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+static_assert(q6_block_output_store_fragment_layout_is_compatible());
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -1092,6 +1135,9 @@ static_assert(cute::is_same_v<
               cute::XE_DPAS_TT<2, float, cutlass::half_t>>);
 static_assert(!KVarNDecodeD256G128DpasConfig::Epilogue::ScalarOutput);
 static_assert(KVarNDecodeD256G128DpasQ6Config::Epilogue::ScalarOutput);
+static_assert(!KVarNDecodeD256G128DpasQ6Config::Epilogue::Block2DOutputStore);
+static_assert(KVarNDecodeD256G128DpasQ6BlockOutputStoreConfig::Epilogue::
+                  Block2DOutputStore);
 static_assert(!KVarNDecodeD256G128DpasQ6Config::Epilogue::CacheScalarWeights);
 static_assert(
     KVarNDecodeD256G128DpasQ6CachedWeightsConfig::Epilogue::CacheScalarWeights);

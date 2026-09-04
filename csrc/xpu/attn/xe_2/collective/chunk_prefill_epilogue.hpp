@@ -48,6 +48,12 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+// Compile-time output-store policies for the exceptional Q6 output shape.
+// The default retains the established coordinate scatter exactly.  The block
+// policy is selected only by an explicitly instantiated kernel variant.
+struct Q6CoordinateOutputStorePolicy {};
+struct Q6Block2DOutputStorePolicy {};
+
 template <
     bool Sink_,
     class CollectiveMainloop,  // Attention mainloop
@@ -351,7 +357,8 @@ template <
     class TiledCopyO_ = void,    // Optional TiledCopy for loading O
     bool Sink_ = false,          // Whether to sink softmax into epilogue
     bool ScalarOutput_ = false,  // Whether to use coordinate scalar stores
-    bool CacheScalarWeights_ = false>  // Reuse Q6 cross-SG softmax weights
+    bool CacheScalarWeights_ = false,  // Reuse Q6 cross-SG softmax weights
+    class OutputStorePolicy_ = Q6CoordinateOutputStorePolicy>
 class DecodeFwdEpilogue {
  public:
   //
@@ -418,7 +425,11 @@ class DecodeFwdEpilogue {
   // narrow coordinate scatter only for that Q6 tile.
   static constexpr bool ScalarOutput = ScalarOutput_;
   static constexpr bool CacheScalarWeights = CacheScalarWeights_;
+  using OutputStorePolicy = OutputStorePolicy_;
+  static constexpr bool Block2DOutputStore =
+      cute::is_same_v<OutputStorePolicy, Q6Block2DOutputStorePolicy>;
   static_assert(!CacheScalarWeights || ScalarOutput);
+  static_assert(!Block2DOutputStore || ScalarOutput);
   struct ScalarCopyO {};
 
   static auto default_tiled_copy_O_helper() {
@@ -475,6 +486,82 @@ class DecodeFwdEpilogue {
       if (q < size<0>(O.shape()) && v < size<1>(O.shape())) {
         O(q, v) = static_cast<ElementO>(rA(i));
       }
+    }
+  }
+
+  // Q6's reduced subgroup fragment is exactly 3x128.  Its interleaved CuTe
+  // layout gives lane L values (q, L + 16*i), with eight values per row.  A
+  // Xe block-2D 2x32 store consumes four fp16 values per lane in precisely
+  // row0[0,16], row1[0,16] order; the 1x32 tail consumes two.  Four pairs of
+  // these messages cover the full 3x128 subtile without changing its layout.
+  // This replaces 384 coordinate scalar stores with eight 2D messages while
+  // retaining the original coordinate path as the reference policy.
+  template <typename OutputFragment, typename QVCoord>
+  CUTLASS_DEVICE static void store_q6_block2d_output(
+      TensorO2D const& O,
+      OutputFragment const& rA,
+      QVCoord blk_qv,
+      int thr_id) {
+    static_assert(size<0>(SGTileShapeO{}) == 3);
+    static_assert(size<1>(SGTileShapeO{}) == 128);
+    static_assert(ReduceK{} == 4);
+    static_assert(OutputFragment{}.size() == 24);
+    static_assert(sizeof_bits_v<ElementO> == 16);
+
+    auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk())
+                       .get_flat_coord(assert_uniform(thr_id));
+    auto reduction_subtile = get<2>(thr_vak);
+    auto subtile_coord = idx2crd(reduction_subtile, shape(ReduceSGLayout{}));
+    int const q_subtile = int(get<0>(subtile_coord));
+    int const v_subtile = int(get<1>(subtile_coord));
+    int const lane =
+        sycl::ext::oneapi::this_work_item::get_sub_group().get_local_id()[0];
+
+    Tensor cO = make_identity_tensor(O.shape());
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);
+    auto sgO = domain_offset(
+        make_coord(
+            q_subtile * size<0>(SGTileShapeO{}),
+            v_subtile * size<1>(SGTileShapeO{})),
+        gO);
+
+    using Store2Rows = XE_STORE_2D<16, 2, 32>;
+    using Store1Row = XE_STORE_2D<16, 1, 32>;
+    auto copy_2rows = make_block_2d_copy(Store2Rows{}, O);
+    auto copy_1row = make_block_2d_copy(Store1Row{}, O);
+    auto thr_copy_2rows = copy_2rows.get_slice(lane);
+    auto thr_copy_1row = copy_1row.get_slice(lane);
+    auto sgO_last_row = domain_offset(make_coord(2, 0), sgO);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int v_tile = 0; v_tile < 4; ++v_tile) {
+      auto gO_2rows =
+          local_tile(sgO, Shape<_2, Int<32>>{}, make_coord(0, v_tile));
+      auto tOgO_2rows = thr_copy_2rows.partition_D(gO_2rows);
+      // A store atom consumes the coordinate iterator's first element as its
+      // block origin. Preserve that iterator while presenting the rank-1
+      // per-lane payload shape required by Copy_Atom.
+      auto tOgO_2rows_linear = make_tensor(
+          tOgO_2rows.data(),
+          make_layout(make_shape(size(tOgO_2rows)), Stride<E<0>>{}));
+      auto rO_2rows = make_tensor<ElementO>(Shape<_4>{});
+      int const row_value = v_tile * 2;
+      rO_2rows(0) = static_cast<ElementO>(rA(row_value));
+      rO_2rows(1) = static_cast<ElementO>(rA(row_value + 1));
+      rO_2rows(2) = static_cast<ElementO>(rA(8 + row_value));
+      rO_2rows(3) = static_cast<ElementO>(rA(8 + row_value + 1));
+      copy(copy_2rows, rO_2rows, tOgO_2rows_linear);
+
+      auto gO_last_row = local_tile(
+          sgO_last_row, Shape<_1, Int<32>>{}, make_coord(0, v_tile));
+      auto tOgO_last_row = thr_copy_1row.partition_D(gO_last_row);
+      auto tOgO_last_row_linear = make_tensor(
+          tOgO_last_row.data(),
+          make_layout(make_shape(size(tOgO_last_row)), Stride<E<0>>{}));
+      auto rO_last_row = make_tensor<ElementO>(Shape<_2>{});
+      rO_last_row(0) = static_cast<ElementO>(rA(16 + row_value));
+      rO_last_row(1) = static_cast<ElementO>(rA(16 + row_value + 1));
+      copy(copy_1row, rO_last_row, tOgO_last_row_linear);
     }
   }
 
@@ -690,7 +777,9 @@ class DecodeFwdEpilogue {
       rA(i) *= broadcast<0>(rA_sum, rA, i);
     }
 
-    if constexpr (ScalarOutput) {
+    if constexpr (Block2DOutputStore) {
+      store_q6_block2d_output(O, rA, blk_qv, thr_id);
+    } else if constexpr (ScalarOutput) {
       store_scalar_output(O, rA, blk_qv, thr_id);
     } else {
       Tensor cO = make_identity_tensor(O.shape());       // (q,v)
