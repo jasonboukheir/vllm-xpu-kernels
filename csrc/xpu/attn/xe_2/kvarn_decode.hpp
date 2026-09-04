@@ -559,7 +559,7 @@ struct KVarNDecodeD256G128ConfigImpl {
           (DpasPacked && VectorPackedLoads &&
            cute::is_same_v<QPacked, cute::Int<6>> && SpecializedSplitReducer &&
            NextPagePrefetch && CurrentHalfVPrefetch && ReusePageRecordCursor &&
-           !SimdPackedUnpack && !PagePair),
+           !ReusePageMetadataCursor && !SimdPackedUnpack && !PagePair),
       "paired-nibble half2 expansion is isolated to the complete ID18 "
       "producer with aligned vector cache loads");
 
@@ -1408,6 +1408,8 @@ static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
                   CurrentHalfVPrefetch);
 static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
                   ReusePageRecordCursor);
+static_assert(!KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
+                  ReusePageMetadataCursor);
 static_assert(!KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::Mainloop::
                   SimdPackedUnpack);
 static_assert(KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::

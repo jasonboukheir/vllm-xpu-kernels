@@ -660,6 +660,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static_assert(
       !PairedNibbleHalf2 ||
       (DpasPacked_ && VectorPackedLoads_ && !SimdPackedUnpack_ && !PagePair));
+  static_assert(!PairedNibbleHalf2 || !ReusePageMetadataCursor_);
   static_assert(
       !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
   // Each split stores a bounded normalized partial. KVarN reducers combine
