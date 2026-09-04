@@ -221,13 +221,16 @@ struct KVarNK4V4FragmentLoader {
    * Column scales are page-wide; packed V, row scales, and zero points are
    * half-local contiguous ranges in the immutable xe2_dpas cache ABI.
    */
+  template <bool IncludeColumnScale = true>
   CUTLASS_DEVICE void
   prefetch_dpas_v_half_l1(std::uint8_t const* rec, int half, int thread) const {
     static_assert(DpasPacked);
     prefetch_lane_partition_l1<kPackedHalfBytes>(
         rec + layout.v_packed_offset + half * kPackedHalfBytes, thread);
-    prefetch_lane_partition_l1<kColumnBytes>(
-        rec + layout.v_s_col_offset, thread);
+    if constexpr (IncludeColumnScale) {
+      prefetch_lane_partition_l1<kColumnBytes>(
+          rec + layout.v_s_col_offset, thread);
+    }
     prefetch_lane_partition_l1<kHalfRowBytes>(
         rec + layout.v_s_row_offset + half * kHalfRowBytes, thread);
     prefetch_lane_partition_l1<kHalfRowBytes>(
@@ -486,7 +489,8 @@ template <
     bool NextPagePrefetch_ = false,
     bool SimdPackedUnpack_ = false,
     bool CurrentHalfVPrefetch_ = false,
-    bool ReusePageRecordCursor_ = false>
+    bool ReusePageRecordCursor_ = false,
+    bool ReusePageMetadataCursor_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -548,6 +552,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool SimdPackedUnpack = SimdPackedUnpack_;
   static constexpr bool CurrentHalfVPrefetch = CurrentHalfVPrefetch_;
   static constexpr bool ReusePageRecordCursor = ReusePageRecordCursor_;
+  static constexpr bool ReusePageMetadataCursor = ReusePageMetadataCursor_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
   static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
   static_assert(QueryRows <= 8);
@@ -557,6 +562,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static_assert(!CurrentHalfVPrefetch || !PagePair);
   static_assert(!ReusePageRecordCursor || DpasPacked_);
   static_assert(!ReusePageRecordCursor || !PagePair);
+  static_assert(!ReusePageMetadataCursor || DpasPacked_);
+  static_assert(!ReusePageMetadataCursor || ReusePageRecordCursor_);
+  static_assert(!ReusePageMetadataCursor || !PagePair);
   static_assert(
       !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
   // Each split stores a bounded normalized partial. KVarN reducers combine
@@ -1030,6 +1038,19 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       return;
     }
 
+    // ID20 keeps only page-wide metadata live across the sequential K64 loop.
+    // Unlike PagePair it never retains a second score fragment: half zero is
+    // fully consumed before half one starts. These fragments are dead and
+    // eliminated for every specialization whose metadata cursor is disabled.
+    using KDimMetadataFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
+    static_assert(KDimMetadataFragment{}.size() == 4);
+    KDimMetadataFragment page_k_dim_scale[4];
+    float page_k_zp_bias[BiasRows] = {};
+    SingleFragA metadata_fragment_shape;
+    using VDimMetadataFragment =
+        decltype(reduce<0>(metadata_fragment_shape, sycl::plus<void>{}));
+    VDimMetadataFragment page_v_dim_scale[VTiles];
+
     int record_cursor_slot = 0;
     std::uint8_t const* record_cursor = nullptr;
     for (int k_tile = blk_k0; k_tile < blk_k1; ++k_tile) {
@@ -1073,6 +1094,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                         std::int64_t(kv_head) * params.kvarn.head_stride
                   : nullptr;
       }
+      bool const refresh_page_metadata = (k_tile & 1) == 0 || k_tile == blk_k0;
       if constexpr (NextPagePrefetch) {
         using Loader = KVarNK4V4FragmentLoader<
             DpasPacked_,
@@ -1201,32 +1223,60 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         for (int d_tile = 0; d_tile < 256; d_tile += 64) {
           copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
           reorder(tQrQ, tSrQ);
-          using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
-          static_assert(KDimFragment{}.size() == 4);
-          KDimFragment k_dim_scale;
+          KDimMetadataFragment k_dim_scale;
           if (slot < 0) {
             int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
                                  .get_local_id()[0];
-            KDimFragment k_dim_zp;
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < k_dim_scale.size(); ++i) {
-              int const dim = d_tile + lane + i * intel::sg_size;
-              k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_s_col_offset + 2 * dim);
-              k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_zp_offset + 2 * dim);
+            KDimMetadataFragment k_dim_zp;
+            if constexpr (ReusePageMetadataCursor) {
+              if (refresh_page_metadata) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < k_dim_scale.size(); ++i) {
+                  int const dim = d_tile + lane + i * intel::sg_size;
+                  page_k_dim_scale[d_tile / 64](i) =
+                      KVarNK4V4FragmentLoader<>::load_f16(
+                          rec + params.kvarn.k_s_col_offset + 2 * dim);
+                  k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                      rec + params.kvarn.k_zp_offset + 2 * dim);
+                }
+              }
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < k_dim_scale.size(); ++i) {
+                int const dim = d_tile + lane + i * intel::sg_size;
+                k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                    rec + params.kvarn.k_s_col_offset + 2 * dim);
+                k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                    rec + params.kvarn.k_zp_offset + 2 * dim);
+              }
             }
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < tSrQ.size(); ++i) {
               auto coord = tSrQ.tv_layout()(lane, i);
               int const query_row = int(get<0>(coord));
               float const query_value = static_cast<float>(tSrQ(i));
-              float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
-              k_zp_bias[query_row] += query_value * dim_zp;
+              if constexpr (ReusePageMetadataCursor) {
+                // The zero point is page-wide, so derive and reduce its query
+                // bias only on the first owned half. Half one consumes the
+                // cached subgroup result below without reloading K zero point.
+                if (refresh_page_metadata) {
+                  float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
+                  k_zp_bias[query_row] += query_value * dim_zp;
+                }
+              } else {
+                float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
+                k_zp_bias[query_row] += query_value * dim_zp;
+              }
               // The column scale is constant across all 128 tokens in this
               // KVarN page. Apply it to the much smaller Q fragment instead of
               // scaling every unpacked K element.
-              float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
+              float dim_scale;
+              if constexpr (ReusePageMetadataCursor) {
+                dim_scale =
+                    broadcast<1>(page_k_dim_scale[d_tile / 64], tSrQ, i);
+              } else {
+                dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
+              }
               tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
                   query_value * dim_scale);
             }
@@ -1239,10 +1289,23 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
 
       if (slot < 0) {
         auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-        CUTLASS_PRAGMA_UNROLL
-        for (int query_row = 0; query_row < BiasRows; ++query_row) {
-          k_zp_bias[query_row] = sycl::reduce_over_group(
-              subgroup, k_zp_bias[query_row], sycl::plus<float>());
+        if constexpr (ReusePageMetadataCursor) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int query_row = 0; query_row < BiasRows; ++query_row) {
+            if (refresh_page_metadata) {
+              k_zp_bias[query_row] = sycl::reduce_over_group(
+                  subgroup, k_zp_bias[query_row], sycl::plus<float>());
+              page_k_zp_bias[query_row] = k_zp_bias[query_row];
+            } else {
+              k_zp_bias[query_row] = page_k_zp_bias[query_row];
+            }
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int query_row = 0; query_row < BiasRows; ++query_row) {
+            k_zp_bias[query_row] = sycl::reduce_over_group(
+                subgroup, k_zp_bias[query_row], sycl::plus<float>());
+          }
         }
         int const lane = subgroup.get_local_id()[0];
         CUTLASS_PRAGMA_UNROLL
@@ -1285,7 +1348,19 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
 
       if constexpr (CurrentHalfVPrefetch) {
         if (slot < 0) {
-          loader.prefetch_dpas_v_half_l1(rec, k_tile & 1, thr_id);
+          if constexpr (ReusePageMetadataCursor) {
+            if (refresh_page_metadata) {
+              loader.template prefetch_dpas_v_half_l1<true>(
+                  rec, k_tile & 1, thr_id);
+            } else {
+              // V column scale remains live from the first half. Only packed
+              // V and half-local row scale/zero point need another L1 hint.
+              loader.template prefetch_dpas_v_half_l1<false>(
+                  rec, k_tile & 1, thr_id);
+            }
+          } else {
+            loader.prefetch_dpas_v_half_l1(rec, k_tile & 1, thr_id);
+          }
         }
       }
 
@@ -1346,13 +1421,29 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
           using VDimFragment =
               decltype(reduce<0>(fragment_shape, sycl::plus<void>{}));
           VDimFragment v_dim_scale;
-          if (enter_v_scale_frame || leave_v_scale_frame) {
+          if constexpr (ReusePageMetadataCursor) {
+            if (enter_v_scale_frame) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < v_dim_scale.size(); ++i) {
+                int const dim =
+                    vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
+                page_v_dim_scale[vv](i) = KVarNK4V4FragmentLoader<>::load_f16(
+                    rec + params.kvarn.v_s_col_offset + 2 * dim);
+              }
+            }
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < v_dim_scale.size(); ++i) {
-              int const dim =
-                  vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
-              v_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.v_s_col_offset + 2 * dim);
+              v_dim_scale(i) = page_v_dim_scale[vv](i);
+            }
+          } else {
+            if (enter_v_scale_frame || leave_v_scale_frame) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < v_dim_scale.size(); ++i) {
+                int const dim =
+                    vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
+                v_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                    rec + params.kvarn.v_s_col_offset + 2 * dim);
+              }
             }
           }
           // Accumulate directly into the online-softmax output fragment. Put
