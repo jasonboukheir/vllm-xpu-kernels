@@ -47,7 +47,6 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ6CurrentHalfVPrefetch = 16,
   kQ6PageRecordCursor = 17,
   kQ6PrefetchRecordCursor = 18,
-  kQ6B1ShortLastProducer = 19,
 };
 
 static_assert(static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair) == 9);
@@ -73,9 +72,6 @@ static_assert(
 static_assert(
     static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PrefetchRecordCursor) ==
     18);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6B1ShortLastProducer) ==
-    19);
 
 using KVarNDpasPrefetchLoader =
     cutlass::fmha::collective::KVarNK4V4FragmentLoader<true>;
@@ -194,8 +190,7 @@ void kvarn_decode_with_scratch_xe2(
     bool write_bf16_output,
     int64_t requested_num_kv_splits,
     int64_t kernel_variant,
-    bool dpas_layout,
-    bool last_producer_state_initialized) {
+    bool dpas_layout) {
   check_xpu(query, "query");
   check_xpu(packed_cache, "packed_cache");
   check_xpu(block_table, "block_table");
@@ -343,11 +338,8 @@ void kvarn_decode_with_scratch_xe2(
               KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch) ||
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6PrefetchRecordCursor) ||
       kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6B1ShortLastProducer);
+                            KVarNNativeKernelVariant::kQ6PrefetchRecordCursor);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
@@ -401,13 +393,7 @@ void kvarn_decode_with_scratch_xe2(
       static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor);
   bool const use_q6_prefetch_record_cursor =
       kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6PrefetchRecordCursor) ||
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6B1ShortLastProducer);
-  bool const request_q6_b1_short_last_producer =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6B1ShortLastProducer);
+      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PrefetchRecordCursor);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -421,12 +407,11 @@ void kvarn_decode_with_scratch_xe2(
       "(q6_split_reducer_specialized), 12 (q6_next_page_prefetch), 13 "
       "(q6_next_page_prefetch_split_reducer), 14 (q6_simd_unpack), and 15 "
       "(q6_block_output_store), 16 (q6_current_half_v_prefetch), and 17 "
-      "(q6_page_record_cursor), 18 (q6_prefetch_record_cursor), and 19 "
-      "(q6_b1_short_last_producer)");
+      "(q6_page_record_cursor), and 18 (q6_prefetch_record_cursor)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
       "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, and "
-      "16, 17, 18, and 19 "
+      "16, 17, and 18 "
       "require "
       "dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
@@ -446,13 +431,6 @@ void kvarn_decode_with_scratch_xe2(
       kVZpOffset};
   int const num_kv_splits = validated_split_count(
       max_seq_len, requested_num_kv_splits, use_q6_page_pair);
-  // ID19 deliberately fails closed to the byte-identical ID18 producer and
-  // reducer unless every bounded protocol precondition is CPU-known. In
-  // particular, arbitrary caller-owned device memory cannot be inspected or
-  // repaired here without synchronizing decode.
-  bool const use_q6_b1_short_last_producer =
-      request_q6_b1_short_last_producer && batch == 1 && max_seq_len <= 4096 &&
-      num_kv_splits > 1 && unrotate_output && last_producer_state_initialized;
   TORCH_CHECK(
       !unrotate_output || num_kv_splits > 1,
       "unrotate_output requires a multi-split KVarN decode");
@@ -490,16 +468,6 @@ void kvarn_decode_with_scratch_xe2(
           !exp_sums.is_alias_of(max_logits) && !exp_sums.is_alias_of(output) &&
           !max_logits.is_alias_of(output),
       "native KVarN scratch tensors must not alias each other or output");
-  if (use_q6_b1_short_last_producer) {
-    auto const completion_address =
-        reinterpret_cast<std::uintptr_t>(max_logits.data_ptr<float>());
-    TORCH_CHECK(
-        completion_address % alignof(std::uint64_t) == 0 &&
-            max_logits.numel() * max_logits.element_size() >=
-                kKVHeads * int64_t(sizeof(std::uint64_t)),
-        "ID19 completion state requires four aligned uint64 words in the "
-        "zero-initialized max_logits prefix");
-  }
   kvarn_decode_args_t args{
       query.const_data_ptr(),
       static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
@@ -507,9 +475,6 @@ void kvarn_decode_with_scratch_xe2(
       temp_output.data_ptr(),
       nullptr,
       nullptr,
-      use_q6_b1_short_last_producer
-          ? reinterpret_cast<std::uint64_t*>(max_logits.data_ptr<float>())
-          : nullptr,
       block_table.const_data_ptr<int>(),
       seq_lens.const_data_ptr<int>(),
       block_to_slot.const_data_ptr<int>(),
@@ -524,17 +489,14 @@ void kvarn_decode_with_scratch_xe2(
       write_bf16_output,
       layout};
 
-  // Keep the public two-statistics-scratch ABI during the upstream LSE
-  // migration. The first tensor stores natural-log LSE. ID19 alone reserves
-  // the aligned first four uint64 words of max_logits for completion epochs;
-  // every established variant leaves that tensor untouched.
+  // Keep the public two-scratch ABI during the upstream LSE migration.  The
+  // first tensor now stores one natural-log LSE per split; the second remains
+  // validated and stream-tracked for extension compatibility but is unused.
   args.softmax_lse_accum = exp_sums.data_ptr<float>();
   args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   auto status =
       use_qk_i8u4 ? KVarNDecodeD256G128DpasQKInt8U4Config::run(queue, args)
-      : use_q6_b1_short_last_producer
-          ? KVarNDecodeD256G128DpasQ6B1ShortLastProducerConfig::run(queue, args)
       : use_q6_prefetch_record_cursor
           ? KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(
                 queue, args)
@@ -604,14 +566,8 @@ void kvarn_decode_xe2(
   auto scratch_options = query.options().dtype(at::kFloat);
   auto exp_sums =
       at::empty({batch, kQueryHeads, num_kv_splits}, scratch_options);
-  bool const initialize_last_producer =
-      kernel_variant == static_cast<int64_t>(
-                            KVarNNativeKernelVariant::kQ6B1ShortLastProducer) &&
-      batch == 1 && max_seq_len <= 4096 && num_kv_splits > 1 && unrotate_output;
   auto max_logits =
-      initialize_last_producer
-          ? at::zeros({batch, kQueryHeads, num_kv_splits}, scratch_options)
-          : at::empty({batch, kQueryHeads, num_kv_splits}, scratch_options);
+      at::empty({batch, kQueryHeads, num_kv_splits}, scratch_options);
   kvarn_decode_with_scratch_xe2(
       query,
       packed_cache,
@@ -630,8 +586,7 @@ void kvarn_decode_xe2(
       write_bf16_output,
       num_kv_splits,
       kernel_variant,
-      dpas_layout,
-      initialize_last_producer);
+      dpas_layout);
 
   // Multi-split decode consumes these function-local tensors asynchronously
   // in both the main kernel and its reducer. Keep their allocations live on

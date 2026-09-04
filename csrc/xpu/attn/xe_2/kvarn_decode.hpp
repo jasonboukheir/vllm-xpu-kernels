@@ -3,8 +3,6 @@
 #include "collective/kvarn_decode_mainloop.hpp"
 #include "paged_decode.hpp"
 
-#include <cstdint>
-
 /** Host-facing arguments for the deliberately narrow native decode spike.
  *
  * The first integration should expose these fields through a caller-owned
@@ -17,15 +15,15 @@ struct kvarn_decode_args_t {
   void* output;              // [B,24,256] fp16, or bf16 when fused/unrotated
   void* temp_output;         // [B, 24 * splits, 256] fp16 partials
   float* softmax_lse_accum;  // [B, 24, splits] natural-log LSE scratch
-  float* legacy_max_logits;  // validated ABI scratch; ID19 reserves its prefix
-  std::uint64_t* completion_state;  // ID19: zero-initialized [4] epoch/count
-  int const* block_table;           // [B, max_pages_per_seq]
-  int const* seq_lens;              // [B], actual length for each batch row
-  int const* block_to_slot;         // [num_physical_blocks], -1 selects KVarN
-  void const* tail_key;             // [slots, 128, 4, 256] fp16, rotated
-  void const* tail_value;           // [slots, 128, 4, 256] fp16, rotated
-  int batch_size;                   // B1-B12 decode rows
-  int max_seq_len;                  // maximum length used by the scheduler
+  float*
+      legacy_max_logits;   // validated ABI scratch; unused after LSE migration
+  int const* block_table;  // [B, max_pages_per_seq]
+  int const* seq_lens;     // [B], actual length for each batch row
+  int const* block_to_slot;  // [num_physical_blocks], -1 selects KVarN
+  void const* tail_key;      // [slots, 128, 4, 256] fp16, rotated
+  void const* tail_value;    // [slots, 128, 4, 256] fp16, rotated
+  int batch_size;            // B1-B12 decode rows
+  int max_seq_len;           // maximum length used by the scheduler
   int max_pages_per_seq;
   int num_kv_splits;
   float softmax_scale;
@@ -475,191 +473,6 @@ struct KVarNReduceSplitOutputHadamardSpecializedKernel {
   }
 };
 
-/** B1 short-context split finalizer executed by the last producer workgroup.
- *
- * One 64-bit completion word is reserved per KV head. Its high 32 bits are an
- * epoch and its low 32 bits are the producer count. The state must be zeroed
- * once before first use and exclusively owned by one in-order stream. The
- * last producer advances the epoch and resets the count after publishing all
- * six transformed query-head rows, so steady-state decode needs no reset or
- * standalone reducer launch.
- *
- * Every producer reaches a workgroup-wide global-memory barrier before lane
- * zero's release RMW. The last RMW acquires the preceding release sequence,
- * making every partial and LSE visible before reduction. No producer spins;
- * non-last workgroups return immediately.
- */
-struct KVarNB1ShortLastProducerFinalizer {
-  using Element = cutlass::half_t;
-
-  static constexpr int kThreads = 64;
-  static constexpr int kMaxSplits = 32;
-  static constexpr int kQueryHeadsPerKV = 6;
-  static constexpr int kHeadDim = KVarNDecodeD256G128Policy::HeadDim;
-  static constexpr int kKVHeads = KVarNDecodeD256G128Policy::NumKVHeads;
-  static constexpr std::uint64_t kCountMask = 0xffffffffULL;
-
-  struct Arguments {
-    void* output;
-    Element const* partial_output;
-    float const* softmax_lse_accum;
-    std::uint64_t* completion_state;
-    int num_kv_splits;
-    bool write_bf16_output;
-  };
-  using Params = Arguments;
-
-  struct SharedStorage {
-    cutlass::Array<float, kMaxSplits> split_weights;
-    cutlass::Array<float, kHeadDim> output_row;
-    std::uint32_t is_last_producer;
-    std::uint32_t completed_epoch;
-  };
-
-  static Params to_underlying_arguments(Arguments const& args) { return args; }
-
-  static bool can_implement(Arguments const& args) {
-    return args.output != nullptr && args.partial_output != nullptr &&
-           args.softmax_lse_accum != nullptr &&
-           args.completion_state != nullptr && args.num_kv_splits > 1 &&
-           args.num_kv_splits <= kMaxSplits;
-  }
-
-  KVarNB1ShortLastProducerFinalizer(Params const& params, SharedStorage& shared)
-      : params_(params), shared_(shared) {}
-
-  CUTLASS_DEVICE
-  void operator()(int batch, int kv_head, int, int producer_count) const {
-    using namespace sycl::ext::oneapi::this_work_item;
-
-    int const thread = int(ThreadIdxX());
-    auto workgroup = get_work_group<3>();
-
-    // Publish all partial-output and LSE stores to lane zero before its
-    // release RMW publishes this workgroup to the eventual last producer.
-    sycl::group_barrier(workgroup);
-    if (thread == 0) {
-      sycl::atomic_fence(
-          sycl::memory_order::release, sycl::memory_scope::device);
-      using CompletionAtomic = sycl::atomic_ref<
-          std::uint64_t,
-          sycl::memory_order::relaxed,
-          sycl::memory_scope::device,
-          sycl::access::address_space::global_space>;
-      CompletionAtomic completion(
-          params_.completion_state[batch * kKVHeads + kv_head]);
-      std::uint64_t const prior =
-          completion.fetch_add(1, sycl::memory_order::acq_rel);
-      std::uint32_t const prior_count =
-          static_cast<std::uint32_t>(prior & kCountMask);
-      shared_.is_last_producer =
-          prior_count + 1 == static_cast<std::uint32_t>(producer_count);
-      shared_.completed_epoch = static_cast<std::uint32_t>(prior >> 32);
-    }
-    sycl::group_barrier(workgroup);
-    if (!shared_.is_last_producer) return;
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int query_in_group = 0; query_in_group < kQueryHeadsPerKV;
-         ++query_in_group) {
-      int const query_head = kv_head * kQueryHeadsPerKV + query_in_group;
-      int const stats_base =
-          (batch * KVarNDecodeD256G128Policy::NumQueryHeads + query_head) *
-          params_.num_kv_splits;
-      float const invalid_lse =
-          cutlass::platform::numeric_limits<float>::lowest();
-      float const local_lse =
-          thread < producer_count
-              ? params_.softmax_lse_accum[stats_base + thread]
-              : invalid_lse;
-      float const global_max_lse =
-          sycl::reduce_over_group(workgroup, local_lse, sycl::maximum<>());
-      constexpr float kLog2e = 1.4426950408889634f;
-      if (thread < producer_count) {
-        shared_.split_weights[thread] =
-            local_lse > invalid_lse
-                ? sycl::native::exp2((local_lse - global_max_lse) * kLog2e)
-                : 0.0f;
-      }
-      sycl::group_barrier(workgroup);
-
-      for (int dim = thread; dim < kHeadDim; dim += kThreads) {
-        float numerator = 0.0f;
-        float denominator = 0.0f;
-        for (int split = 0; split < producer_count; ++split) {
-          float const weight = shared_.split_weights[split];
-          if (weight <= 0.0f) continue;
-          int const partial_offset =
-              ((batch * params_.num_kv_splits + split) *
-                   KVarNDecodeD256G128Policy::NumQueryHeads +
-               query_head) *
-                  kHeadDim +
-              dim;
-          numerator +=
-              static_cast<float>(params_.partial_output[partial_offset]) *
-              weight;
-          denominator += weight;
-        }
-        Element const reduced = static_cast<Element>(numerator / denominator);
-        shared_.output_row[dim] = static_cast<float>(reduced);
-      }
-      sycl::group_barrier(workgroup);
-
-      CUTLASS_PRAGMA_UNROLL
-      for (int stage = 0; stage < 8; ++stage) {
-        int const span = 1 << stage;
-        for (int pair_index = thread; pair_index < kHeadDim / 2;
-             pair_index += kThreads) {
-          int const pair = pair_index / span;
-          int const offset = pair_index - pair * span;
-          int const low = pair * 2 * span + offset;
-          int const high = low + span;
-          float const a = shared_.output_row[low];
-          float const b = shared_.output_row[high];
-          shared_.output_row[low] = a + b;
-          shared_.output_row[high] = a - b;
-        }
-        sycl::group_barrier(workgroup);
-      }
-
-      for (int dim = thread; dim < kHeadDim; dim += kThreads) {
-        int const output_offset =
-            (batch * KVarNDecodeD256G128Policy::NumQueryHeads + query_head) *
-                kHeadDim +
-            dim;
-        Element const transformed =
-            static_cast<Element>(shared_.output_row[dim] * (1.0f / 16.0f));
-        if (params_.write_bf16_output) {
-          using BFloat16 = sycl::ext::oneapi::bfloat16;
-          reinterpret_cast<BFloat16*>(params_.output)[output_offset] =
-              static_cast<BFloat16>(static_cast<float>(transformed));
-        } else {
-          reinterpret_cast<Element*>(params_.output)[output_offset] =
-              transformed;
-        }
-      }
-      sycl::group_barrier(workgroup);
-    }
-
-    if (thread == 0) {
-      using CompletionAtomic = sycl::atomic_ref<
-          std::uint64_t,
-          sycl::memory_order::relaxed,
-          sycl::memory_scope::device,
-          sycl::access::address_space::global_space>;
-      CompletionAtomic completion(
-          params_.completion_state[batch * kKVHeads + kv_head]);
-      std::uint64_t const next_epoch =
-          std::uint64_t(shared_.completed_epoch + 1) << 32;
-      completion.store(next_epoch, sycl::memory_order::release);
-    }
-  }
-
- private:
-  Params const& params_;
-  SharedStorage& shared_;
-};
-
 /** Concrete, intentionally narrow native decode configuration.
  *
  * This is kept separate from PagedDecodeConfig because K and V are not
@@ -682,8 +495,7 @@ template <
     bool SimdPackedUnpack = false,
     bool Block2DOutputStore = false,
     bool CurrentHalfVPrefetch = false,
-    bool ReusePageRecordCursor = false,
-    bool LastProducerFinalizer = false>
+    bool ReusePageRecordCursor = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -734,13 +546,6 @@ struct KVarNDecodeD256G128ConfigImpl {
           (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
       "page-record cursor reuse is an exact-Q6 DPAS experiment");
   static_assert(!ReusePageRecordCursor || !PagePair);
-  static_assert(
-      !LastProducerFinalizer ||
-          (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>> &&
-           SpecializedSplitReducer && NextPagePrefetch &&
-           CurrentHalfVPrefetch && ReusePageRecordCursor),
-      "last-producer finalization is isolated to the complete ID18 producer");
-  static constexpr bool UsesLastProducerFinalizer = LastProducerFinalizer;
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -823,20 +628,11 @@ struct KVarNDecodeD256G128ConfigImpl {
           cutlass::fmha::collective::Q6Block2DOutputStorePolicy,
           cutlass::fmha::collective::Q6CoordinateOutputStorePolicy>>;
   using ProblemShape = cutlass::fmha::kernel::DecodeProblemShape<false>;
-  using Finalizer = cute::conditional_t<
-      LastProducerFinalizer,
-      KVarNB1ShortLastProducerFinalizer,
-      void>;
   using Kernel = cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
       ProblemShape,
       Mainloop,
       Epilogue,
-      cutlass::fmha::kernel::DecodeTileScheduler,
-      Finalizer>;
-  static_assert(
-      !LastProducerFinalizer || Kernel::SGPerWG::value * cute::intel::sg_size ==
-                                    KVarNB1ShortLastProducerFinalizer::kThreads,
-      "ID19 finalizer requires the exact 64-thread Q6 producer workgroup");
+      cutlass::fmha::kernel::DecodeTileScheduler>;
   using ReductionSplitKernel = cutlass::fmha::kernel::ReduceSplitK<
       ProblemShape,
       cutlass::fmha::kernel::XeReduceSplitKTileScheduler,
@@ -864,13 +660,6 @@ struct KVarNDecodeD256G128ConfigImpl {
         args.cache == nullptr || args.block_to_slot == nullptr ||
         args.tail_key == nullptr || args.tail_value == nullptr) {
       return cutlass::Status::kErrorInvalidProblem;
-    }
-    if constexpr (LastProducerFinalizer) {
-      if (args.batch_size != 1 || args.max_seq_len > 4096 ||
-          args.num_kv_splits <= 1 || !args.unrotate_output ||
-          args.completion_state == nullptr) {
-        return cutlass::Status::kErrorInvalidProblem;
-      }
     }
     if constexpr (VectorPackedLoads) {
       constexpr std::uintptr_t kKVectorAlignment = 32;
@@ -961,16 +750,6 @@ struct KVarNDecodeD256G128ConfigImpl {
         cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
             hw_info.device_id);
 
-    typename Kernel::FinalizerArguments finalizer_args{};
-    if constexpr (LastProducerFinalizer) {
-      finalizer_args = {
-          args.output,
-          reinterpret_cast<Element const*>(args.temp_output),
-          args.softmax_lse_accum,
-          args.completion_state,
-          args.num_kv_splits,
-          args.write_bf16_output};
-    }
     typename Kernel::Arguments kernel_args{
         {shape,
          q,
@@ -1003,8 +782,7 @@ struct KVarNDecodeD256G128ConfigImpl {
          args.seq_lens},
         {},
         hw_info,
-        args.num_kv_splits,
-        finalizer_args};
+        args.num_kv_splits};
 
     typename ReductionSplitKernel::Arguments reduce_args{
         {shape,
@@ -1114,10 +892,6 @@ struct KVarNDecodeD256G128ConfigImpl {
         main_kernel_props};
     compat::experimental::launch<cutlass::device_kernel<Kernel>>(
         policy, queue, params);
-
-    if constexpr (LastProducerFinalizer) {
-      return;
-    }
 
     if (unrotate_output) {
       if constexpr (SpecializedSplitReducer) {
@@ -1348,23 +1122,6 @@ using KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig =
         false,
         true,
         true>;
-using KVarNDecodeD256G128DpasQ6B1ShortLastProducerConfig =
-    KVarNDecodeD256G128ConfigImpl<
-        true,
-        cute::Int<6>,
-        false,
-        false,
-        false,
-        false,
-        false,
-        256,
-        true,
-        true,
-        false,
-        false,
-        true,
-        true,
-        true>;
 
 // The block-store payload assembly relies on the established interleaved Q6
 // fragment order.  Prove that contract against CuTe at compile time so a
@@ -1561,19 +1318,6 @@ static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
                   ReusePageRecordCursor);
 static_assert(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::
                   UsesSpecializedSplitReducer);
-static_assert(!KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::
-                  UsesLastProducerFinalizer);
-static_assert(KVarNDecodeD256G128DpasQ6B1ShortLastProducerConfig::
-                  UsesLastProducerFinalizer);
-static_assert(cute::is_same_v<
-              KVarNDecodeD256G128DpasQ6B1ShortLastProducerConfig::Mainloop,
-              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop>);
-static_assert(cute::is_same_v<
-              KVarNDecodeD256G128DpasQ6B1ShortLastProducerConfig::Epilogue,
-              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Epilogue>);
-static_assert(!cute::is_same_v<
-              KVarNDecodeD256G128DpasQ6B1ShortLastProducerConfig::Kernel,
-              KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Kernel>);
 static_assert(
     sizeof(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::
                Params) ==
