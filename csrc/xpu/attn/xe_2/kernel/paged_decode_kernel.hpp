@@ -57,13 +57,40 @@ struct DecodeProblemShape {
   int head_size_qk, head_size_vo;
 };
 
+template <class Finalizer>
+struct DecodeLastProducerTraits {
+  static constexpr bool Enabled = true;
+  using Arguments = typename Finalizer::Arguments;
+  using Params = typename Finalizer::Params;
+  using SharedStorage = typename Finalizer::SharedStorage;
+
+  static Params to_underlying_arguments(Arguments const& args) {
+    return Finalizer::to_underlying_arguments(args);
+  }
+  static bool can_implement(Arguments const& args) {
+    return Finalizer::can_implement(args);
+  }
+};
+
+template <>
+struct DecodeLastProducerTraits<void> {
+  static constexpr bool Enabled = false;
+  struct Arguments {};
+  struct Params {};
+  struct SharedStorage {};
+
+  static Params to_underlying_arguments(Arguments const&) { return {}; }
+  static bool can_implement(Arguments const&) { return true; }
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 
 template <
     class ProblemShape_,
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
-    class TileScheduler_>
+    class TileScheduler_,
+    class LastProducerFinalizer_ = void>
 class XeFMHAFwdSplitKVKernel {
  public:
   //
@@ -110,12 +137,20 @@ class XeFMHAFwdSplitKVKernel {
   using ElementLSE = typename CollectiveEpilogue::ElementLSE;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
+  using LastProducerFinalizer = LastProducerFinalizer_;
+  using LastProducerTraits = DecodeLastProducerTraits<LastProducerFinalizer>;
+  static constexpr bool HasLastProducerFinalizer = LastProducerTraits::Enabled;
+  using FinalizerArguments = typename LastProducerTraits::Arguments;
+  using FinalizerParams = typename LastProducerTraits::Params;
+  using FinalizerSharedStorage = typename LastProducerTraits::SharedStorage;
+
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
   union SharedStorage {
     MainloopSharedStorage mainloop;
     EpilogueSharedStorage epilogue;
+    FinalizerSharedStorage finalizer;
   };
 
   static constexpr int SharedStorageSize =
@@ -161,6 +196,7 @@ class XeFMHAFwdSplitKVKernel {
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     int num_kv_splits = -1;  // no split by default
+    FinalizerArguments finalizer{};
   };
 
   // Kernel entry point API
@@ -169,6 +205,7 @@ class XeFMHAFwdSplitKVKernel {
     MainloopParams mainloop;
     EpilogueParams epilogue;
     TileSchedulerParams scheduler;
+    FinalizerParams finalizer;
   };
 
   //
@@ -182,7 +219,8 @@ class XeFMHAFwdSplitKVKernel {
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
         TileScheduler::to_underlying_arguments(
-            args.kernel.shape, args.hw_info, TileShapeO{}, args.num_kv_splits)};
+            args.kernel.shape, args.hw_info, TileShapeO{}, args.num_kv_splits),
+        LastProducerTraits::to_underlying_arguments(args.finalizer)};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -196,7 +234,8 @@ class XeFMHAFwdSplitKVKernel {
     }
 
     return CollectiveMainloop::can_implement(args.mainloop) &&
-           CollectiveEpilogue::can_implement(args.epilogue);
+           CollectiveEpilogue::can_implement(args.epilogue) &&
+           LastProducerTraits::can_implement(args.finalizer);
   }
 
   static int get_workspace_size(Arguments const& args) { return 0; }
@@ -556,6 +595,13 @@ class XeFMHAFwdSplitKVKernel {
             num_kv_splits,
             ptrLSE,
             p.lse_stride);
+      }
+
+      if constexpr (HasLastProducerFinalizer) {
+        LastProducerFinalizer finalizer{
+            params.finalizer, shared_storage.finalizer};
+        finalizer(
+            idx_b, head, idx_kv_split, is_single_split ? 1 : seq_num_kv_splits);
       }
     }
   }

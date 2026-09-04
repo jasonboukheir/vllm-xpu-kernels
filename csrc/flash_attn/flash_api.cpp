@@ -454,7 +454,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(d!) output, "
       "int max_seq_len, float softmax_scale, bool unrotate_output=False, "
       "bool write_bf16_output=False, int num_kv_splits=0, "
-      "int kernel_variant=0, bool dpas_layout=False) "
+      "int kernel_variant=0, bool dpas_layout=False, "
+      "bool last_producer_state_initialized=False) "
       "-> ()");
   ops.impl(
       "kvarn_decode_with_scratch", torch::kXPU, &kvarn_decode_with_scratch_xe2);
