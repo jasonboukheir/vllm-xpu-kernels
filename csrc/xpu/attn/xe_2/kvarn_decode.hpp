@@ -1007,6 +1007,18 @@ using KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig =
         256,
         false,
         true>;
+using KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        true,
+        true>;
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -1111,6 +1123,19 @@ static_assert(
     KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::MainGrfSize == 256);
 static_assert(!KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::
                   UsesSpecializedSplitReducer);
+static_assert(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+                  Mainloop::NextPagePrefetch);
+static_assert(KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+                  UsesSpecializedSplitReducer);
+static_assert(
+    cute::is_same_v<
+        KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::Mainloop,
+        KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::Mainloop>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::
+                  ReductionSplitOutputHadamardSpecializedKernel<8>,
+              KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::
+                  ReductionSplitOutputHadamardSpecializedKernel<8>>);
 static_assert(
     KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::KVWorkUnitTokens == 64);
 static_assert(cute::is_same_v<
