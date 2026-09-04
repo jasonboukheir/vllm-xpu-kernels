@@ -369,13 +369,21 @@ template <
     bool DpasPacked = false,
     class QPacked = cute::_8,
     bool VectorPackedLoads = false,
-    bool QKInt8U4 = false>
+    bool QKInt8U4 = false,
+    bool CacheScalarWeights = false,
+    bool ExactLiveRows = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
   static_assert(
       !QKInt8U4 || cute::is_same_v<QPacked, cute::_8>,
       "integer QK remains isolated from the exact-Q6 experiment");
+  static_assert(
+      !CacheScalarWeights || cute::is_same_v<QPacked, cute::Int<6>>,
+      "cached scalar weights are an exact-Q6 experiment");
+  static_assert(
+      !ExactLiveRows || cute::is_same_v<QPacked, cute::Int<6>>,
+      "exact live-row loops are an exact-Q6 experiment");
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -437,7 +445,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       TensorV,
       DpasPacked,
       VectorPackedLoads,
-      QKInt8U4>;
+      QKInt8U4,
+      ExactLiveRows>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -445,7 +454,8 @@ struct KVarNDecodeD256G128ConfigImpl {
       TensorLSE,
       void,
       false,
-      cute::is_same_v<QPacked, cute::Int<6>>>;
+      cute::is_same_v<QPacked, cute::Int<6>>,
+      CacheScalarWeights>;
   using ProblemShape = cutlass::fmha::kernel::DecodeProblemShape<false>;
   using Kernel = cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
       ProblemShape,
@@ -731,6 +741,17 @@ using KVarNDecodeD256G128DpasQ6Config =
     KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>>;
 using KVarNDecodeD256G128DpasQ6VectorLoadConfig =
     KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>, true>;
+using KVarNDecodeD256G128DpasQ6CachedWeightsConfig =
+    KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>, false, false, true>;
+using KVarNDecodeD256G128DpasQ6ExactRowsConfig = KVarNDecodeD256G128ConfigImpl<
+    true,
+    cute::Int<6>,
+    false,
+    false,
+    false,
+    true>;
+using KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig =
+    KVarNDecodeD256G128ConfigImpl<true, cute::Int<6>, false, false, true, true>;
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -780,6 +801,16 @@ static_assert(cute::is_same_v<
               cute::XE_DPAS_TT<2, float, cutlass::half_t>>);
 static_assert(!KVarNDecodeD256G128DpasConfig::Epilogue::ScalarOutput);
 static_assert(KVarNDecodeD256G128DpasQ6Config::Epilogue::ScalarOutput);
+static_assert(!KVarNDecodeD256G128DpasQ6Config::Epilogue::CacheScalarWeights);
+static_assert(
+    KVarNDecodeD256G128DpasQ6CachedWeightsConfig::Epilogue::CacheScalarWeights);
+static_assert(!KVarNDecodeD256G128DpasQ6Config::Mainloop::ExactLiveRows);
+static_assert(
+    KVarNDecodeD256G128DpasQ6ExactRowsConfig::Mainloop::ExactLiveRows);
+static_assert(KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::Epilogue::
+                  CacheScalarWeights);
+static_assert(KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::Mainloop::
+                  ExactLiveRows);
 static_assert(
     cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
     6);

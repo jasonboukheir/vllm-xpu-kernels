@@ -350,7 +350,8 @@ template <
     class TensorLSE_ = void,     // Optional intermediate natural-LSE tensor
     class TiledCopyO_ = void,    // Optional TiledCopy for loading O
     bool Sink_ = false,          // Whether to sink softmax into epilogue
-    bool ScalarOutput_ = false>  // Whether to use coordinate scalar stores
+    bool ScalarOutput_ = false,  // Whether to use coordinate scalar stores
+    bool CacheScalarWeights_ = false>  // Reuse Q6 cross-SG softmax weights
 class DecodeFwdEpilogue {
  public:
   //
@@ -416,6 +417,8 @@ class DecodeFwdEpilogue {
   // existing block-store path identical for established policies and use a
   // narrow coordinate scatter only for that Q6 tile.
   static constexpr bool ScalarOutput = ScalarOutput_;
+  static constexpr bool CacheScalarWeights = CacheScalarWeights_;
+  static_assert(!CacheScalarWeights || ScalarOutput);
   struct ScalarCopyO {};
 
   static auto default_tiled_copy_O_helper() {
@@ -756,6 +759,7 @@ class DecodeFwdEpilogue {
 
       ReduceFragA rA;
       ReduceFragARow rA_sum, rA_max;
+      ReduceFragARow rA_kweight[kReduceK];
       auto output_subtile = idx2crd(source_k, shape(ReduceSGLayout{}));
       int const q_offset =
           int(get<0>(output_subtile)) * size<0>(SGTileShapeO{});
@@ -778,6 +782,9 @@ class DecodeFwdEpilogue {
           for (int kr = 0; kr < kReduceK; ++kr) {
             float const weight = sycl::native::exp2(
                 shared.a_max_data[kr * kAlignedQ + q] - global_max);
+            if constexpr (CacheScalarWeights) {
+              rA_kweight[kr](i) = weight;
+            }
             global_sum += shared.a_sum_data[kr * kAlignedQ + q] * weight;
           }
           rA_max(i) = global_max;
@@ -790,18 +797,30 @@ class DecodeFwdEpilogue {
         auto coord = rA.tv_layout()(lane, i);
         int const q = q_offset + int(get<0>(coord));
         int const v = v_offset + int(get<1>(coord));
-        float global_max = shared.a_max_data[q];
-        CUTLASS_PRAGMA_UNROLL
-        for (int kr = 1; kr < kReduceK; ++kr) {
-          global_max =
-              sycl::fmax(global_max, shared.a_max_data[kr * kAlignedQ + q]);
-        }
         float value = 0.0f;
-        CUTLASS_PRAGMA_UNROLL
-        for (int kr = 0; kr < kReduceK; ++kr) {
-          float const weight = sycl::native::exp2(
-              shared.a_max_data[kr * kAlignedQ + q] - global_max);
-          value += shared.a_data[(kr * kQ + q) * kV + v] * weight;
+        if constexpr (CacheScalarWeights) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int kr = 0; kr < kReduceK; ++kr) {
+            float const weight = broadcast<0>(rA_kweight[kr], rA, i);
+            value += shared.a_data[(kr * kQ + q) * kV + v] * weight;
+          }
+        } else {
+          // Preserve the round-one Q6 implementation as a separately
+          // selectable control.  This deliberately recomputes the weights
+          // for every output value; CacheScalarWeights isolates the effect of
+          // hoisting them to one computation per query row.
+          float global_max = shared.a_max_data[q];
+          CUTLASS_PRAGMA_UNROLL
+          for (int kr = 1; kr < kReduceK; ++kr) {
+            global_max =
+                sycl::fmax(global_max, shared.a_max_data[kr * kAlignedQ + q]);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int kr = 0; kr < kReduceK; ++kr) {
+            float const weight = sycl::native::exp2(
+                shared.a_max_data[kr * kAlignedQ + q] - global_max);
+            value += shared.a_data[(kr * kQ + q) * kV + v] * weight;
+          }
         }
         rA(i) = value;
       }
