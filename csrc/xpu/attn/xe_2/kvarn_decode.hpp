@@ -1186,6 +1186,22 @@ static_assert(
     !KVarNDecodeD256G128DpasQ6SimdUnpackConfig::UsesSpecializedSplitReducer);
 static_assert(
     KVarNDecodeD256G128DpasQ6SimdUnpackConfig::KVWorkUnitTokens == 64);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6SimdUnpackConfig::TiledMMAQK,
+              KVarNDecodeD256G128DpasQ6VectorLoadConfig::TiledMMAQK>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6SimdUnpackConfig::TiledMMAPV,
+              KVarNDecodeD256G128DpasQ6VectorLoadConfig::TiledMMAPV>);
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6SimdUnpackConfig::Mainloop::Params) ==
+    sizeof(KVarNDecodeD256G128DpasQ6VectorLoadConfig::Mainloop::Params));
+static_assert(
+    sizeof(KVarNDecodeD256G128DpasQ6SimdUnpackConfig::Mainloop::Arguments) ==
+    sizeof(KVarNDecodeD256G128DpasQ6VectorLoadConfig::Mainloop::Arguments));
+static_assert(
+    sizeof(
+        KVarNDecodeD256G128DpasQ6SimdUnpackConfig::Mainloop::SharedStorage) ==
+    sizeof(KVarNDecodeD256G128DpasQ6VectorLoadConfig::Mainloop::SharedStorage));
 static_assert(
     cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
     6);
