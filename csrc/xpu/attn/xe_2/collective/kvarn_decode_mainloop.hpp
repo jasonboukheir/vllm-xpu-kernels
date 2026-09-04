@@ -57,7 +57,7 @@ struct KVarNHybridTailLayout {
  * what makes the register assignment independent of undocumented fragment
  * linear order.
  */
-template <bool DpasPacked = false>
+template <bool DpasPacked = false, bool VectorPackedLoads = false>
 struct KVarNK4V4FragmentLoader {
   static constexpr int kHeadDim = 256;
   static constexpr int kGroup = 128;
@@ -65,6 +65,20 @@ struct KVarNK4V4FragmentLoader {
   static constexpr int kValuesPerWord = 8;
   static constexpr int kKRowBytes = kGroup / 2;
   static constexpr int kVRowBytes = kHeadDim / 2;
+  static constexpr int kKPackedLaneWords = 8;
+  static constexpr int kVPackedLaneWords = 4;
+  static constexpr int kKPackedLaneBytes =
+      kKPackedLaneWords * sizeof(std::uint32_t);
+  static constexpr int kVPackedLaneBytes =
+      kVPackedLaneWords * sizeof(std::uint32_t);
+
+  static_assert(!VectorPackedLoads || DpasPacked);
+  static_assert(kKPackedLaneBytes == 32);
+  static_assert(kVPackedLaneBytes == 16);
+  static_assert(
+      sizeof(sycl::vec<std::uint32_t, kKPackedLaneWords>) == kKPackedLaneBytes);
+  static_assert(
+      sizeof(sycl::vec<std::uint32_t, kVPackedLaneWords>) == kVPackedLaneBytes);
 
   KVarNK4V4Layout layout;
   KVarNHybridTailLayout tail;
@@ -112,6 +126,43 @@ struct KVarNK4V4FragmentLoader {
 
   CUTLASS_DEVICE static int unpack_nibble(std::uint32_t word, int index) {
     return int((word >> (4 * index)) & 0xfu);
+  }
+
+  template <int WordCount, class Fragment>
+  CUTLASS_DEVICE static void
+  fill_packed_lane_fragment(Fragment& dst, std::uint8_t const* lane_bytes) {
+    static_assert(
+        WordCount == kKPackedLaneWords || WordCount == kVPackedLaneWords);
+    if constexpr (VectorPackedLoads) {
+      // The host specialization validates the complete address induction:
+      // cache base, block/head strides, field offset, and these fixed lane
+      // extents.  Keep this as one explicit vector load per lane so this
+      // candidate differs from the scalar DPAS baseline only at the load.
+      using WordVector = sycl::vec<std::uint32_t, WordCount>;
+      WordVector const words = *reinterpret_cast<WordVector const*>(lane_bytes);
+      CUTLASS_PRAGMA_UNROLL
+      for (int word_index = 0; word_index < WordCount; ++word_index) {
+        std::uint32_t const word = words[word_index];
+        CUTLASS_PRAGMA_UNROLL
+        for (int nibble = 0; nibble < kValuesPerWord; ++nibble) {
+          dst(word_index * kValuesPerWord + nibble) =
+              static_cast<typename Fragment::value_type>(
+                  unpack_nibble(word, nibble));
+        }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int word_index = 0; word_index < WordCount; ++word_index) {
+        std::uint32_t const word =
+            load_u32(lane_bytes + word_index * sizeof(std::uint32_t));
+        CUTLASS_PRAGMA_UNROLL
+        for (int nibble = 0; nibble < kValuesPerWord; ++nibble) {
+          dst(word_index * kValuesPerWord + nibble) =
+              static_cast<typename Fragment::value_type>(
+                  unpack_nibble(word, nibble));
+        }
+      }
+    }
   }
 
   CUTLASS_DEVICE float
@@ -180,16 +231,7 @@ struct KVarNK4V4FragmentLoader {
         auto const* lane_bytes =
             rec + layout.k_packed_offset +
             (((half * 4 + dim_tile / 64) * 4 + subgroup) * 16 + lane) * 32;
-        CUTLASS_PRAGMA_UNROLL
-        for (int word_index = 0; word_index < 8; ++word_index) {
-          auto word = load_u32(lane_bytes + word_index * 4);
-          CUTLASS_PRAGMA_UNROLL
-          for (int nibble = 0; nibble < 8; ++nibble) {
-            dst(word_index * 8 + nibble) =
-                static_cast<typename Fragment::value_type>(
-                    unpack_nibble(word, nibble));
-          }
-        }
+        fill_packed_lane_fragment<kKPackedLaneWords>(dst, lane_bytes);
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < dst.size(); ++i) {
@@ -232,16 +274,7 @@ struct KVarNK4V4FragmentLoader {
         auto const* lane_bytes =
             rec + layout.v_packed_offset +
             (((half * 8 + value_tile / 32) * 4 + subgroup) * 16 + lane) * 16;
-        CUTLASS_PRAGMA_UNROLL
-        for (int word_index = 0; word_index < 4; ++word_index) {
-          auto word = load_u32(lane_bytes + word_index * 4);
-          CUTLASS_PRAGMA_UNROLL
-          for (int nibble = 0; nibble < 8; ++nibble) {
-            dst(word_index * 8 + nibble) =
-                static_cast<typename Fragment::value_type>(
-                    unpack_nibble(word, nibble));
-          }
-        }
+        fill_packed_lane_fragment<kVPackedLaneWords>(dst, lane_bytes);
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < dst.size(); ++i) {
@@ -281,7 +314,8 @@ template <
     class TensorQ_,
     class TensorK_,
     class TensorV_,
-    bool DpasPacked_ = false>
+    bool DpasPacked_ = false,
+    bool VectorPackedLoads_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -445,7 +479,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
-    KVarNK4V4FragmentLoader<DpasPacked_> loader{
+    KVarNK4V4FragmentLoader<DpasPacked_, VectorPackedLoads_> loader{
         params.kvarn,
         params.tail,
         params.base.ptr_page_table,

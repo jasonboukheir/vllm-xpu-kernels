@@ -33,6 +33,8 @@ from benchmark.kvarn_utils import (  # noqa: E402
     swizzle_record_dpas_k4v4,
 )
 
+R1_P5_DPAS_VECTOR_LOAD = 3
+
 
 @pytest.fixture(scope="module", autouse=True)
 def native_library() -> None:
@@ -528,6 +530,7 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
     ).xpu()
     canonical_output = torch.empty_like(query)
     swizzled_output = torch.empty_like(query)
+    vector_output = torch.empty_like(query)
 
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
@@ -546,9 +549,10 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
         0,
         False,
     )
+    swizzled_xpu = swizzled.xpu()
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
-        swizzled.xpu(),
+        swizzled_xpu,
         pages,
         lengths,
         block_to_slot,
@@ -563,9 +567,118 @@ def test_dpas_payload_decode_matches_canonical_ragged_and_hybrid() -> None:
         0,
         True,
     )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        query,
+        swizzled_xpu,
+        pages,
+        lengths,
+        block_to_slot,
+        tail_key,
+        tail_value,
+        vector_output,
+        257,
+        1.0 / 16.0,
+        False,
+        False,
+        0,
+        R1_P5_DPAS_VECTOR_LOAD,
+        True,
+    )
     torch.testing.assert_close(
         swizzled_output, canonical_output, rtol=0, atol=0
     )
+    torch.testing.assert_close(vector_output, swizzled_output, rtol=0, atol=0)
+
+
+def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
+    cache, _ = make_cache(1)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    with pytest.raises(
+        RuntimeError,
+        match="kernel_variant=3 requires dpas_layout=True",
+    ):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            cache.xpu(),
+            torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+            torch.ones((1,), dtype=torch.int32, device="xpu"),
+            torch.full((1,), -1, dtype=torch.int32, device="xpu"),
+            *_tail_tensors(),
+            torch.empty_like(query),
+            1,
+            1.0 / 16.0,
+            False,
+            False,
+            0,
+            R1_P5_DPAS_VECTOR_LOAD,
+            False,
+        )
+
+
+@pytest.mark.parametrize("misalignment", ["base", "record_stride"])
+def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
+    misalignment: str,
+) -> None:
+    layout = KVarNLayout(record_stride=35072)
+    if misalignment == "base":
+        storage = torch.zeros(
+            4 * layout.tile_bytes_aligned + 1,
+            dtype=torch.uint8,
+            device="xpu",
+        )
+        cache = storage[1:].view(1, 4, layout.tile_bytes_aligned)
+        expected = "32-byte-aligned packed_cache base"
+    else:
+        cache = torch.zeros(
+            (1, 4, layout.tile_bytes_aligned + 4),
+            dtype=torch.uint8,
+            device="xpu",
+        )
+        expected = "32-byte-aligned packed_cache block and head strides"
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    with pytest.raises(RuntimeError, match=expected):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            cache,
+            torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+            torch.ones((1,), dtype=torch.int32, device="xpu"),
+            torch.full((1,), -1, dtype=torch.int32, device="xpu"),
+            *_tail_tensors(),
+            torch.empty_like(query),
+            1,
+            1.0 / 16.0,
+            False,
+            False,
+            0,
+            R1_P5_DPAS_VECTOR_LOAD,
+            True,
+        )
+
+
+@pytest.mark.parametrize("kernel_variant", [1, 2, 4, 5, -1, 6])
+def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
+    cache, _ = make_cache(1)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    with pytest.raises(
+        RuntimeError,
+        match=f"unsupported native KVarN kernel_variant {kernel_variant}",
+    ):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            cache.xpu(),
+            torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+            torch.ones((1,), dtype=torch.int32, device="xpu"),
+            torch.full((1,), -1, dtype=torch.int32, device="xpu"),
+            *_tail_tensors(),
+            torch.empty_like(query),
+            1,
+            1.0 / 16.0,
+            False,
+            False,
+            0,
+            kernel_variant,
+            True,
+        )
 
 
 def test_full_precision_tail_and_packed_history_share_softmax() -> None:
@@ -713,8 +826,7 @@ def test_shared_prefix_is_deterministic() -> None:
     )
 
 
-def test_decode_with_scratch_matches_legacy_and_reuses_storage(
-) -> None:
+def test_decode_with_scratch_matches_legacy_and_reuses_storage() -> None:
     torch.xpu.synchronize()
     cache, _ = make_random_cache(6)
     generator = torch.Generator().manual_seed(20260808)
@@ -1083,8 +1195,7 @@ def test_fused_output_hadamard_matches_separate_transform(
     torch.testing.assert_close(fused, expected, atol=2e-2, rtol=2e-2)
 
 
-def test_fused_output_hadamard_rejects_single_split(
-) -> None:
+def test_fused_output_hadamard_rejects_single_split() -> None:
     cache, _ = make_random_cache(4)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(RuntimeError, match="requires a multi-split"):
@@ -1192,8 +1303,7 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
     )
 
 
-def test_bf16_output_requires_fused_unrotation(
-) -> None:
+def test_bf16_output_requires_fused_unrotation() -> None:
     cache, _ = make_random_cache(4)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(RuntimeError, match="requires unrotate_output"):
@@ -1215,20 +1325,32 @@ def test_bf16_output_requires_fused_unrotation(
         )
 
 
-_LONG_CONTEXT_LAYOUT_SPLITS = [
-    pytest.param(False, splits, id=f"natural-split{splits}")
-    for splits in (1, 2, 4, 8, 16, 17, 24, 32)
-] + [
-    pytest.param(True, splits, id=f"dpas-split{splits}")
-    for splits in (1, 16, 24, 32)
-]
+_LONG_CONTEXT_LAYOUT_SPLITS = (
+    [
+        pytest.param(False, splits, 0, id=f"natural-split{splits}")
+        for splits in (1, 2, 4, 8, 16, 17, 24, 32)
+    ]
+    + [
+        pytest.param(True, splits, 0, id=f"dpas-split{splits}")
+        for splits in (1, 16, 24, 32)
+    ]
+    + [
+        pytest.param(
+            True,
+            24,
+            R1_P5_DPAS_VECTOR_LOAD,
+            id="r1-p5-dpas-vector-load",
+        )
+    ]
+)
 
 
 @pytest.mark.parametrize(
-    ("dpas_layout", "splits"), _LONG_CONTEXT_LAYOUT_SPLITS
+    ("dpas_layout", "splits", "kernel_variant"),
+    _LONG_CONTEXT_LAYOUT_SPLITS,
 )
 def test_long_context_ragged_b4_matches_structured_oracle(
-    dpas_layout: bool, splits: int
+    dpas_layout: bool, splits: int, kernel_variant: int
 ) -> None:
     """Exercise packed and hybrid traversal through the 262K boundary."""
     num_blocks = 2048
@@ -1338,7 +1460,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         False,
         False,
         splits,
-        0,
+        kernel_variant,
         dpas_layout,
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1349,7 +1471,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         False,
         False,
         splits,
-        0,
+        kernel_variant,
         dpas_layout,
     )
     if splits > 1:
