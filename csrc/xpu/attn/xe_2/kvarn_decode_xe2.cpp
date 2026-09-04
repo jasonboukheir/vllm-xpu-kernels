@@ -37,6 +37,7 @@ enum class KVarNNativeKernelVariant : int64_t {
   kQ6CachedWeights = 6,
   kQ6ExactRows = 7,
   kQ6CachedWeightsExactRows = 8,
+  kQ6PagePair = 9,
 };
 
 static_assert(kPackedBytes % kDpasKVectorAlignment == 0);
@@ -57,7 +58,13 @@ void check_dpas_vector_load_alignment(const at::Tensor& packed_cache) {
       "block and head strides");
 }
 
-int validated_split_count(int64_t max_seq_len, int64_t requested_splits) {
+bool is_q6_page_pair_variant(int64_t kernel_variant) {
+  return kernel_variant ==
+         static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair);
+}
+
+int validated_split_count(
+    int64_t max_seq_len, int64_t requested_splits, bool page_pair = false) {
   // Zero retains source compatibility for direct extension callers. vLLM's
   // native path always passes the initialization-time policy result.
   int64_t const splits = requested_splits == 0 ? 16 : requested_splits;
@@ -65,11 +72,15 @@ int validated_split_count(int64_t max_seq_len, int64_t requested_splits) {
       splits == 1 || splits == 2 || splits == 4 || splits == 8 ||
           splits == 16 || splits == 17 || splits == 24 || splits == 32,
       "num_kv_splits must be one of 1, 2, 4, 8, 16, 17, 24, or 32");
-  // Do not launch more splits than the maximum sequence has 64-token work
-  // units. Apart from wasting work, empty split partials amplify reduction
-  // drift over many short-context model layers. The one-split direct-output
-  // path is both faster and more accurate in this regime.
-  int64_t const kv_tiles = (max_seq_len + 63) / 64;
+  // Do not launch more splits than the maximum sequence has work units.
+  // q6_page_pair deliberately schedules one 128-token page per unit while
+  // all established variants schedule K64 tiles. Apart from wasting work,
+  // empty split partials amplify reduction drift over many short-context
+  // model layers. The one-split direct-output path is both faster and more
+  // accurate in this regime.
+  int64_t const work_unit_tokens = page_pair ? kGroup : 64;
+  int64_t const kv_tiles =
+      (max_seq_len + work_unit_tokens - 1) / work_unit_tokens;
   if (splits > 1 && kv_tiles < splits) return 1;
   return static_cast<int>(splits);
 }
@@ -270,7 +281,8 @@ void kvarn_decode_with_scratch_xe2(
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ6ExactRows) ||
       kernel_variant ==
           static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
+              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows) ||
+      is_q6_page_pair_variant(kernel_variant);
   bool const use_dpas_vector_load =
       kernel_variant ==
           static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
@@ -290,6 +302,7 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant ==
           static_cast<int64_t>(
               KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
+  bool const use_q6_page_pair = is_q6_page_pair_variant(kernel_variant);
   TORCH_CHECK(
       kernel_variant ==
               static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
@@ -298,10 +311,12 @@ void kvarn_decode_with_scratch_xe2(
       kernel_variant,
       "; implemented variants are 0 (q8 scalar), 1 (integer QK), 2 (q6 "
       "scalar), 3 (q8 vector load), 4 (q6 vector load), 6 (q6 cached "
-      "weights), 7 (q6 exact rows), and 8 (q6 cached weights + exact rows)");
+      "weights), 7 (q6 exact rows), 8 (q6 cached weights + exact rows), and "
+      "9 (q6_page_pair)");
   TORCH_CHECK(
       (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, 4, 6, 7, and 8 require dpas_layout=True");
+      "kernel variants 1, 2, 3, 4, 6, 7, 8, and 9 require "
+      "dpas_layout=True");
   if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
 
   cutlass::fmha::collective::KVarNK4V4Layout layout{
@@ -317,8 +332,8 @@ void kvarn_decode_with_scratch_xe2(
       kVSColOffset,
       kVSRowOffset,
       kVZpOffset};
-  int const num_kv_splits =
-      validated_split_count(max_seq_len, requested_num_kv_splits);
+  int const num_kv_splits = validated_split_count(
+      max_seq_len, requested_num_kv_splits, use_q6_page_pair);
   TORCH_CHECK(
       !unrotate_output || num_kv_splits > 1,
       "unrotate_output requires a multi-split KVarN decode");
@@ -387,6 +402,8 @@ void kvarn_decode_with_scratch_xe2(
       use_qk_i8u4 ? KVarNDecodeD256G128DpasQKInt8U4Config::run(queue, args)
       : use_q6 && use_dpas_vector_load
           ? KVarNDecodeD256G128DpasQ6VectorLoadConfig::run(queue, args)
+      : use_q6_page_pair
+          ? KVarNDecodeD256G128DpasQ6PagePairConfig::run(queue, args)
       : use_q6_cached_weights && use_q6_exact_rows
           ? KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::run(
                 queue, args)
@@ -420,8 +437,10 @@ void kvarn_decode_xe2(
     int64_t requested_num_kv_splits,
     int64_t kernel_variant,
     bool dpas_layout) {
-  int const num_kv_splits =
-      validated_split_count(max_seq_len, requested_num_kv_splits);
+  int const num_kv_splits = validated_split_count(
+      max_seq_len,
+      requested_num_kv_splits,
+      is_q6_page_pair_variant(kernel_variant));
   int64_t const batch = query.size(0);
   auto temp_output = at::empty(
       {batch, kQueryHeads * num_kv_splits, kHeadDim}, query.options());

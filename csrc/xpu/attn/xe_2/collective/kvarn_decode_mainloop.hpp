@@ -347,7 +347,8 @@ template <
     bool DpasPacked_ = false,
     bool VectorPackedLoads_ = false,
     bool QKInt8U4_ = false,
-    bool ExactLiveRows_ = false>
+    bool ExactLiveRows_ = false,
+    bool PagePair_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -404,6 +405,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   static constexpr bool LocalMask = false;
   static constexpr bool InitializeSplitScratchSentinels = true;
   static constexpr bool ExactLiveRows = ExactLiveRows_;
+  static constexpr bool PagePair = PagePair_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
   static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
   static_assert(QueryRows <= 8);
@@ -525,6 +527,315 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     // Legacy single-split scheduler orders grid.z batch-major:
     //   flat = batch * num_kv_heads + kv_head.
     int kv_head = int(BlockIdxZ()) % 4;
+
+    if constexpr (PagePair_) {
+      // A scheduler work unit is one complete 128-token page for this
+      // specialization.  Keep the established K64 MMA fragments, but build
+      // both halves while the page lookup, query transform, and per-page
+      // scalar metadata are live.  The two score fragments are then consumed
+      // in their original order so online-softmax rounding remains aligned
+      // with the scalar Q6 implementation.
+      static_assert(DpasPacked_);
+      static_assert(!VectorPackedLoads_);
+      static_assert(!QKInt8U4_);
+      auto tSrSSecond = thr_mma_qk.partition_sg_fragment_C(cP);
+
+      for (int page = blk_k0; page < blk_k1; ++page) {
+        int const first_k_tile = page * 2;
+        if (page * KVarNK4V4FragmentLoader<>::kGroup >= actual_seq_len) {
+          break;
+        }
+
+        // One lookup and address calculation serve both K64 halves.  This is
+        // also important for the hybrid path: a page cannot change storage
+        // class between its first and second half.
+        int const physical = loader.physical_block(idx_b, first_k_tile);
+        int const slot = params.tail.block_to_slot[physical];
+        auto const* rec =
+            slot < 0 ? params.kvarn.cache +
+                           std::int64_t(physical) * params.kvarn.block_stride +
+                           std::int64_t(kv_head) * params.kvarn.head_stride
+                     : nullptr;
+
+        clear(tSrS);
+        clear(tSrSSecond);
+        float k_zp_bias[BiasRows] = {};
+        CUTLASS_PRAGMA_UNROLL
+        for (int d_tile = 0; d_tile < 256; d_tile += 64) {
+          // K column scale and zero point are page-wide.  Transform Q once,
+          // then reuse the exact same fp16 fragment for both packed halves.
+          copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
+          reorder(tQrQ, tSrQ);
+          if (slot < 0) {
+            using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
+            static_assert(KDimFragment{}.size() == 4);
+            KDimFragment k_dim_scale;
+            KDimFragment k_dim_zp;
+            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                                 .get_local_id()[0];
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < k_dim_scale.size(); ++i) {
+              int const dim = d_tile + lane + i * intel::sg_size;
+              k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_s_col_offset + 2 * dim);
+              k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_zp_offset + 2 * dim);
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrQ.size(); ++i) {
+              auto coord = tSrQ.tv_layout()(lane, i);
+              int const query_row = int(get<0>(coord));
+              float const query_value = static_cast<float>(tSrQ(i));
+              float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
+              k_zp_bias[query_row] += query_value * dim_zp;
+              float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
+              tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
+                  query_value * dim_scale);
+            }
+          }
+
+          loader.fill_k_fragment(
+              tSrK, rec, slot, kv_head, first_k_tile, qk_token_sg, d_tile);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+          loader.fill_k_fragment(
+              tSrK, rec, slot, kv_head, first_k_tile + 1, qk_token_sg, d_tile);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrSSecond);
+        }
+
+        if (slot < 0) {
+          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+          CUTLASS_PRAGMA_UNROLL
+          for (int query_row = 0; query_row < BiasRows; ++query_row) {
+            k_zp_bias[query_row] = sycl::reduce_over_group(
+                subgroup, k_zp_bias[query_row], sycl::plus<float>());
+          }
+          int const lane = subgroup.get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            auto coord = tSrS.tv_layout()(lane, i);
+            float const bias = k_zp_bias[int(get<0>(coord))];
+            tSrS(i) += bias;
+            tSrSSecond(i) += bias;
+          }
+
+          FragSCol first_k_row_scale;
+          FragSCol second_k_row_scale;
+          int first_token = qk_token_sg + lane;
+          int second_token = 64 + qk_token_sg + lane;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < first_k_row_scale.size(); ++i,
+                   first_token += intel::sg_size,
+                   second_token += intel::sg_size) {
+            first_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.k_s_row_offset + 2 * first_token);
+            second_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.k_s_row_offset + 2 * second_token);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            tSrS(i) *= broadcast<1>(first_k_row_scale, tSrS, i);
+            tSrSSecond(i) *= broadcast<1>(second_k_row_scale, tSrSSecond, i);
+          }
+        }
+
+        // A physical page is always safe to read in full, including a hybrid
+        // tail page.  Mask the unused tokens in the final partial page after
+        // fragment materialization, exactly as the K64 baseline does.
+        if ((first_k_tile + 1) * 64 > actual_seq_len) {
+          FragSCol mask;
+          int token = first_k_tile * 64 + qk_token_sg +
+                      sycl::ext::oneapi::this_work_item::get_sub_group()
+                          .get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < mask.size(); ++i, token += intel::sg_size) {
+            mask(i) = token < actual_seq_len ? ElementS(sycl::nan(0u))
+                                             : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(mask, tSrS, i));
+          }
+        }
+        if ((first_k_tile + 2) * 64 > actual_seq_len) {
+          FragSCol mask;
+          int token = (first_k_tile + 1) * 64 + qk_token_sg +
+                      sycl::ext::oneapi::this_work_item::get_sub_group()
+                          .get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < mask.size(); ++i, token += intel::sg_size) {
+            mask(i) = token < actual_seq_len ? ElementS(sycl::nan(0u))
+                                             : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrSSecond.size(); ++i) {
+            tSrSSecond(i) =
+                sycl::fmin(tSrSSecond(i), broadcast<1>(mask, tSrSSecond, i));
+          }
+        }
+
+        using VTokenFragment = decltype(reduce<0>(tArP, sycl::plus<void>{}));
+        SingleFragA fragment_shape;
+        using VDimFragment =
+            decltype(reduce<0>(fragment_shape, sycl::plus<void>{}));
+        VDimFragment page_v_dim_scale[VTiles];
+
+        this->softmax(
+            params.base.scale, page == blk_k0, tSrS, tA_max, tA_sum, tArA);
+        reorder(tSrS, tArP);
+
+        if (slot < 0) {
+          float v_zp_bias[BiasRows] = {};
+          int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                               .get_local_id()[0];
+          VTokenFragment v_token_scale;
+          VTokenFragment v_token_zp;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < v_token_scale.size(); ++i) {
+            int const token = pv_token_sg + lane + i * intel::sg_size;
+            v_token_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_s_row_offset + 2 * token);
+            v_token_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_zp_offset + 2 * token);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tArP.size(); ++i) {
+            auto coord = tArP.tv_layout()(lane, i);
+            int const query_row = int(get<0>(coord));
+            float const probability = static_cast<float>(tArP(i));
+            float const token_scale = broadcast<1>(v_token_scale, tArP, i);
+            float const token_zp = broadcast<1>(v_token_zp, tArP, i);
+            v_zp_bias[query_row] += probability * token_zp;
+            tArP(i) = static_cast<typename decltype(tArP)::value_type>(
+                probability * token_scale);
+          }
+          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+          CUTLASS_PRAGMA_UNROLL
+          for (int query_row = 0; query_row < BiasRows; ++query_row) {
+            v_zp_bias[query_row] = sycl::reduce_over_group(
+                subgroup, v_zp_bias[query_row], sycl::plus<float>());
+          }
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int vv = 0; vv < VTiles; ++vv) {
+            auto& v_dim_scale = page_v_dim_scale[vv];
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < v_dim_scale.size(); ++i) {
+              int const dim =
+                  vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
+              v_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.v_s_col_offset + 2 * dim);
+            }
+            auto output_tile = tArA(_, _, _, vv);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < output_tile.size(); ++i) {
+              output_tile(i) /= broadcast<1>(v_dim_scale, fragment_shape, i);
+            }
+            loader.fill_v_fragment(
+                tArV,
+                rec,
+                slot,
+                kv_head,
+                first_k_tile,
+                pv_token_sg,
+                vv * get<1>(TileShapePV{}));
+            cute::gemm(mma_pv, tArP, tArV, output_tile);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < output_tile.size(); ++i) {
+              auto coord = fragment_shape.tv_layout()(lane, i);
+              output_tile(i) += v_zp_bias[int(get<0>(coord))];
+            }
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int vv = 0; vv < VTiles; ++vv) {
+            loader.fill_v_fragment(
+                tArV,
+                rec,
+                slot,
+                kv_head,
+                first_k_tile,
+                pv_token_sg,
+                vv * get<1>(TileShapePV{}));
+            cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
+          }
+        }
+
+        // Consume the second half only after the first half's PV update.  The
+        // output remains in this page's V-column-scale frame across the
+        // second softmax rescale, preserving the established online ordering.
+        this->softmax(
+            params.base.scale, false, tSrSSecond, tA_max, tA_sum, tArA);
+        reorder(tSrSSecond, tArP);
+
+        if (slot < 0) {
+          float v_zp_bias[BiasRows] = {};
+          int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                               .get_local_id()[0];
+          VTokenFragment v_token_scale;
+          VTokenFragment v_token_zp;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < v_token_scale.size(); ++i) {
+            int const token = 64 + pv_token_sg + lane + i * intel::sg_size;
+            v_token_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_s_row_offset + 2 * token);
+            v_token_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                rec + params.kvarn.v_zp_offset + 2 * token);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tArP.size(); ++i) {
+            auto coord = tArP.tv_layout()(lane, i);
+            int const query_row = int(get<0>(coord));
+            float const probability = static_cast<float>(tArP(i));
+            float const token_scale = broadcast<1>(v_token_scale, tArP, i);
+            float const token_zp = broadcast<1>(v_token_zp, tArP, i);
+            v_zp_bias[query_row] += probability * token_zp;
+            tArP(i) = static_cast<typename decltype(tArP)::value_type>(
+                probability * token_scale);
+          }
+          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+          CUTLASS_PRAGMA_UNROLL
+          for (int query_row = 0; query_row < BiasRows; ++query_row) {
+            v_zp_bias[query_row] = sycl::reduce_over_group(
+                subgroup, v_zp_bias[query_row], sycl::plus<float>());
+          }
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int vv = 0; vv < VTiles; ++vv) {
+            auto output_tile = tArA(_, _, _, vv);
+            loader.fill_v_fragment(
+                tArV,
+                rec,
+                slot,
+                kv_head,
+                first_k_tile + 1,
+                pv_token_sg,
+                vv * get<1>(TileShapePV{}));
+            cute::gemm(mma_pv, tArP, tArV, output_tile);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < output_tile.size(); ++i) {
+              auto coord = fragment_shape.tv_layout()(lane, i);
+              output_tile(i) += v_zp_bias[int(get<0>(coord))];
+              output_tile(i) *=
+                  broadcast<1>(page_v_dim_scale[vv], fragment_shape, i);
+            }
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int vv = 0; vv < VTiles; ++vv) {
+            loader.fill_v_fragment(
+                tArV,
+                rec,
+                slot,
+                kv_head,
+                first_k_tile + 1,
+                pv_token_sg,
+                vv * get<1>(TileShapePV{}));
+            cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
+          }
+        }
+      }
+      return;
+    }
 
     for (int k_tile = blk_k0; k_tile < blk_k1; ++k_tile) {
       // The scheduler tiles to the batch maximum.  A workgroup owns exactly
