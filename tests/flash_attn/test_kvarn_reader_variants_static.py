@@ -53,6 +53,19 @@ def test_id17_selects_only_page_record_cursor_over_id13() -> None:
     ) in CONFIG
 
 
+def test_id18_composes_prefetch_and_record_cursor() -> None:
+    assert "kQ6PrefetchRecordCursor = 18" in DISPATCH
+    assert "use_q6_prefetch_record_cursor" in DISPATCH
+    assert (
+        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::\n"
+        "                  CurrentHalfVPrefetch"
+    ) in CONFIG
+    assert (
+        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::\n"
+        "                  ReusePageRecordCursor"
+    ) in CONFIG
+
+
 def test_half_local_v_prefetch_ranges_match_xe2_dpas_record() -> None:
     packed_bytes = 256 * 128 // 2
     column_bytes = 256 * 2
