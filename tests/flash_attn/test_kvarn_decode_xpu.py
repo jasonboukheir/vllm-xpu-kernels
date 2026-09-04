@@ -328,8 +328,11 @@ def test_ragged_batch_matches_independent_fp32_oracle(
 
 
 @pytest.mark.parametrize("record_stride", [35072, 65536])
+@pytest.mark.parametrize("dpas_layout", [False, True])
 def test_nonuniform_kvarn_factors_across_page_boundary(
+    monkeypatch: pytest.MonkeyPatch,
     record_stride: int,
+    dpas_layout: bool,
 ) -> None:
     """Exercise separable K and V factors with no unit-scale shortcuts.
 
@@ -359,6 +362,18 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
             _put_half(cache[block, kv_head], layout.v_s_row_offset, v_row_scale)
             _put_half(cache[block, kv_head], layout.v_zp_offset, v_row_zp)
 
+    packed_cache = cache
+    if dpas_layout:
+        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+        packed_cache = cache.clone()
+        for block in range(packed_cache.size(0)):
+            for kv_head in range(packed_cache.size(1)):
+                packed_cache[block, kv_head] = swizzle_record_dpas_k4v4(
+                    cache[block, kv_head], layout
+                )
+    else:
+        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+
     generator = torch.Generator().manual_seed(314159)
     query = torch.randn((3, 24, 256), generator=generator).to(torch.float16)
     pages = [[5, 0], [4, 1], [3, 2]]
@@ -367,7 +382,7 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
     tail_key, tail_value = _tail_tensors()
     torch.ops._vllm_fa2_C.kvarn_decode(
         query.xpu(),
-        cache.xpu(),
+        packed_cache.xpu(),
         torch.tensor(pages, dtype=torch.int32, device="xpu"),
         torch.tensor(lengths, dtype=torch.int32, device="xpu"),
         torch.full((6,), -1, dtype=torch.int32, device="xpu"),

@@ -502,30 +502,18 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
             float const query_value = static_cast<float>(tSrQ(i));
             float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
             k_zp_bias[query_row] += query_value * dim_zp;
+            // The column scale is constant across all 128 tokens in this
+            // KVarN page.  Apply it to the much smaller Q fragment instead of
+            // scaling every unpacked K element.  This is the same bilinear
+            // product, while also avoiding a cross-lane select for each K
+            // fragment element.
+            float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
+            tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
+                query_value * dim_scale);
           }
         }
         loader.fill_k_fragment(
             tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
-        if (slot < 0) {
-          // k_dim_scale is owned like the MMA-A (Q) fragment: lane `l`
-          // holds dimensions l, l+16, l+32, and l+48.  The MMA-B (K)
-          // fragment has different lane ownership, so CUTE's fragment-local
-          // broadcast cannot be used between them.  Select the scale from
-          // the lane which owns the K fragment's actual dimension instead.
-          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-          int const lane = subgroup.get_local_id()[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrK.size(); ++i) {
-            auto coord = tSrK.tv_layout()(lane, i);
-            int const dim = int(get<1>(coord));
-            float const dim_scale = sycl::select_from_group(
-                subgroup,
-                static_cast<float>(k_dim_scale(dim / intel::sg_size)),
-                dim % intel::sg_size);
-            tSrK(i) = static_cast<typename decltype(tSrK)::value_type>(
-                static_cast<float>(tSrK(i)) * dim_scale);
-          }
-        }
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
