@@ -41,6 +41,7 @@ R2_Q6_EXACT_ROWS = 7
 R2_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
 Q6_PAGE_PAIR = 9
 Q6_MAIN_GRF128 = 10
+Q6_SPLIT_REDUCER_SPECIALIZED = 11
 
 Q6_FACTORY_VARIANTS = (
     R1_P2_DPAS_Q6,
@@ -50,6 +51,7 @@ Q6_FACTORY_VARIANTS = (
     R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
     Q6_PAGE_PAIR,
     Q6_MAIN_GRF128,
+    Q6_SPLIT_REDUCER_SPECIALIZED,
 )
 
 
@@ -440,7 +442,7 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
             "dpas_layout=True"
         ),
     ):
@@ -671,7 +673,7 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
             "dpas_layout=True"
         ),
     ):
@@ -733,7 +735,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [5, -1, 11])
+@pytest.mark.parametrize("kernel_variant", [5, -1, 12])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -770,6 +772,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
         Q6_PAGE_PAIR,
         Q6_MAIN_GRF128,
+        Q6_SPLIT_REDUCER_SPECIALIZED,
     ],
 )
 def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
@@ -794,7 +797,7 @@ def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, and 10 require "
+            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, and 11 require "
             "dpas_layout=True"
         ),
     ):
@@ -1477,6 +1480,75 @@ def test_fused_output_hadamard_rejects_single_split() -> None:
             0,
             False,
         )
+
+
+@pytest.mark.parametrize(
+    ("batch", "splits"),
+    [
+        pytest.param(1, 32, id="b1-split32"),
+        pytest.param(4, 8, id="b4-split8"),
+        pytest.param(1, 24, id="generic-fallback-split24"),
+    ],
+)
+def test_q6_specialized_fused_reducer_matches_runtime_reducer(
+    batch: int, splits: int
+) -> None:
+    """ID 11 changes only the fused reducer selected after Q6 production."""
+    seq_len = 4096
+    pages_per_row = (seq_len + 127) // 128
+    canonical, layout = make_random_cache(pages_per_row)
+    swizzled = canonical.clone()
+    for block in range(pages_per_row):
+        for kv_head in range(4):
+            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
+                canonical[block, kv_head], layout
+            )
+
+    generator = torch.Generator().manual_seed(1100 + batch + splits)
+    query = torch.randn(
+        (batch, 24, 256), generator=generator, dtype=torch.float16
+    ).xpu()
+    pages = torch.arange(pages_per_row, dtype=torch.int32, device="xpu").repeat(
+        batch, 1
+    )
+    seq_lens = torch.arange(
+        seq_len, seq_len - batch, -1, dtype=torch.int32, device="xpu"
+    )
+    arguments = (
+        query,
+        swizzled.xpu(),
+        pages,
+        seq_lens,
+        torch.full((pages_per_row,), -1, dtype=torch.int32, device="xpu"),
+        *_tail_tensors(),
+    )
+    runtime_output = torch.empty_like(query)
+    specialized_output = torch.empty_like(query)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        runtime_output,
+        seq_len,
+        1.0 / 16.0,
+        True,
+        False,
+        splits,
+        R1_P2_DPAS_Q6,
+        True,
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        specialized_output,
+        seq_len,
+        1.0 / 16.0,
+        True,
+        False,
+        splits,
+        Q6_SPLIT_REDUCER_SPECIALIZED,
+        True,
+    )
+    torch.testing.assert_close(
+        specialized_output, runtime_output, atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("with_scratch", [False, True])
