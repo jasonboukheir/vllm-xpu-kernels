@@ -1154,11 +1154,26 @@ def test_bf16_output_requires_fused_unrotation(
         )
 
 
-@pytest.mark.parametrize("splits", [1, 2, 4, 8, 16, 17, 24, 32])
+_LONG_CONTEXT_LAYOUT_SPLITS = [
+    pytest.param(False, splits, id=f"natural-split{splits}")
+    for splits in (1, 2, 4, 8, 16, 17, 24, 32)
+] + [
+    pytest.param(True, splits, id=f"dpas-split{splits}")
+    for splits in (1, 16, 24, 32)
+]
+
+
+@pytest.mark.parametrize(
+    ("dpas_layout", "splits"), _LONG_CONTEXT_LAYOUT_SPLITS
+)
 def test_long_context_ragged_b4_matches_structured_oracle(
-    monkeypatch: pytest.MonkeyPatch, splits: int
+    monkeypatch: pytest.MonkeyPatch, dpas_layout: bool, splits: int
 ) -> None:
-    """Exercise native page traversal through the 262K service boundary."""
+    """Exercise packed and hybrid traversal through the 262K boundary."""
+    if dpas_layout:
+        monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+    else:
+        monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", str(splits))
     num_blocks = 2048
     cache, layout, page_scores, value_rows, column_scales = (
@@ -1215,15 +1230,35 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         query[row, :, row] = 16.0
     output = torch.full_like(query, float("nan"), device="xpu")
     repeat = torch.full_like(output, float("nan"))
-    tail_key, tail_value = _tail_tensors()
+
+    # Put the highest physical block in the fp16 tail while leaving every
+    # other block packed.  It is active in all four differently shaped rows,
+    # including the final page of the 262K row, so both packed/tail softmax
+    # composition and high-address traversal are covered in one B4 case.
+    # The structured packed payload uses a constant nibble per record, making
+    # its natural and DPAS byte layouts identical.  The independent random
+    # payload tests above retain responsibility for validating the swizzle.
+    hybrid_physical = num_blocks - 1
+    tail_key_cpu = torch.empty((1, 128, 4, 256), dtype=torch.float16)
+    tail_value_cpu = torch.empty_like(tail_key_cpu)
+    for kv_head in range(4):
+        key_page, value_page = dequant_record(
+            cache[hybrid_physical, kv_head], layout
+        )
+        tail_key_cpu[0, :, kv_head] = key_page
+        tail_value_cpu[0, :, kv_head] = value_page
+    block_to_slot = torch.full(
+        (num_blocks,), -1, dtype=torch.int32, device="xpu"
+    )
+    block_to_slot[hybrid_physical] = 0
     arguments = (
         query.xpu(),
         cache.xpu(),
         page_rows.to(dtype=torch.int32, device="xpu"),
         torch.tensor(seq_lengths, dtype=torch.int32, device="xpu"),
-        torch.full((num_blocks,), -1, dtype=torch.int32, device="xpu"),
-        tail_key,
-        tail_value,
+        block_to_slot,
+        tail_key_cpu.xpu(),
+        tail_value_cpu.xpu(),
     )
 
     temp_output = torch.full(
