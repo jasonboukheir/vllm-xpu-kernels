@@ -850,9 +850,6 @@ struct DecodeFwdMainloop<
   // Specialized collectives may ask the decode kernel to publish exact
   // empty-split sentinels before row-local scheduling can skip a split.
   static constexpr bool InitializeSplitScratchSentinels = false;
-  // Specialized collectives with fp16 split scratch may normalize each
-  // partial before storing it, then restore its weight in the reducer.
-  static constexpr bool NormalizeSplitPartialOutput = false;
 
   // User-facing arguments
   struct Arguments {

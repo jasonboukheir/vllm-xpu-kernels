@@ -35,6 +35,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kXPU, &fused_add_rms_norm);
 
+  // Gemma RMS Normalization: out = (x / rms(x)) * (1 + weight), folding the
+  // Gemma unit-offset and fp32 weighted multiply into the kernel.
+  ops.def(
+      "gemma_rms_norm(Tensor! result, Tensor! input, Tensor! weight, "
+      "float epsilon) -> ()");
+  ops.impl("gemma_rms_norm", torch::kXPU, &gemma_rms_norm);
+
+  // In-place fused Add and Gemma RMS Normalization.
+  ops.def(
+      "fused_add_gemma_rms_norm(Tensor! input, Tensor! residual, "
+      "Tensor! weight, float epsilon) -> ()");
+  ops.impl("fused_add_gemma_rms_norm", torch::kXPU, &fused_add_gemma_rms_norm);
+
   // Fused RMSNorm + dynamic per-token quantization (FP8 or INT8).
   ops.def(
       "rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
@@ -237,9 +250,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // memory outside the caching host allocator (e.g. a shared mmap region) has
   // no other way to become pinned. Returns false if registration is
   // unsupported, in which case transfers remain correct but slower.
-  ops.def("xpu_host_register(Tensor ptr, int n_bytes) -> bool");
+  ops.def("xpu_host_register(int ptr, int n_bytes) -> bool");
   ops.impl("xpu_host_register", &xpu_host_register);
-  ops.def("xpu_host_unregister(Tensor ptr) -> bool");
+  ops.def("xpu_host_unregister(int ptr) -> bool");
   ops.impl("xpu_host_unregister", &xpu_host_unregister);
 
   // Merge attn states

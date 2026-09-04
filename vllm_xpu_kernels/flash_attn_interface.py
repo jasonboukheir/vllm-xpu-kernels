@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+import sys
 from typing import Optional
 
 import torch
@@ -16,6 +17,11 @@ except ImportError as e:
 #isort: on
 
 DEFAULT_FA_VERSION = 2
+
+# Tracks configs we have already warned about so the
+# missing-kernel fallback notice is emitted once per config rather
+# than on every decode step.
+_warned_missing_configs: set = set()
 
 # Speculative-decoding fast path.
 #
@@ -198,6 +204,7 @@ def build_decode_split_plan(
     num_kv_splits: int,
     num_xe_cores: int,
     num_heads_kv: int,
+    window_size_left: int = -1,
 ):
     """Produce (splits_per_seq, work_list) for the compact-grid decode kernel.
 
@@ -209,6 +216,10 @@ def build_decode_split_plan(
     num_kv_splits   : global cap on per-seq split count (buffer dim).
     num_xe_cores    : Xe-core count used for the target-WG heuristic.
     num_heads_kv    : KV heads (workload is sliced across heads_kv heads).
+    window_size_left: sliding-window size (-1 = unlimited). Tiles before the
+                      window are skipped by the kernel, which offsets every
+                      work item by its own `k_block0`, so the plan must only
+                      partition the tiles that are actually inside the window.
 
     Returns
     -------
@@ -221,8 +232,8 @@ def build_decode_split_plan(
     - sum(splits_per_seq) == work_list.size(0) == total_wgs
     - For every emitted work item, kv_tile_count >= 1
     - For each seq, the work items partition [0, kv_tiles) exactly once
-    - splits_per_seq[i] <= num_kv_splits (so Oaccum/exp_sums/max_logits
-      buffer indexing is safe)
+    - splits_per_seq[i] <= num_kv_splits (so Oaccum/LSE scratch buffer
+      indexing is safe)
     - splits_per_seq[i] folds in {single-split heuristic, balanced
       assignment, hard cap}; the kernel never needs to second-guess it.
     """
@@ -231,8 +242,18 @@ def build_decode_split_plan(
     else:
         kv_lens_list = [int(v) for v in kv_lens]
 
-    tiles_per_seq = [max(1, (kv + kv_tile - 1) // kv_tile)
-                     for kv in kv_lens_list]
+    # Mirror the kernel's k_block0: for decode all packed GQA heads sit at
+    # position kv_len - 1, so a left window of W makes tiles before
+    # (kv_len - 1 - W) / kv_tile unreachable. work_list tile indices are
+    # relative to k_block0, matching `kv_split_offset = k_block0 + tile_start`.
+    def _windowed_tiles(kv: int) -> int:
+        total = (kv + kv_tile - 1) // kv_tile
+        if window_size_left >= 0:
+            k_block0 = max(kv - 1 - window_size_left, 0) // kv_tile
+            total -= k_block0
+        return max(1, total)
+
+    tiles_per_seq = [_windowed_tiles(kv) for kv in kv_lens_list]
     total_tiles = sum(tiles_per_seq)
 
     # Target: ~2x oversubscription of Xe cores per kv head, minimum 4 tiles
@@ -542,12 +563,20 @@ def flash_attn_varlen_func(
             kv_tile = _kv_tile_from_block_size(block_size)
             num_xe_cores = _infer_num_xe_cores(q.device)
             num_heads_kv = k.size(2)
+            # Mirror flash_api.cpp: any window bound enables local masking,
+            # and an unbounded left edge is normalized to max_seqlen_k.
+            if real_window_size[0] != -1 or real_window_size[1] != -1:
+                eff_window_left = (max_seqlen_k if real_window_size[0] == -1
+                                   else real_window_size[0])
+            else:
+                eff_window_left = -1
             splits_cpu, work_list_cpu = build_decode_split_plan(
                 host_kv_lens,
                 kv_tile=kv_tile,
                 num_kv_splits=num_splits_kv,
                 num_xe_cores=num_xe_cores,
                 num_heads_kv=num_heads_kv,
+                window_size_left=eff_window_left,
             )
             if work_list_cpu.numel() > 0:
                 splits_per_seq_dev = splits_cpu.to(
@@ -592,17 +621,23 @@ def flash_attn_varlen_func(
             if "not compiled" not in str(e):
                 raise
             # Fallback to PyTorch reference implementation.
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(
+            # Emit the notice once per unique missing config and write
+            # it straight to stderr.
+            _msg = (
                 "XPU kernel not compiled for this config, falling back "
                 "to PyTorch reference attention. Performance will be "
                 "significantly degraded.\n"
                 "To fix: rebuild with the config line shown above.\n"
                 "If this is unexpected, report at: "
                 "https://github.com/vllm-project/vllm-xpu-kernels/issues/364\n"
-                "Original error: %s", e)
-            out, softmax_lse = _fallback_varlen_attn(
+                f"Original error: {e}")
+            if str(e) not in _warned_missing_configs:
+                _warned_missing_configs.add(str(e))
+                import logging
+                logging.getLogger(__name__).warning(_msg)
+                print("[vllm_xpu_kernels] " + _msg, file=sys.stderr,
+                      flush=True)
+            fallback_out, softmax_lse = _fallback_varlen_attn(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k,
                 block_table, softmax_scale, causal,
                 real_window_size, softcap,
@@ -611,6 +646,10 @@ def flash_attn_varlen_func(
                 s_aux=s_aux,
                 return_softmax_lse=return_softmax_lse,
             )
+            if out is not None:
+                out.copy_(fallback_out.reshape(out.shape))
+            else:
+                out = fallback_out
     else:
         raise NotImplementedError("not support yet")
     return (out, softmax_lse) if return_softmax_lse else (out)
@@ -710,5 +749,4 @@ def _fallback_varlen_attn(
     if return_softmax_lse:
         return result[0], result[1]
     return result, None
-
 
