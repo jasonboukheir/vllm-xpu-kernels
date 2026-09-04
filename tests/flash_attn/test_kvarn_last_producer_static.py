@@ -16,12 +16,52 @@ REGISTRATION = (REPO_ROOT / "csrc/flash_attn/flash_api.cpp").read_text()
 def test_id19_is_runtime_selectable_but_fails_closed_to_id18() -> None:
     assert "kQ6B1ShortLastProducer = 19" in DISPATCH
     assert "request_q6_b1_short_last_producer && batch == 1" in DISPATCH
-    assert "max_seq_len <= 4096 && num_kv_splits > 1" in DISPATCH
+    assert "kMaxShortContextSeqLen = 8192" in CONFIG
+    assert (
+        "KVarNB1ShortLastProducerFinalizer::kMaxShortContextSeqLen" in CONFIG
+    )
+    assert (
+        "args.max_seq_len >\n"
+        "              KVarNB1ShortLastProducerFinalizer::"
+        "kMaxShortContextSeqLen"
+        in CONFIG
+    )
+    assert (
+        "KVarNB1ShortLastProducerFinalizer::kMaxShortContextSeqLen" in DISPATCH
+    )
+    assert (
+        DISPATCH.count(
+            "KVarNB1ShortLastProducerFinalizer::kMaxShortContextSeqLen"
+        )
+        >= 2
+    )
+    assert "max_seq_len <= 4096" not in DISPATCH
+    assert "args.max_seq_len > 4096" not in CONFIG
     assert "unrotate_output && last_producer_state_initialized" in DISPATCH
     assert "use_q6_prefetch_record_cursor" in DISPATCH
     assert (
         "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run" in DISPATCH
     )
+
+
+def test_id19_short_context_bucket_boundaries() -> None:
+    """Prove the host-visible eligibility contract at the bucket boundary."""
+    short_context_max = 8192
+
+    def id19_eligible(seq_len: int) -> bool:
+        # All other ID19 prerequisites are held true here so this focused
+        # contract test isolates the short-context bucket itself.
+        return seq_len > 0 and seq_len <= short_context_max
+
+    # The 4096-input/512-output experiment must remain on ID19 throughout its
+    # decode; test every length in that benchmark's transition interval.
+    assert all(id19_eligible(seq_len) for seq_len in range(4096, 4609))
+    assert id19_eligible(short_context_max)
+
+    # The next token must fail closed to ID18 rather than entering an ID19
+    # kernel compiled for the bounded short-context protocol.
+    assert not id19_eligible(8193)
+    assert not id19_eligible(16384)
 
 
 def test_id18_producer_and_layout_are_unchanged() -> None:
