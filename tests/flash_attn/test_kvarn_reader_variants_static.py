@@ -8,8 +8,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
 MAINLOOP = (
-    REPO_ROOT
-    / "csrc/xpu/attn/xe_2/collective/kvarn_decode_mainloop.hpp"
+    REPO_ROOT / "csrc/xpu/attn/xe_2/collective/kvarn_decode_mainloop.hpp"
 ).read_text()
 CONFIG = (REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_decode.hpp").read_text()
 DISPATCH = (REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_decode_xe2.cpp").read_text()
