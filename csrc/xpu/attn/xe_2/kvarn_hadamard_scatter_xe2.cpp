@@ -188,7 +188,12 @@ void kvarn_hadamard_scatter_xe2(
     const at::Tensor& block_to_slot,
     at::Tensor& tail_key,
     at::Tensor& tail_value,
-    int64_t group) {
+    int64_t group,
+    bool dpas_layout) {
+  // Tail records are unquantized and layout-independent. Keep the resolved
+  // packed-cache layout in this writer ABI so every cache boundary is explicit
+  // and future writer variants can branch without re-reading process state.
+  (void)dpas_layout;
   check_inputs(
       key, value, slot_mapping, block_to_slot, tail_key, tail_value, group);
   if (key.size(0) == 0) return;

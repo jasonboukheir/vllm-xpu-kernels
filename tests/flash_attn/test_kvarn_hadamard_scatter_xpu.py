@@ -51,6 +51,7 @@ def test_kvarn_hadamard_scatter_matches_fp32(dtype, tokens):
         tail_key,
         tail_value,
         128,
+        False,
     )
     torch.xpu.synchronize()
     h = _hadamard_256()
@@ -100,6 +101,7 @@ def test_kvarn_hadamard_scatter_structured_and_invalid_rows():
         tail_key,
         tail_value,
         128,
+        False,
     )
     torch.xpu.synchronize()
     actual_k = tail_key.cpu()
@@ -133,7 +135,7 @@ def test_kvarn_hadamard_scatter_repeated_is_deterministic():
         )
         tail_value = torch.full_like(tail_key, -1)
         torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
-            key, value, slots, lookup, tail_key, tail_value, 128
+            key, value, slots, lookup, tail_key, tail_value, 128, False
         )
         outputs.append((tail_key.cpu(), tail_value.cpu()))
     for candidate in outputs[1:]:
@@ -166,6 +168,7 @@ def test_kvarn_hadamard_scatter_survives_input_allocator_reuse():
             tail_key,
             tail_value,
             128,
+            False,
         )
         # Drop every temporary input immediately, then pressure the caching
         # allocator with matching allocations before synchronizing.
@@ -223,6 +226,7 @@ def test_kvarn_hadamard_scatter_matches_backend_strides_and_appends(batch_size):
             native_key,
             native_value,
             128,
+            False,
         )
     torch.xpu.synchronize()
 

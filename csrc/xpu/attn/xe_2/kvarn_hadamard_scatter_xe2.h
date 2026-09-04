@@ -9,4 +9,5 @@ void kvarn_hadamard_scatter_xe2(
     const at::Tensor& block_to_slot,
     at::Tensor& tail_key,
     at::Tensor& tail_value,
-    int64_t group);
+    int64_t group,
+    bool dpas_layout);

@@ -179,6 +179,11 @@ def main() -> None:
             output,
             seq_len,
             1.0 / 16.0,
+            False,
+            False,
+            0,
+            0,
+            False,
         )
         torch.xpu.synchronize()
         expected = torch.full_like(output.cpu(), expected_value(pages, seq_len))
@@ -206,6 +211,11 @@ def main() -> None:
         output,
         129,
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        0,
+        False,
     )
     torch.xpu.synchronize()
     hybrid_expected = torch.full_like(output.cpu(), (128 * 0.75) / 129)
@@ -238,6 +248,11 @@ def main() -> None:
         random_output,
         129,
         scale,
+        False,
+        False,
+        0,
+        0,
+        False,
     )
     torch.xpu.synchronize()
     reference = torch.cat(
