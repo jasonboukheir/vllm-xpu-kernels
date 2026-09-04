@@ -271,8 +271,9 @@ void kvarn_pack_balanced_kv_xe2(
       "packed_cache must have shape [blocks, 4, record_bytes>=35072]");
   TORCH_CHECK(packed_cache.is_contiguous(), "packed_cache must be contiguous");
   TORCH_CHECK(
-      packed_cache.size(2) % alignof(sycl::half) == 0,
-      "packed cache record stride must preserve fp16 alignment");
+      packed_cache.size(2) % 4 == 0,
+      "packed cache record stride must preserve the four-byte xe2_dpas ABI "
+      "alignment");
   TORCH_CHECK(
       block_ids.is_xpu() && block_ids.device() == packed_cache.device() &&
           block_ids.scalar_type() == at::kLong && block_ids.dim() == 1 &&
@@ -301,6 +302,12 @@ void kvarn_pack_balanced_kv_xe2(
       value_sinkhorn_row, packed_cache, {tiles, kGroup}, "value_sinkhorn_row");
   if (tiles == 0) return;
 
+  // The service caller constructs block_ids from its per-step flush_seen set:
+  // IDs are unique and in [0, packed_cache.size(0)).  Checking that device
+  // tensor here would add a synchronizing D2H read to the flush hot path.  The
+  // kernel still masks invalid IDs defensively, but duplicate valid IDs are
+  // outside this operator's contract because they would create multiple
+  // workgroups writing the same cache record.
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   const int64_t rows = tiles * (kHeadDim + kGroup);
   queue.submit([&](sycl::handler& cgh) {

@@ -399,6 +399,78 @@ def _balanced_record_reference(
     return torch.nn.functional.pad(record, (0, record_bytes - record.shape[1]))
 
 
+def _balanced_writer_inputs(case: str, tiles: int) -> tuple[torch.Tensor, ...]:
+    channel = torch.arange(256, dtype=torch.float32)
+    token = torch.arange(128, dtype=torch.float32)
+    tile = torch.arange(tiles, dtype=torch.float32)
+
+    if case == "arbitrary":
+        generator = torch.Generator().manual_seed(20260904)
+        key_balanced = torch.randn(tiles, 256, 128, generator=generator) * 3.125
+        value_balanced = (
+            torch.randn(tiles, 128, 256, generator=generator) * 2.75
+        )
+    elif case == "halfway":
+        # Exact endpoints keep scale=1 while the interior exercises every
+        # round-to-nearest-even tie, including even and odd lower q4 codes.
+        key_pattern = torch.tensor(
+            [0.0, 15.0, *[code + 0.5 for code in range(15)]],
+            dtype=torch.float32,
+        )
+        value_pattern = key_pattern.flip(0)
+        key_balanced = key_pattern.repeat(8)[:128].view(1, 1, 128)
+        key_balanced = (
+            key_balanced
+            + channel.remainder(3).view(1, 256, 1) * 16
+            + tile.view(tiles, 1, 1) * 64
+        )
+        value_balanced = value_pattern.repeat(16)[:256].view(1, 1, 256)
+        value_balanced = (
+            value_balanced
+            - token.remainder(3).view(1, 128, 1) * 16
+            - tile.view(tiles, 1, 1) * 64
+        )
+    elif case == "constant":
+        key_balanced = (
+            channel.remainder(17).view(1, 256, 1) / 8
+            - 1
+            + tile.view(tiles, 1, 1) / 4
+        ).expand(tiles, 256, 128)
+        value_balanced = (
+            token.remainder(19).view(1, 128, 1) / 8
+            - 2
+            - tile.view(tiles, 1, 1) / 4
+        ).expand(tiles, 128, 256)
+    else:
+        raise AssertionError(f"unknown writer input case: {case}")
+
+    # Nontrivial, exactly representable factors also verify the fp16 metadata
+    # fields rather than only the q4 payload.
+    key_sinkhorn_col = (
+        (tile[:, None] + token[None, :].remainder(11) + 1) / 16
+    ).contiguous()
+    key_sinkhorn_row = (
+        (tile[:, None] + channel[None, :].remainder(13) + 1) / 16
+    ).contiguous()
+    value_sinkhorn_col = (
+        (tile[:, None] + channel[None, :].remainder(17) + 1) / 16
+    ).contiguous()
+    value_sinkhorn_row = (
+        (tile[:, None] + token[None, :].remainder(19) + 1) / 16
+    ).contiguous()
+    return tuple(
+        tensor.contiguous()
+        for tensor in (
+            key_balanced,
+            key_sinkhorn_col,
+            key_sinkhorn_row,
+            value_balanced,
+            value_sinkhorn_col,
+            value_sinkhorn_row,
+        )
+    )
+
+
 @pytest.mark.parametrize("num_flush_blocks", [1, 3])
 @pytest.mark.parametrize("record_bytes", [35072, 65536])
 def test_kvarn_balanced_writer_matches_dpas_record_bytes(
@@ -497,3 +569,43 @@ def test_kvarn_balanced_writer_skips_invalid_ragged_block_ids():
     )
     torch.xpu.synchronize()
     assert torch.all(packed_cache == 0xA5)
+
+
+@pytest.mark.parametrize("case", ["arbitrary", "halfway", "constant"])
+def test_kvarn_balanced_writer_matches_nontrivial_rounding(case):
+    _load_op()
+    record_bytes = 35072
+    block_ids = torch.tensor([2], dtype=torch.int64)
+    inputs = _balanced_writer_inputs(case, tiles=4)
+    packed_cache = torch.full(
+        (4, 4, record_bytes), 0xA5, dtype=torch.uint8, device="xpu"
+    )
+
+    torch.ops._vllm_fa2_C.kvarn_pack_balanced_kv(
+        *(tensor.xpu() for tensor in inputs),
+        block_ids.xpu(),
+        packed_cache,
+        True,
+    )
+    torch.xpu.synchronize()
+
+    expected = _balanced_record_reference(*inputs, record_bytes).reshape(
+        1, 4, record_bytes
+    )
+    actual = packed_cache.cpu()
+    assert torch.equal(actual[2], expected[0])
+    assert torch.all(actual[[0, 1, 3]] == 0xA5)
+
+
+def test_kvarn_balanced_writer_rejects_non_abi_record_stride():
+    _load_op()
+    inputs = _balanced_writer_inputs("constant", tiles=4)
+    packed_cache = torch.empty(1, 4, 35074, dtype=torch.uint8, device="xpu")
+
+    with pytest.raises(RuntimeError, match="four-byte xe2_dpas ABI alignment"):
+        torch.ops._vllm_fa2_C.kvarn_pack_balanced_kv(
+            *(tensor.xpu() for tensor in inputs),
+            torch.tensor([0], dtype=torch.int64, device="xpu"),
+            packed_cache,
+            True,
+        )
