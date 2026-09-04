@@ -77,6 +77,8 @@ def test_id21_composes_with_id18_without_changing_cache_abi() -> None:
             and contract in CONFIG
         )
     assert "!SimdPackedUnpack && !PagePair" in CONFIG
+    assert "!PairedNibbleHalf2 || !ReusePageMetadataCursor_" in MAINLOOP
+    assert "!ReusePageMetadataCursor && !SimdPackedUnpack" in CONFIG
     assert "KVarNK4V4Layout" in MAINLOOP
     assert "paired_nibble_half2_lut[256]" in MAINLOOP
     assert "256 * sizeof(std::uint32_t)" in CONFIG
