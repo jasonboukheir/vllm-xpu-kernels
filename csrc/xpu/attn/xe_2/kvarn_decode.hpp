@@ -360,6 +360,119 @@ struct KVarNReduceSplitOutputHadamardKernel {
   }
 };
 
+/** Compile-time split-count version of the fused KVarN output reducer.
+ *
+ * B70 production uses a small fixed set of split counts.  Making NumSplits a
+ * template argument gives the compiler a constant scratch stride and a bounded
+ * accumulation loop while leaving the producer kernel and scratch layout
+ * unchanged.  Inactive per-row splits still carry the established lowest-float
+ * LSE sentinel and are skipped before their uninitialized partial is read.
+ */
+template <int NumSplits, int KVWorkUnitTokens>
+struct KVarNReduceSplitOutputHadamardSpecializedKernel {
+  using Element = cutlass::half_t;
+  using Params =
+      typename KVarNReduceSplitOutputHadamardKernel<KVWorkUnitTokens>::Params;
+
+  static_assert(
+      NumSplits == 2 || NumSplits == 4 || NumSplits == 8 || NumSplits == 16 ||
+          NumSplits == 32,
+      "specialized KVarN reducer supports only B70 production split counts");
+  static constexpr int kThreads = KVarNDecodeD256G128Policy::HeadDim;
+
+  struct SharedStorage {
+    cutlass::Array<float, NumSplits> split_weights;
+    cutlass::Array<float, KVarNDecodeD256G128Policy::HeadDim> output_row;
+  };
+  static constexpr int SharedStorageSize = sizeof(SharedStorage);
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* shared_storage) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    int const head = int(BlockIdxY());
+    int const batch = int(BlockIdxZ());
+    int const thread = int(ThreadIdxX());
+    auto workgroup = get_work_group<3>();
+    auto& storage = *reinterpret_cast<SharedStorage*>(shared_storage);
+
+    int const kv_tiles =
+        cute::ceil_div(params.seq_lens[batch], KVWorkUnitTokens);
+    int const active_splits =
+        cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
+    int const stats_offset =
+        (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) * NumSplits +
+        thread;
+    float const invalid_lse =
+        cutlass::platform::numeric_limits<float>::lowest();
+    float const local_lse = thread < active_splits
+                                ? params.softmax_lse_accum[stats_offset]
+                                : invalid_lse;
+    bool const valid = local_lse > invalid_lse;
+
+    float const global_max_lse =
+        sycl::reduce_over_group(workgroup, local_lse, sycl::maximum<>());
+    constexpr float kLog2e = 1.4426950408889634f;
+    if (thread < NumSplits) {
+      storage.split_weights[thread] =
+          valid ? sycl::native::exp2((local_lse - global_max_lse) * kLog2e)
+                : 0.0f;
+    }
+    sycl::group_barrier(workgroup);
+
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int split = 0; split < NumSplits; ++split) {
+      float const weight = storage.split_weights[split];
+      if (weight <= 0.0f) continue;
+      int const partial_offset = ((batch * NumSplits + split) *
+                                      KVarNDecodeD256G128Policy::NumQueryHeads +
+                                  head) *
+                                     KVarNDecodeD256G128Policy::HeadDim +
+                                 thread;
+      numerator +=
+          static_cast<float>(params.partial_output[partial_offset]) * weight;
+      denominator += weight;
+    }
+
+    // Preserve the generic reducer's two fp16 rounding boundaries exactly.
+    Element const reduced = static_cast<Element>(numerator / denominator);
+    storage.output_row[thread] = static_cast<float>(reduced);
+    sycl::group_barrier(workgroup);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int stage = 0; stage < 8; ++stage) {
+      int const span = 1 << stage;
+      if (thread < KVarNDecodeD256G128Policy::HeadDim / 2) {
+        int const pair = thread / span;
+        int const offset = thread - pair * span;
+        int const low = pair * 2 * span + offset;
+        int const high = low + span;
+        float const a = storage.output_row[low];
+        float const b = storage.output_row[high];
+        storage.output_row[low] = a + b;
+        storage.output_row[high] = a - b;
+      }
+      sycl::group_barrier(workgroup);
+    }
+
+    int const output_offset =
+        (batch * KVarNDecodeD256G128Policy::NumQueryHeads + head) *
+            KVarNDecodeD256G128Policy::HeadDim +
+        thread;
+    Element const transformed =
+        static_cast<Element>(storage.output_row[thread] * (1.0f / 16.0f));
+    if (params.write_bf16_output) {
+      using BFloat16 = sycl::ext::oneapi::bfloat16;
+      reinterpret_cast<BFloat16*>(params.output)[output_offset] =
+          static_cast<BFloat16>(static_cast<float>(transformed));
+    } else {
+      reinterpret_cast<Element*>(params.output)[output_offset] = transformed;
+    }
+  }
+};
+
 /** Concrete, intentionally narrow native decode configuration.
  *
  * This is kept separate from PagedDecodeConfig because K and V are not
@@ -376,7 +489,8 @@ template <
     bool CacheScalarWeights = false,
     bool ExactLiveRows = false,
     bool PagePair = false,
-    int MainKernelGrfSize = 256>
+    int MainKernelGrfSize = 256,
+    bool SpecializedSplitReducer = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
   static_assert(!QKInt8U4 || DpasPacked);
@@ -397,6 +511,12 @@ struct KVarNDecodeD256G128ConfigImpl {
       MainKernelGrfSize == 128 || MainKernelGrfSize == 256,
       "KVarN main-kernel GRF size must be 128 or 256");
   static constexpr int MainGrfSize = MainKernelGrfSize;
+  static_assert(
+      !SpecializedSplitReducer ||
+          (DpasPacked && cute::is_same_v<QPacked, cute::Int<6>>),
+      "specialized split reduction is an exact-Q6 DPAS experiment");
+
+  static constexpr bool UsesSpecializedSplitReducer = SpecializedSplitReducer;
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -486,6 +606,11 @@ struct KVarNDecodeD256G128ConfigImpl {
   using ReductionSplit32Kernel = KVarNReduceSplit32Kernel<KVWorkUnitTokens>;
   using ReductionSplitOutputHadamardKernel =
       KVarNReduceSplitOutputHadamardKernel<KVWorkUnitTokens>;
+  template <int NumSplits>
+  using ReductionSplitOutputHadamardSpecializedKernel =
+      KVarNReduceSplitOutputHadamardSpecializedKernel<
+          NumSplits,
+          KVWorkUnitTokens>;
 
   static cutlass::Status
   run(sycl::queue& queue, kvarn_decode_args_t const& args) {
@@ -679,6 +804,26 @@ struct KVarNDecodeD256G128ConfigImpl {
     return cutlass::Status::kSuccess;
   }
 
+  template <class Reducer>
+  static void launch_output_hadamard_reducer(
+      sycl::queue& queue,
+      typename ReductionSplitOutputHadamardKernel::Params const& reduce_params,
+      int batch_size) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    namespace intelex = sycl::ext::intel::experimental;
+    compat::experimental::launch_properties launch_props{
+        syclex::work_group_scratch_size(Reducer::SharedStorageSize)};
+    compat::experimental::kernel_properties kernel_props{
+        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+    compat::experimental::launch_policy policy{
+        compat::dim3(1, Policy::NumQueryHeads, batch_size),
+        compat::dim3(Reducer::kThreads, 1, 1),
+        launch_props,
+        kernel_props};
+    compat::experimental::launch<cutlass::device_kernel<Reducer>>(
+        policy, queue, reduce_params);
+  }
+
   static void launch(
       sycl::queue& queue,
       typename Kernel::Params params,
@@ -712,17 +857,45 @@ struct KVarNDecodeD256G128ConfigImpl {
         policy, queue, params);
 
     if (unrotate_output) {
-      compat::experimental::launch_properties reduce_hadamard_launch_props{
-          syclex::work_group_scratch_size(
-              ReductionSplitOutputHadamardKernel::SharedStorageSize)};
-      compat::experimental::launch_policy reduce_hadamard_policy{
-          compat::dim3(1, Policy::NumQueryHeads, params.kernel.shape.batch),
-          compat::dim3(ReductionSplitOutputHadamardKernel::kThreads, 1, 1),
-          reduce_hadamard_launch_props,
-          reduce_kernel_props};
-      compat::experimental::launch<
-          cutlass::device_kernel<ReductionSplitOutputHadamardKernel>>(
-          reduce_hadamard_policy, queue, reduce_hadamard_params);
+      if constexpr (SpecializedSplitReducer) {
+        switch (num_kv_splits) {
+          case 2:
+            launch_output_hadamard_reducer<
+                ReductionSplitOutputHadamardSpecializedKernel<2>>(
+                queue, reduce_hadamard_params, params.kernel.shape.batch);
+            break;
+          case 4:
+            launch_output_hadamard_reducer<
+                ReductionSplitOutputHadamardSpecializedKernel<4>>(
+                queue, reduce_hadamard_params, params.kernel.shape.batch);
+            break;
+          case 8:
+            launch_output_hadamard_reducer<
+                ReductionSplitOutputHadamardSpecializedKernel<8>>(
+                queue, reduce_hadamard_params, params.kernel.shape.batch);
+            break;
+          case 16:
+            launch_output_hadamard_reducer<
+                ReductionSplitOutputHadamardSpecializedKernel<16>>(
+                queue, reduce_hadamard_params, params.kernel.shape.batch);
+            break;
+          case 32:
+            launch_output_hadamard_reducer<
+                ReductionSplitOutputHadamardSpecializedKernel<32>>(
+                queue, reduce_hadamard_params, params.kernel.shape.batch);
+            break;
+          default:
+            // Legal non-policy counts (currently 17 and 24) retain the generic
+            // fused reducer, so selecting the experiment never rejects a
+            // service shape that the external ABI already accepts.
+            launch_output_hadamard_reducer<ReductionSplitOutputHadamardKernel>(
+                queue, reduce_hadamard_params, params.kernel.shape.batch);
+            break;
+        }
+      } else {
+        launch_output_hadamard_reducer<ReductionSplitOutputHadamardKernel>(
+            queue, reduce_hadamard_params, params.kernel.shape.batch);
+      }
     } else if (num_kv_splits == 32) {
       compat::experimental::launch_properties reduce32_launch_props{
           syclex::work_group_scratch_size(
@@ -804,6 +977,17 @@ using KVarNDecodeD256G128DpasQ6PagePairConfig = KVarNDecodeD256G128ConfigImpl<
     false,
     false,
     true>;
+using KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig =
+    KVarNDecodeD256G128ConfigImpl<
+        true,
+        cute::Int<6>,
+        false,
+        false,
+        false,
+        false,
+        false,
+        256,
+        true>;
 
 // Candidate r1-p2's scalar scatter assigns one 3x128 output subtile to each
 // of the established four Reduce-K subgroups.  Prove against the actual CuTe
@@ -874,6 +1058,25 @@ static_assert(KVarNDecodeD256G128DpasQ6PagePairConfig::KVWorkUnitTokens == 128);
 static_assert(cute::is_same_v<
               KVarNDecodeD256G128DpasQ6PagePairConfig::MMAOperation,
               KVarNDecodeD256G128DpasQ6Config::MMAOperation>);
+static_assert(!KVarNDecodeD256G128DpasQ6Config::UsesSpecializedSplitReducer);
+static_assert(KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::
+                  UsesSpecializedSplitReducer);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::Mainloop,
+              KVarNDecodeD256G128DpasQ6Config::Mainloop>);
+static_assert(cute::is_same_v<
+              KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::Kernel,
+              KVarNDecodeD256G128DpasQ6Config::Kernel>);
+static_assert(cute::is_same_v<
+              KVarNReduceSplitOutputHadamardSpecializedKernel<8, 64>::Params,
+              KVarNReduceSplitOutputHadamardKernel<64>::Params>);
+static_assert(
+    KVarNReduceSplitOutputHadamardSpecializedKernel<8, 64>::SharedStorageSize <
+    KVarNReduceSplitOutputHadamardKernel<64>::SharedStorageSize);
+static_assert(
+    KVarNReduceSplitOutputHadamardSpecializedKernel<32, 64>::
+        SharedStorageSize ==
+    KVarNReduceSplitOutputHadamardKernel<64>::SharedStorageSize);
 static_assert(
     cute::size<0>(KVarNDecodeD256G128DpasQ6Config::Epilogue::TileShapeO{}) ==
     6);
