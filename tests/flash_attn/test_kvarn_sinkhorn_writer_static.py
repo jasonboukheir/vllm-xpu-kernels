@@ -5,6 +5,10 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parents[2]
+ROOT_CMAKE = (REPO_ROOT / "CMakeLists.txt").read_text()
+XE2_ATTN_CMAKE = (
+    REPO_ROOT / "csrc/xpu/attn/xe_2/CMakeLists.txt"
+).read_text()
 WRITER = (
     REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_sinkhorn_writer_xe2.cpp"
 ).read_text()
@@ -15,6 +19,33 @@ REGISTRATION = (REPO_ROOT / "csrc/flash_attn/flash_api.cpp").read_text()
 ESTABLISHED_WRITER = (
     REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_balanced_writer_xe2.cpp"
 ).read_text()
+
+
+def test_only_kvarn_record_writers_use_precise_fp_compilation() -> None:
+    source_list = XE2_ATTN_CMAKE.split(
+        "set(KVARN_PRECISE_FP_SOURCES", maxsplit=1
+    )[1].split(")", maxsplit=1)[0]
+    configured_sources = {
+        line.strip().strip('"').removeprefix("${CMAKE_CURRENT_SOURCE_DIR}/")
+        for line in source_list.splitlines()
+        if line.strip()
+    }
+    assert configured_sources == {
+        "kvarn_sinkhorn_writer_xe2.cpp",
+        "kvarn_balanced_writer_xe2.cpp",
+    }
+    assert (
+        "set_source_files_properties(${KVARN_PRECISE_FP_SOURCES}\n"
+        '                            PROPERTIES COMPILE_OPTIONS "-fp-model=precise")'
+        in XE2_ATTN_CMAKE
+    )
+    assert XE2_ATTN_CMAKE.count("-fp-model=precise") == 1
+
+
+def test_precise_writer_override_preserves_global_o3_policy() -> None:
+    assert '"-O3" "-DNDEBUG"' in ROOT_CMAKE
+    assert "-fp-model=precise" not in ROOT_CMAKE
+    assert "target_compile_options(attn_kernels_xe_2" not in XE2_ATTN_CMAKE
 
 
 def test_fused_writer_keeps_slm_below_xe2_limit() -> None:
