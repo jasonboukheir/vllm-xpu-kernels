@@ -368,9 +368,14 @@ struct KVarNReduceSplitOutputHadamardKernel {
 template <
     bool DpasPacked = false,
     class QPacked = cute::_8,
-    bool VectorPackedLoads = false>
+    bool VectorPackedLoads = false,
+    bool QKInt8U4 = false>
 struct KVarNDecodeD256G128ConfigImpl {
   static_assert(!VectorPackedLoads || DpasPacked);
+  static_assert(!QKInt8U4 || DpasPacked);
+  static_assert(
+      !QKInt8U4 || cute::is_same_v<QPacked, cute::_8>,
+      "integer QK remains isolated from the exact-Q6 experiment");
 
   using Policy = KVarNDecodeD256G128PolicyImpl<QPacked>;
   using TileShapeQK = typename Policy::ShapeQK;
@@ -391,6 +396,16 @@ struct KVarNDecodeD256G128ConfigImpl {
   using MMAOperation = cute::XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, Element>;
   using TiledMMAQK = typename TiledMMAHelper<
       cute::MMA_Atom<MMAOperation>,
+      cute::Layout<TileShapeQK>,
+      SubgroupLayoutQK>::TiledMMA;
+  using MMAOperationQKInt = cute::XE_DPAS_TT<
+      cute::gcd(SGTileQ, 8),
+      std::int32_t,
+      std::int8_t,
+      cute::uint4_t,
+      std::int32_t>;
+  using TiledMMAQKInt = typename TiledMMAHelper<
+      cute::MMA_Atom<MMAOperationQKInt>,
       cute::Layout<TileShapeQK>,
       SubgroupLayoutQK>::TiledMMA;
   using TiledMMAPV = typename TiledMMAHelper<
@@ -414,13 +429,15 @@ struct KVarNDecodeD256G128ConfigImpl {
 
   using Mainloop = cutlass::fmha::collective::KVarNDecodeFwdMainloop<
       TiledMMAQK,
+      TiledMMAQKInt,
       TiledMMAPV,
       VTiles,
       TensorQ,
       TensorK,
       TensorV,
       DpasPacked,
-      VectorPackedLoads>;
+      VectorPackedLoads,
+      QKInt8U4>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -706,6 +723,8 @@ struct KVarNDecodeD256G128ConfigImpl {
 
 using KVarNDecodeD256G128Config = KVarNDecodeD256G128ConfigImpl<false>;
 using KVarNDecodeD256G128DpasConfig = KVarNDecodeD256G128ConfigImpl<true>;
+using KVarNDecodeD256G128DpasQKInt8U4Config =
+    KVarNDecodeD256G128ConfigImpl<true, cute::_8, false, true>;
 using KVarNDecodeD256G128DpasVectorLoadConfig =
     KVarNDecodeD256G128ConfigImpl<true, cute::_8, true>;
 using KVarNDecodeD256G128DpasQ6Config =

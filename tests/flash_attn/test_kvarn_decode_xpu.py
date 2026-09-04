@@ -329,10 +329,15 @@ def test_ragged_batch_matches_independent_fp32_oracle(
 
 
 @pytest.mark.parametrize("record_stride", [35072, 65536])
-@pytest.mark.parametrize("dpas_layout", [False, True])
+@pytest.mark.parametrize(
+    ("dpas_layout", "kernel_variant"),
+    [(False, 0), (True, 0), (True, 1)],
+    ids=["natural-baseline", "dpas-baseline", "dpas-qk-i8u4"],
+)
 def test_nonuniform_kvarn_factors_across_page_boundary(
     record_stride: int,
     dpas_layout: bool,
+    kernel_variant: int,
 ) -> None:
     """Exercise separable K and V factors with no unit-scale shortcuts.
 
@@ -391,7 +396,7 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
         False,
         False,
         0,
-        0,
+        kernel_variant,
         dpas_layout,
     )
     reference = torch.cat(
@@ -407,10 +412,36 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
             for batch in range(3)
         ]
     )
+    tolerance = 6e-2 if kernel_variant == 1 else 3e-2
     torch.testing.assert_close(
-        output.cpu().float(), reference, atol=3e-2, rtol=3e-2
+        output.cpu().float(), reference, atol=tolerance, rtol=tolerance
     )
     assert torch.isfinite(output).all()
+
+
+def test_qk_i8u4_requires_dpas_layout() -> None:
+    cache, _ = make_cache(1)
+    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
+    with pytest.raises(
+        RuntimeError,
+        match="kernel variants 1, 2, 3, and 4 require dpas_layout=True",
+    ):
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            query,
+            cache.xpu(),
+            torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
+            torch.ones((1,), dtype=torch.int32, device="xpu"),
+            torch.full((1,), -1, dtype=torch.int32, device="xpu"),
+            *_tail_tensors(),
+            torch.empty_like(query),
+            1,
+            1.0 / 16.0,
+            False,
+            False,
+            1,
+            1,
+            False,
+        )
 
 
 def test_kvarn_dpas_fragment_coordinate_tables_are_bijections() -> None:
@@ -622,7 +653,7 @@ def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(
         RuntimeError,
-        match="kernel variants 2, 3, and 4 require dpas_layout=True",
+        match="kernel variants 1, 2, 3, and 4 require dpas_layout=True",
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
             query,
@@ -682,7 +713,7 @@ def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
         )
 
 
-@pytest.mark.parametrize("kernel_variant", [1, 5, -1, 6])
+@pytest.mark.parametrize("kernel_variant", [5, -1, 6])
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
@@ -733,7 +764,7 @@ def test_round1_variants_are_dpas_only(kernel_variant: int) -> None:
     )
     with pytest.raises(
         RuntimeError,
-        match="kernel variants 2, 3, and 4 require dpas_layout=True",
+        match="kernel variants 1, 2, 3, and 4 require dpas_layout=True",
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(*arguments)
 
@@ -1460,6 +1491,10 @@ _LONG_CONTEXT_LAYOUT_SPLITS = (
     ]
     + [
         pytest.param(True, splits, 0, id=f"dpas-split{splits}")
+        for splits in (1, 16, 24, 32)
+    ]
+    + [
+        pytest.param(True, splits, 1, id=f"dpas-qk-i8u4-split{splits}")
         for splits in (1, 16, 24, 32)
     ]
     + [

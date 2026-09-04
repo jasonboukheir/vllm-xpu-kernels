@@ -309,13 +309,15 @@ struct KVarNK4V4FragmentLoader {
  */
 template <
     class TiledMMAQK_,
+    class TiledMMAQKInt_,
     class TiledMMAPV_,
     int VTiles_,
     class TensorQ_,
     class TensorK_,
     class TensorV_,
     bool DpasPacked_ = false,
-    bool VectorPackedLoads_ = false>
+    bool VectorPackedLoads_ = false,
+    bool QKInt8U4_ = false>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -364,6 +366,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   using typename Base::TiledMMAQK;
   using typename Base::TileShapePV;
   using typename Base::TileShapeQK;
+  using TiledMMAQKInt = TiledMMAQKInt_;
 
   static constexpr int VTiles = VTiles_;
   static constexpr bool PagedKV = true;
@@ -508,45 +511,129 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                    : nullptr;
       clear(tSrS);
       float k_zp_bias[8] = {};
-      CUTLASS_PRAGMA_UNROLL
-      for (int d_tile = 0; d_tile < 256; d_tile += 64) {
-        copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
-        reorder(tQrQ, tSrQ);
-        using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
-        static_assert(KDimFragment{}.size() == 4);
-        KDimFragment k_dim_scale;
+      if constexpr (QKInt8U4_) {
         if (slot < 0) {
-          int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
-                               .get_local_id()[0];
-          KDimFragment k_dim_zp;
+          // Variant 1 keeps the PV path and cache ABI unchanged. Only packed
+          // QK uses signed-int8 x unsigned-int4 DPAS. Quantize each 64-wide Q
+          // slice independently so its scale can be folded back into the
+          // corresponding integer accumulator before the four slices sum.
+          TiledMMAQKInt mma_qk_int{};
+          auto thr_mma_qk_int = mma_qk_int.get_slice(thr_id);
+          auto tIrQ = thr_mma_qk_int.partition_sg_fragment_A(gQ(_, _, 0));
+          auto tIrK = thr_mma_qk_int.partition_sg_fragment_B(cK);
+          auto tIrS = thr_mma_qk_int.partition_sg_fragment_C(cP);
+          auto tQrQInt8 = make_subgroup_tensor(
+              make_tensor<std::int8_t>(tSrQ.layout()), tSrQ.tv_layout());
+          auto tSrSPartial = make_subgroup_tensor(
+              make_tensor<float>(tSrS.layout()), tSrS.tv_layout());
+
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < k_dim_scale.size(); ++i) {
-            int const dim = d_tile + lane + i * intel::sg_size;
-            k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.k_s_col_offset + 2 * dim);
-            k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.k_zp_offset + 2 * dim);
+          for (int d_tile = 0; d_tile < 256; d_tile += 64) {
+            copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
+            reorder(tQrQ, tSrQ);
+            using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
+            static_assert(KDimFragment{}.size() == 4);
+            KDimFragment k_dim_scale;
+            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                                 .get_local_id()[0];
+            KDimFragment k_dim_zp;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < k_dim_scale.size(); ++i) {
+              int const dim = d_tile + lane + i * intel::sg_size;
+              k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_s_col_offset + 2 * dim);
+              k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_zp_offset + 2 * dim);
+            }
+
+            float q_amax = 0.0f;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrQ.size(); ++i) {
+              auto coord = tSrQ.tv_layout()(lane, i);
+              int const query_row = int(get<0>(coord));
+              float const query_value = static_cast<float>(tSrQ(i));
+              float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
+              k_zp_bias[query_row] += query_value * dim_zp;
+              float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
+              float const scaled_query = query_value * dim_scale;
+              tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
+                  scaled_query);
+              q_amax = sycl::fmax(q_amax, sycl::fabs(scaled_query));
+            }
+
+            auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+            q_amax = sycl::reduce_over_group(
+                subgroup, q_amax, sycl::maximum<float>());
+            float const q_scale = q_amax > 0.0f ? q_amax / 127.0f : 1.0f;
+            float const q_inv_scale = 1.0f / q_scale;
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrQ.size(); ++i) {
+              float const quantized =
+                  sycl::rint(static_cast<float>(tSrQ(i)) * q_inv_scale);
+              tQrQInt8(i) = static_cast<std::int8_t>(
+                  sycl::clamp(quantized, -127.0f, 127.0f));
+            }
+            reorder(tQrQInt8, tIrQ);
+            loader.fill_k_fragment(
+                tIrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+            clear(tIrS);
+            cute::gemm(mma_qk_int, tIrQ, tIrK, tIrS);
+            reorder(tIrS, tSrSPartial);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); ++i) {
+              tSrS(i) += tSrSPartial(i) * q_scale;
+            }
           }
+        } else {
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrQ.size(); ++i) {
-            auto coord = tSrQ.tv_layout()(lane, i);
-            int const query_row = int(get<0>(coord));
-            float const query_value = static_cast<float>(tSrQ(i));
-            float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
-            k_zp_bias[query_row] += query_value * dim_zp;
-            // The column scale is constant across all 128 tokens in this
-            // KVarN page.  Apply it to the much smaller Q fragment instead of
-            // scaling every unpacked K element.  This is the same bilinear
-            // product, while also avoiding a cross-lane select for each K
-            // fragment element.
-            float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
-            tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
-                query_value * dim_scale);
+          for (int d_tile = 0; d_tile < 256; d_tile += 64) {
+            copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
+            reorder(tQrQ, tSrQ);
+            loader.fill_k_fragment(
+                tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+            cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
           }
         }
-        loader.fill_k_fragment(
-            tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int d_tile = 0; d_tile < 256; d_tile += 64) {
+          copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
+          reorder(tQrQ, tSrQ);
+          using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
+          static_assert(KDimFragment{}.size() == 4);
+          KDimFragment k_dim_scale;
+          if (slot < 0) {
+            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
+                                 .get_local_id()[0];
+            KDimFragment k_dim_zp;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < k_dim_scale.size(); ++i) {
+              int const dim = d_tile + lane + i * intel::sg_size;
+              k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_s_col_offset + 2 * dim);
+              k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                  rec + params.kvarn.k_zp_offset + 2 * dim);
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrQ.size(); ++i) {
+              auto coord = tSrQ.tv_layout()(lane, i);
+              int const query_row = int(get<0>(coord));
+              float const query_value = static_cast<float>(tSrQ(i));
+              float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
+              k_zp_bias[query_row] += query_value * dim_zp;
+              // The column scale is constant across all 128 tokens in this
+              // KVarN page. Apply it to the much smaller Q fragment instead of
+              // scaling every unpacked K element.
+              float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
+              tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
+                  query_value * dim_scale);
+            }
+          }
+          loader.fill_k_fragment(
+              tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        }
       }
 
       if (slot < 0) {
