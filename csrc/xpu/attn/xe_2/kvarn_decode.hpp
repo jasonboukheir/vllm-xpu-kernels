@@ -488,18 +488,12 @@ struct KVarNReduceSplitOutputHadamardSpecializedKernel {
  * zero's release RMW. The last RMW acquires the preceding release sequence,
  * making every partial and LSE visible before reduction. No producer spins;
  * non-last workgroups return immediately.
- *
- * ID19 is intentionally restricted to the explicit short-context bucket
- * below. The 8192-token bound keeps a 4096-token prompt plus the 512-token
- * decode benchmark on the same producer/finalizer path, while longer inputs
- * fail closed to the ID18 producer and reducer.
  */
 struct KVarNB1ShortLastProducerFinalizer {
   using Element = cutlass::half_t;
 
   static constexpr int kThreads = 64;
   static constexpr int kMaxSplits = 32;
-  static constexpr int kMaxShortContextSeqLen = 8192;
   static constexpr int kQueryHeadsPerKV = 6;
   static constexpr int kHeadDim = KVarNDecodeD256G128Policy::HeadDim;
   static constexpr int kKVHeads = KVarNDecodeD256G128Policy::NumKVHeads;
@@ -872,9 +866,7 @@ struct KVarNDecodeD256G128ConfigImpl {
       return cutlass::Status::kErrorInvalidProblem;
     }
     if constexpr (LastProducerFinalizer) {
-      if (args.batch_size != 1 ||
-          args.max_seq_len >
-              KVarNB1ShortLastProducerFinalizer::kMaxShortContextSeqLen ||
+      if (args.batch_size != 1 || args.max_seq_len > 4096 ||
           args.num_kv_splits <= 1 || !args.unrotate_output ||
           args.completion_state == nullptr) {
         return cutlass::Status::kErrorInvalidProblem;
