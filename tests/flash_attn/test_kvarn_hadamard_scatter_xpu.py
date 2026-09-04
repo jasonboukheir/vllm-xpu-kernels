@@ -13,6 +13,20 @@ def _hadamard_256(device: str = "cpu") -> torch.Tensor:
     return (h / math.sqrt(256)).to(device)
 
 
+def _fwht_256(values: torch.Tensor) -> torch.Tensor:
+    """Independent O(D log D) reference for realistic prefill row counts."""
+    output = values.float().clone()
+    width = 1
+    while width < 256:
+        pairs = output.reshape(*output.shape[:-1], -1, width * 2)
+        left = pairs[..., :width].clone()
+        right = pairs[..., width:].clone()
+        pairs[..., :width] = left + right
+        pairs[..., width:] = left - right
+        width *= 2
+    return output / math.sqrt(256)
+
+
 def _load_op() -> None:
     library = os.environ.get("VLLM_XPU_KERNELS_LIBRARY")
     if library:
@@ -74,6 +88,42 @@ def test_kvarn_hadamard_scatter_matches_fp32(dtype, tokens):
             atol=2e-2,
             rtol=2e-2,
         )
+
+
+def test_kvarn_hadamard_scatter_realistic_4k_prefill_grid():
+    """Exercise the multi-workgroup launch used by a full 4K prefill chunk."""
+    _load_op()
+    tokens = 4096
+    generator = torch.Generator().manual_seed(20260904)
+    key_cpu = torch.randn(tokens, 4, 256, generator=generator).bfloat16()
+    value_cpu = torch.randn(tokens, 4, 256, generator=generator).bfloat16()
+    slots_cpu = torch.arange(tokens, dtype=torch.int64)
+    blocks = tokens // 128
+    block_to_slot_cpu = torch.arange(blocks, dtype=torch.int32).flip(0)
+    tail_key = torch.full(
+        (blocks, 128, 4, 256), -123.0, dtype=torch.float16, device="xpu"
+    )
+    tail_value = torch.full_like(tail_key, -123.0)
+
+    torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+        key_cpu.to("xpu"),
+        value_cpu.to("xpu"),
+        slots_cpu.to("xpu"),
+        block_to_slot_cpu.to("xpu"),
+        tail_key,
+        tail_value,
+        128,
+        False,
+    )
+    torch.xpu.synchronize()
+
+    key_ref = _fwht_256(key_cpu).half().reshape(blocks, 128, 4, 256)
+    value_ref = _fwht_256(value_cpu).half().reshape(blocks, 128, 4, 256)
+    logical_to_physical = block_to_slot_cpu.long()
+    actual_key = tail_key.cpu().index_select(0, logical_to_physical)
+    actual_value = tail_value.cpu().index_select(0, logical_to_physical)
+    torch.testing.assert_close(actual_key, key_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_value, value_ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
