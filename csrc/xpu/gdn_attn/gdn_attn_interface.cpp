@@ -452,12 +452,20 @@ std::vector<torch::Tensor> causal_conv1d_non_spec(
         {num_v_heads / tp_size, non_spec_token + padding_size},
         torch::dtype(torch::kFloat32).device(device).requires_grad(false));
 
+    // The SLM-tiled prefill kernel is disabled for correctness. It has produced
+    // corrupted q/k/v for prefills of at least one tile on Arc B70 with oneAPI
+    // 2026.0, even after its work-group metadata broadcast was replaced with
+    // per-work-item recomputation. Keep the dispatch explicit so it can be
+    // re-enabled only after a device-level determinism regression passes.
+    constexpr bool enable_tiled_prefill = false;
+
     // Determine whether fused l2norm is valid for the chosen conv1d path.
     // Tiled kernel: only valid when all Q+K features fit in a single
     // feature chunk, i.e. 2 * head_k_dim <= feats_per_wg (256).
     // Untiled kernel: always valid (entire QKV in one WG).
     constexpr int tiled_feats_per_wg = 256;  // wg_size(64) * elems_per_item(4)
-    const bool use_tiled = (non_spec_token >= gdn::conv1d_tile_size);
+    const bool use_tiled =
+        enable_tiled_prefill && non_spec_token >= gdn::conv1d_tile_size;
     const bool fuse_l2norm =
         use_tiled ? (2 * head_k_dim <= tiled_feats_per_wg) : true;
 
@@ -792,7 +800,8 @@ void gdn_attention(
     const std::optional<torch::Tensor>& num_accepted_tokens,
     const int64_t num_actual_tokens,
     const int64_t tp_size,
-    const bool reorder_input) {
+    const bool reorder_input,
+    const bool split_mixed_non_spec) {
   // Determine which paths are active using the same conditions the conv/delta
   // ops use internally.
   int non_spec_token = 0;
@@ -807,6 +816,27 @@ void gdn_attention(
   }
   const bool spec_active = spec_token > 0;
   const bool non_spec_active = non_spec_token > 0;
+
+  if (split_mixed_non_spec) {
+    TORCH_CHECK(
+        num_prefills > 0 && num_decodes > 0,
+        "split_mixed_non_spec requires both decodes and prefills");
+    TORCH_CHECK(
+        num_spec_decodes == 0,
+        "split_mixed_non_spec does not support speculative decodes");
+    TORCH_CHECK(
+        !non_spec_token_indx.has_value(),
+        "split_mixed_non_spec requires contiguous decode-first token packing");
+    TORCH_CHECK(
+        non_spec_query_start_loc.has_value(),
+        "split_mixed_non_spec requires non-spec query-start metadata");
+    TORCH_CHECK(
+        non_spec_state_indices_tensor.has_value(),
+        "split_mixed_non_spec requires non-spec state-index metadata");
+    TORCH_CHECK(
+        has_initial_state.has_value(),
+        "split_mixed_non_spec requires per-request initial-state metadata");
+  }
 
   if (spec_active) {
     std::vector<torch::Tensor> intermediates = causal_conv1d_spec(
@@ -856,6 +886,143 @@ void gdn_attention(
   }
 
   if (non_spec_active) {
+#ifdef VLLM_XPU_ENABLE_XE2
+    if (split_mixed_non_spec) {
+      // Production packs one-token decodes before prefills. Keep cached
+      // decodes on the native route used by decode-only calls; otherwise the
+      // presence of any prefill moves them onto the XE2 chunk arithmetic path.
+      // Optional token indexing belongs to the spec-mixed path, where vLLM
+      // reclassifies non-spec decodes as prefills; leave that path unchanged.
+      const int64_t num_decode_tokens = num_decodes;
+      const int64_t num_prefill_tokens = non_spec_token - num_decode_tokens;
+      TORCH_CHECK(
+          num_prefill_tokens > 0,
+          "mixed non-spec GDN dispatch requires at least one prefill token");
+
+      torch::Tensor decode_core_attn_out =
+          core_attn_out.narrow(0, 0, num_decode_tokens);
+      torch::Tensor decode_z = z.narrow(0, 0, num_decode_tokens);
+      torch::Tensor decode_projected_states_qkvz =
+          projected_states_qkvz.narrow(0, 0, num_decode_tokens);
+      torch::Tensor decode_projected_states_ba =
+          projected_states_ba.narrow(0, 0, num_decode_tokens);
+      torch::Tensor prefill_core_attn_out =
+          core_attn_out.narrow(0, num_decode_tokens, num_prefill_tokens);
+      torch::Tensor prefill_z =
+          z.narrow(0, num_decode_tokens, num_prefill_tokens);
+      torch::Tensor prefill_projected_states_qkvz =
+          projected_states_qkvz.narrow(
+              0, num_decode_tokens, num_prefill_tokens);
+      torch::Tensor prefill_projected_states_ba =
+          projected_states_ba.narrow(0, num_decode_tokens, num_prefill_tokens);
+
+      torch::Tensor decode_query_start_loc =
+          non_spec_query_start_loc->narrow(0, 0, num_decodes + 1);
+      torch::Tensor prefill_query_start_loc =
+          non_spec_query_start_loc->narrow(0, num_decodes, num_prefills + 1)
+              .sub(num_decode_tokens);
+      torch::Tensor decode_state_indices =
+          non_spec_state_indices_tensor->narrow(0, 0, num_decodes);
+      torch::Tensor prefill_state_indices =
+          non_spec_state_indices_tensor->narrow(0, num_decodes, num_prefills);
+
+      std::optional<torch::Tensor> decode_has_initial_state = std::nullopt;
+      std::optional<torch::Tensor> prefill_has_initial_state = std::nullopt;
+      if (has_initial_state.has_value()) {
+        decode_has_initial_state = has_initial_state->narrow(0, 0, num_decodes);
+        prefill_has_initial_state =
+            has_initial_state->narrow(0, num_decodes, num_prefills);
+      }
+
+      auto run_non_spec_group =
+          [&](torch::Tensor& group_core_attn_out,
+              torch::Tensor& group_z,
+              const torch::Tensor& group_qkvz,
+              const torch::Tensor& group_ba,
+              const int64_t group_num_prefills,
+              const int64_t group_num_decodes,
+              const std::optional<torch::Tensor>& group_has_initial_state,
+              const torch::Tensor& group_query_start_loc,
+              const torch::Tensor& group_state_indices,
+              const int64_t group_num_actual_tokens) {
+            std::vector<torch::Tensor> intermediates = causal_conv1d_non_spec(
+                group_z,
+                group_qkvz,
+                group_ba,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                activation,
+                group_num_prefills,
+                group_num_decodes,
+                /*num_spec_decodes=*/0,
+                group_has_initial_state,
+                group_query_start_loc,
+                /*non_spec_token_indx=*/std::nullopt,
+                group_state_indices,
+                group_num_actual_tokens,
+                tp_size,
+                reorder_input);
+
+            gated_delta_rule_non_spec(
+                group_core_attn_out,
+                intermediates[0],
+                intermediates[1],
+                intermediates[2],
+                intermediates[3],
+                intermediates[4],
+                num_v_heads,
+                head_v_dim,
+                A_log,
+                dt_bias,
+                ssm_state,
+                group_num_prefills,
+                group_num_decodes,
+                /*num_spec_decodes=*/0,
+                group_has_initial_state,
+                group_query_start_loc,
+                /*non_spec_token_indx=*/std::nullopt,
+                group_state_indices,
+                group_num_actual_tokens,
+                tp_size);
+            return intermediates;
+          };
+
+      // Keep both intermediate sets live until every mixed-call kernel has
+      // been enqueued. The XPU caching allocator then records their release on
+      // the current queue instead of making decode storage immediately
+      // available to the following prefill chain.
+      std::vector<torch::Tensor> decode_intermediates = run_non_spec_group(
+          decode_core_attn_out,
+          decode_z,
+          decode_projected_states_qkvz,
+          decode_projected_states_ba,
+          /*group_num_prefills=*/0,
+          /*group_num_decodes=*/num_decodes,
+          decode_has_initial_state,
+          decode_query_start_loc,
+          decode_state_indices,
+          num_decode_tokens);
+      std::vector<torch::Tensor> prefill_intermediates = run_non_spec_group(
+          prefill_core_attn_out,
+          prefill_z,
+          prefill_projected_states_qkvz,
+          prefill_projected_states_ba,
+          /*group_num_prefills=*/num_prefills,
+          /*group_num_decodes=*/0,
+          prefill_has_initial_state,
+          prefill_query_start_loc,
+          prefill_state_indices,
+          num_prefill_tokens);
+      (void)decode_intermediates;
+      (void)prefill_intermediates;
+      return;
+    }
+#endif
     std::vector<torch::Tensor> intermediates = causal_conv1d_non_spec(
         z,
         projected_states_qkvz,
