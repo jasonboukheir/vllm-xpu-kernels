@@ -255,7 +255,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor? non_spec_state_indices_tensor, Tensor? spec_query_start_loc, "
       "Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, Tensor? "
       "num_accepted_tokens, int num_actual_tokens, int "
-      "tp_size, bool reorder_input) -> ()");
+      "tp_size, bool reorder_input, bool split_mixed_non_spec=False) -> ()");
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
 #endif
 

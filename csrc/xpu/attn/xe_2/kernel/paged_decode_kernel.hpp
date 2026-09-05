@@ -350,6 +350,27 @@ class XeFMHAFwdSplitKVKernel {
           make_shape(head_group_q, num_kv_splits, s.num_heads_kv, batch_dim);
       auto shape_sink = make_shape(s.num_heads_kv, head_group_q);
 
+      // KVarN's fixed grid can schedule a split that is empty for a shorter
+      // row. Publish an invalid natural-LSE sentinel from the workgroup
+      // before any row-local scheduling branch can skip an empty split. The
+      // same row work-item overwrites these values in the epilogue for a
+      // non-empty split, so this needs neither another kernel launch nor a
+      // workgroup barrier. Partial output may remain untouched: reducers must
+      // not read it unless the corresponding LSE exceeds the sentinel.
+      if constexpr (CollectiveMainloop::InitializeSplitScratchSentinels) {
+        constexpr int q_tile_rows = cute::size<0>(TileShapeO{});
+        int const q_row = blk_q * q_tile_rows + thr_id;
+        if (num_kv_splits > 1 && q_row < head_group_q) {
+          int const query_head = head * head_group_q + q_row;
+          int const stats_batch = is_var_len ? 0 : idx_b;
+          int const packed_stats_offset =
+              (stats_batch * s.num_heads_q + query_head) * num_kv_splits +
+              idx_kv_split;
+          p.softmax_lse_accum[offset_softmax_lse_accum + packed_stats_offset] =
+              cutlass::platform::numeric_limits<ElementLSE>::lowest();
+        }
+      }
+
       int kv_split_offset;
       int num_effective_kv_blocks;
       int seq_num_kv_splits;

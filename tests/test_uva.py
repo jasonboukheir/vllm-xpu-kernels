@@ -158,4 +158,3 @@ def test_non_contiguous_strided_view(device, pinned):
 
     # Correctness check: values match original transposed CPU tensor
     assert torch.equal(xpu_view.cpu(), cpu_view)
-
