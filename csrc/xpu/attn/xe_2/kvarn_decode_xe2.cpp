@@ -27,58 +27,8 @@ constexpr int kRecordBytes = kVZpOffset + kGroup * 2;
 constexpr std::uintptr_t kDpasKVectorAlignment = 32;
 constexpr int64_t kDpasVVectorAlignment = 16;
 
-enum class KVarNNativeKernelVariant : int64_t {
-  kQ8Scalar = 0,
-  kQkI8U4 = 1,
-  kQ6Scalar = 2,
-  kQ8VectorLoad = 3,
-  kQ6VectorLoad = 4,
-  kPage128 = 5,
-  kQ6CachedWeights = 6,
-  kQ6ExactRows = 7,
-  kQ6CachedWeightsExactRows = 8,
-  kQ6PagePair = 9,
-  kQ6MainGrf128 = 10,
-  kQ6SplitReducerSpecialized = 11,
-  kQ6NextPagePrefetch = 12,
-  kQ6NextPagePrefetchSplitReducer = 13,
-  kQ6SimdUnpack = 14,
-  kQ6BlockOutputStore = 15,
-  kQ6CurrentHalfVPrefetch = 16,
-  kQ6PageRecordCursor = 17,
-  kQ6PrefetchRecordCursor = 18,
-  kQ6PageMetadataCursor = 20,
-  kQ6PairedNibbleHalf2 = 21,
-};
-
-static_assert(static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair) == 9);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128) == 10);
-static_assert(
-    static_cast<int64_t>(
-        KVarNNativeKernelVariant::kQ6SplitReducerSpecialized) == 11);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6NextPagePrefetch) == 12);
-static_assert(
-    static_cast<int64_t>(
-        KVarNNativeKernelVariant::kQ6NextPagePrefetchSplitReducer) == 13);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) == 14);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore) == 15);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch) ==
-    16);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor) == 17);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PrefetchRecordCursor) ==
-    18);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor) ==
-    20);
-static_assert(
-    static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2) == 21);
+// Retain the qualified decoder's numeric ABI for paired vLLM releases.
+constexpr int64_t kKVarNDecodeKernel = 18;
 
 using KVarNDpasPrefetchLoader =
     cutlass::fmha::collective::KVarNK4V4FragmentLoader<true>;
@@ -87,27 +37,7 @@ static_assert(kVPackedOffset % kDpasVVectorAlignment == 0);
 static_assert(kRecordBytes % kDpasKVectorAlignment == 0);
 static_assert(kRecordBytes == KVarNDpasPrefetchLoader::kActiveRecordBytes);
 
-void check_dpas_vector_load_alignment(const at::Tensor& packed_cache) {
-  auto const address = reinterpret_cast<std::uintptr_t>(
-      packed_cache.const_data_ptr<std::uint8_t>());
-  TORCH_CHECK(
-      address % kDpasKVectorAlignment == 0,
-      "DPAS vector-load kernel variant requires a 32-byte-aligned "
-      "packed_cache base");
-  TORCH_CHECK(
-      packed_cache.stride(0) % kDpasKVectorAlignment == 0 &&
-          packed_cache.stride(1) % kDpasKVectorAlignment == 0,
-      "DPAS vector-load kernel variant requires 32-byte-aligned packed_cache "
-      "block and head strides");
-}
-
-bool is_q6_page_pair_variant(int64_t kernel_variant) {
-  return kernel_variant ==
-         static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PagePair);
-}
-
-int validated_split_count(
-    int64_t max_seq_len, int64_t requested_splits, bool page_pair = false) {
+int validated_split_count(int64_t max_seq_len, int64_t requested_splits) {
   // Zero retains source compatibility for direct extension callers. vLLM's
   // native path always passes the initialization-time policy result.
   int64_t const splits = requested_splits == 0 ? 16 : requested_splits;
@@ -115,13 +45,8 @@ int validated_split_count(
       splits == 1 || splits == 2 || splits == 4 || splits == 8 ||
           splits == 16 || splits == 17 || splits == 24 || splits == 32,
       "num_kv_splits must be one of 1, 2, 4, 8, 16, 17, 24, or 32");
-  // Do not launch more splits than the maximum sequence has work units.
-  // q6_page_pair deliberately schedules one 128-token page per unit while
-  // all established variants schedule K64 tiles. Apart from wasting work,
-  // empty split partials amplify reduction drift over many short-context
-  // model layers. The one-split direct-output path is both faster and more
-  // accurate in this regime.
-  int64_t const work_unit_tokens = page_pair ? kGroup : 64;
+  // Empty split partials amplify rounding drift at short contexts.
+  constexpr int64_t work_unit_tokens = 64;
   int64_t const kv_tiles =
       (max_seq_len + work_unit_tokens - 1) / work_unit_tokens;
   if (splits > 1 && kv_tiles < splits) return 1;
@@ -138,7 +63,7 @@ std::tuple<at::Tensor, at::Tensor>
 kvarn_fragment_coords_xe2(const at::Tensor& device_anchor) {
   TORCH_CHECK(device_anchor.is_xpu(), "device_anchor must be on XPU");
 
-  using Config = KVarNDecodeD256G128Config;
+  using Config = KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig;
   Config::TiledMMAQK mma_qk{};
   Config::TiledMMAPV mma_pv{};
   auto qk_slice = mma_qk.get_slice(0);
@@ -313,129 +238,10 @@ void kvarn_decode_with_scratch_xe2(
   TORCH_CHECK(
       std::isfinite(softmax_scale) && softmax_scale > 0.0,
       "softmax_scale must be finite and positive");
-  bool const use_q6 =
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6Scalar) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CachedWeights) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6ExactRows) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows) ||
-      is_q6_page_pair_variant(kernel_variant) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6SplitReducerSpecialized) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6NextPagePrefetch) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6NextPagePrefetchSplitReducer) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6PrefetchRecordCursor) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2);
-  bool const use_dpas_vector_load =
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ8VectorLoad) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6VectorLoad) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack) ||
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2);
-  bool const use_qk_i8u4 =
-      kernel_variant == static_cast<int64_t>(KVarNNativeKernelVariant::kQkI8U4);
-  bool const use_q6_cached_weights =
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CachedWeights) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
-  bool const use_q6_exact_rows =
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6ExactRows) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6CachedWeightsExactRows);
-  bool const use_q6_page_pair = is_q6_page_pair_variant(kernel_variant);
-  bool const use_q6_main_grf128 =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6MainGrf128);
-  bool const use_q6_split_reducer_specialized =
-      kernel_variant ==
-      static_cast<int64_t>(
-          KVarNNativeKernelVariant::kQ6SplitReducerSpecialized);
-  bool const use_q6_next_page_prefetch =
-      kernel_variant ==
-          static_cast<int64_t>(KVarNNativeKernelVariant::kQ6NextPagePrefetch) ||
-      kernel_variant ==
-          static_cast<int64_t>(
-              KVarNNativeKernelVariant::kQ6NextPagePrefetchSplitReducer);
-  bool const use_q6_next_page_prefetch_split_reducer =
-      kernel_variant ==
-      static_cast<int64_t>(
-          KVarNNativeKernelVariant::kQ6NextPagePrefetchSplitReducer);
-  bool const use_q6_simd_unpack =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6SimdUnpack);
-  bool const use_q6_block_output_store =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6BlockOutputStore);
-  bool const use_q6_current_half_v_prefetch =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6CurrentHalfVPrefetch);
-  bool const use_q6_page_record_cursor =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageRecordCursor);
-  bool const use_q6_prefetch_record_cursor =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PrefetchRecordCursor);
-  bool const use_q6_page_metadata_cursor =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PageMetadataCursor);
-  bool const use_q6_paired_nibble_half2 =
-      kernel_variant ==
-      static_cast<int64_t>(KVarNNativeKernelVariant::kQ6PairedNibbleHalf2);
   TORCH_CHECK(
-      kernel_variant ==
-              static_cast<int64_t>(KVarNNativeKernelVariant::kQ8Scalar) ||
-          use_q6 || use_dpas_vector_load || use_qk_i8u4,
-      "unsupported native KVarN kernel_variant ",
-      kernel_variant,
-      "; implemented variants are 0 (q8 scalar), 1 (integer QK), 2 (q6 "
-      "scalar), 3 (q8 vector load), 4 (q6 vector load), 6 (q6 cached "
-      "weights), 7 (q6 exact rows), 8 (q6 cached weights + exact rows), 9 "
-      "(q6_page_pair), 10 (q6_main_grf128), 11 "
-      "(q6_split_reducer_specialized), 12 (q6_next_page_prefetch), 13 "
-      "(q6_next_page_prefetch_split_reducer), 14 (q6_simd_unpack), and 15 "
-      "(q6_block_output_store), 16 (q6_current_half_v_prefetch), and 17 "
-      "(q6_page_record_cursor), 18 (q6_prefetch_record_cursor), and 20 "
-      "(q6_page_metadata_cursor), and 21 (q6_paired_nibble_half2)");
-  TORCH_CHECK(
-      (!use_q6 && !use_dpas_vector_load && !use_qk_i8u4) || dpas_layout,
-      "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
-      "16, 17, 18, 20, and 21 "
-      "require "
-      "dpas_layout=True");
-  if (use_dpas_vector_load) check_dpas_vector_load_alignment(packed_cache);
+      kernel_variant == kKVarNDecodeKernel,
+      "only the qualified KVarN decoder (18) is supported");
+  TORCH_CHECK(dpas_layout, "native KVarN decode requires xe2_dpas layout");
 
   cutlass::fmha::collective::KVarNK4V4Layout layout{
       static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
@@ -450,8 +256,8 @@ void kvarn_decode_with_scratch_xe2(
       kVSColOffset,
       kVSRowOffset,
       kVZpOffset};
-  int const num_kv_splits = validated_split_count(
-      max_seq_len, requested_num_kv_splits, use_q6_page_pair);
+  int const num_kv_splits =
+      validated_split_count(max_seq_len, requested_num_kv_splits);
   TORCH_CHECK(
       !unrotate_output || num_kv_splits > 1,
       "unrotate_output requires a multi-split KVarN decode");
@@ -517,49 +323,7 @@ void kvarn_decode_with_scratch_xe2(
   args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   auto status =
-      use_qk_i8u4 ? KVarNDecodeD256G128DpasQKInt8U4Config::run(queue, args)
-      : use_q6_page_metadata_cursor
-          ? KVarNDecodeD256G128DpasQ6PageMetadataCursorConfig::run(queue, args)
-      : use_q6_paired_nibble_half2
-          ? KVarNDecodeD256G128DpasQ6PairedNibbleHalf2Config::run(queue, args)
-      : use_q6_prefetch_record_cursor
-          ? KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(
-                queue, args)
-      : use_q6_page_record_cursor
-          ? KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::run(queue, args)
-      : use_q6_current_half_v_prefetch
-          ? KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::run(
-                queue, args)
-      : use_q6_next_page_prefetch_split_reducer
-          ? KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::run(
-                queue, args)
-      : use_q6_split_reducer_specialized
-          ? KVarNDecodeD256G128DpasQ6SplitReducerSpecializedConfig::run(
-                queue, args)
-      : use_q6_next_page_prefetch
-          ? KVarNDecodeD256G128DpasQ6NextPagePrefetchConfig::run(queue, args)
-      : use_q6_simd_unpack
-          ? KVarNDecodeD256G128DpasQ6SimdUnpackConfig::run(queue, args)
-      : use_q6_block_output_store
-          ? KVarNDecodeD256G128DpasQ6BlockOutputStoreConfig::run(queue, args)
-      : use_q6 && use_dpas_vector_load
-          ? KVarNDecodeD256G128DpasQ6VectorLoadConfig::run(queue, args)
-      : use_q6_page_pair
-          ? KVarNDecodeD256G128DpasQ6PagePairConfig::run(queue, args)
-      : use_q6_cached_weights && use_q6_exact_rows
-          ? KVarNDecodeD256G128DpasQ6CachedWeightsExactRowsConfig::run(
-                queue, args)
-      : use_q6_cached_weights
-          ? KVarNDecodeD256G128DpasQ6CachedWeightsConfig::run(queue, args)
-      : use_q6_exact_rows
-          ? KVarNDecodeD256G128DpasQ6ExactRowsConfig::run(queue, args)
-      : use_q6_main_grf128
-          ? KVarNDecodeD256G128DpasQ6MainGrf128Config::run(queue, args)
-      : use_q6 ? KVarNDecodeD256G128DpasQ6Config::run(queue, args)
-      : use_dpas_vector_load
-          ? KVarNDecodeD256G128DpasVectorLoadConfig::run(queue, args)
-      : dpas_layout ? KVarNDecodeD256G128DpasConfig::run(queue, args)
-                    : KVarNDecodeD256G128Config::run(queue, args);
+      KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(queue, args);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
       "native KVarN decode rejected the validated problem");
@@ -581,10 +345,8 @@ void kvarn_decode_xe2(
     int64_t requested_num_kv_splits,
     int64_t kernel_variant,
     bool dpas_layout) {
-  int const num_kv_splits = validated_split_count(
-      max_seq_len,
-      requested_num_kv_splits,
-      is_q6_page_pair_variant(kernel_variant));
+  int const num_kv_splits =
+      validated_split_count(max_seq_len, requested_num_kv_splits);
   int64_t const batch = query.size(0);
   auto temp_output = at::empty(
       {batch, kQueryHeads * num_kv_splits, kHeadDim}, query.options());

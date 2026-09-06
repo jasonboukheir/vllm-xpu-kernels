@@ -12,6 +12,38 @@ from benchmark.kvarn_utils import (KVarNLayout, _k_dpas_coord,  # noqa: E402
                                    pack_dpas_k4v4, unpack_dpas_k4v4)
 
 
+def _scalar_pack_dpas_k4v4(
+    q_k: torch.Tensor, q_v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Original scalar prototype retained only as a byte-exact test oracle."""
+    k_slots = torch.empty((2, 4, 4, 16, 64), dtype=torch.uint8)
+    v_slots = torch.empty((2, 8, 4, 16, 32), dtype=torch.uint8)
+    for half in range(2):
+        for tile in range(4):
+            for subgroup in range(4):
+                for lane in range(16):
+                    for slot in range(64):
+                        token, dim = _k_dpas_coord(lane, slot)
+                        k_slots[half, tile, subgroup, lane, slot] = q_k[
+                            tile * 64 + dim,
+                            half * 64 + subgroup * 16 + token,
+                        ]
+    for half in range(2):
+        for tile in range(8):
+            for subgroup in range(4):
+                for lane in range(16):
+                    for slot in range(32):
+                        dim, token = _v_dpas_coord(lane, slot)
+                        v_slots[half, tile, subgroup, lane, slot] = q_v[
+                            half * 64 + subgroup * 16 + token,
+                            tile * 32 + dim,
+                        ]
+    return (
+        (k_slots[..., 0::2] | (k_slots[..., 1::2] << 4)).flatten(),
+        (v_slots[..., 0::2] | (v_slots[..., 1::2] << 4)).flatten(),
+    )
+
+
 def _canonical_record(q_k: torch.Tensor, q_v: torch.Tensor) -> torch.Tensor:
     layout = KVarNLayout()
     record = torch.zeros(layout.tile_bytes_aligned, dtype=torch.uint8)
@@ -63,6 +95,9 @@ def test_dpas_pack_roundtrip_random_and_all_nibbles() -> None:
     q_v[:16, :] = torch.arange(16, dtype=torch.uint8)[:, None]
 
     k_packed, v_packed = pack_dpas_k4v4(q_k, q_v)
+    scalar_k, scalar_v = _scalar_pack_dpas_k4v4(q_k, q_v)
+    torch.testing.assert_close(k_packed, scalar_k, rtol=0, atol=0)
+    torch.testing.assert_close(v_packed, scalar_v, rtol=0, atol=0)
     assert k_packed.numel() == 256 * 128 // 2
     assert v_packed.numel() == 128 * 256 // 2
     actual_k, actual_v = unpack_dpas_k4v4(k_packed, v_packed)
@@ -100,6 +135,9 @@ def test_dpas_physical_offsets_cover_every_boundary_axis() -> None:
                             (half, tile, subgroup, lane, slot, value)
                         )
     k_packed, v_packed = pack_dpas_k4v4(q_k, q_v)
+    scalar_k, scalar_v = _scalar_pack_dpas_k4v4(q_k, q_v)
+    torch.testing.assert_close(k_packed, scalar_k, rtol=0, atol=0)
+    torch.testing.assert_close(v_packed, scalar_v, rtol=0, atol=0)
     for half, tile, subgroup, lane, slot, value in cases:
         byte = (((half * 4 + tile) * 4 + subgroup) * 16 + lane) * 32 + slot // 2
         assert int((k_packed[byte] >> (4 * (slot % 2))) & 15) == value

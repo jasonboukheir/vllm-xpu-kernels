@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host-only source and address proofs for Xe2 KVarN reader variants."""
+"""Host-only source and address proofs for the qualified Xe2 KVarN reader."""
 
 from __future__ import annotations
 
@@ -14,55 +14,17 @@ CONFIG = (REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_decode.hpp").read_text()
 DISPATCH = (REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_decode_xe2.cpp").read_text()
 
 
-def test_id13_remains_the_unmodified_reader_control() -> None:
-    assert "kQ6NextPagePrefetchSplitReducer = 13" in DISPATCH
-    assert (
-        "!KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::\n"
-        "                  Mainloop::CurrentHalfVPrefetch"
-    ) in CONFIG
-    assert (
-        "!KVarNDecodeD256G128DpasQ6NextPagePrefetchSplitReducerConfig::\n"
-        "                  Mainloop::ReusePageRecordCursor"
-    ) in CONFIG
-
-
-def test_id16_selects_only_current_half_v_prefetch_over_id13() -> None:
-    assert "kQ6CurrentHalfVPrefetch = 16" in DISPATCH
-    assert "use_q6_current_half_v_prefetch" in DISPATCH
-    assert (
-        "KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::\n"
-        "                  CurrentHalfVPrefetch"
-    ) in CONFIG
-    assert (
-        "!KVarNDecodeD256G128DpasQ6CurrentHalfVPrefetchConfig::Mainloop::\n"
-        "                  ReusePageRecordCursor"
-    ) in CONFIG
-
-
-def test_id17_selects_only_page_record_cursor_over_id13() -> None:
-    assert "kQ6PageRecordCursor = 17" in DISPATCH
-    assert "use_q6_page_record_cursor" in DISPATCH
-    assert (
-        "!KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::\n"
-        "                  CurrentHalfVPrefetch"
-    ) in CONFIG
-    assert (
-        "KVarNDecodeD256G128DpasQ6PageRecordCursorConfig::Mainloop::\n"
-        "                  ReusePageRecordCursor"
-    ) in CONFIG
-
-
 def test_id18_composes_prefetch_and_record_cursor() -> None:
-    assert "kQ6PrefetchRecordCursor = 18" in DISPATCH
-    assert "use_q6_prefetch_record_cursor" in DISPATCH
+    assert "kKVarNDecodeKernel = 18" in DISPATCH
+    assert "only the qualified KVarN decoder (18) is supported" in DISPATCH
     assert (
-        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::\n"
-        "                  CurrentHalfVPrefetch"
-    ) in CONFIG
-    assert (
-        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::Mainloop::\n"
-        "                  ReusePageRecordCursor"
-    ) in CONFIG
+        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(queue, args)"
+        in DISPATCH
+    )
+    assert "using Mainloop =" in CONFIG
+    assert "KVarNDecodeFwdMainloop<" in CONFIG
+    assert "prefetch_dpas_v_half_l1" in MAINLOOP
+    assert "bool const refresh_record =" in MAINLOOP
 
 
 def test_half_local_v_prefetch_ranges_match_xe2_dpas_record() -> None:

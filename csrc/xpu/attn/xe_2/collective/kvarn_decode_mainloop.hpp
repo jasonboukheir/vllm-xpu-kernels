@@ -57,11 +57,7 @@ struct KVarNHybridTailLayout {
  * what makes the register assignment independent of undocumented fragment
  * linear order.
  */
-template <
-    bool DpasPacked = false,
-    bool VectorPackedLoads = false,
-    bool SimdPackedUnpack = false,
-    bool PairedNibbleHalf2 = false>
+template <bool DpasPacked = false>
 struct KVarNK4V4FragmentLoader {
   static constexpr int kHeadDim = 256;
   static constexpr int kGroup = 128;
@@ -86,10 +82,6 @@ struct KVarNK4V4FragmentLoader {
       2 * kPackedBytes + kKMetadataBytes + kVMetadataBytes;
   static constexpr int kPagePrefetchThreads = 4 * cute::intel::sg_size;
 
-  static_assert(!VectorPackedLoads || DpasPacked);
-  static_assert(!SimdPackedUnpack || (DpasPacked && VectorPackedLoads));
-  static_assert(!PairedNibbleHalf2 || (DpasPacked && VectorPackedLoads));
-  static_assert(!PairedNibbleHalf2 || !SimdPackedUnpack);
   static_assert(kKPackedLaneBytes == 32);
   static_assert(kVPackedLaneBytes == 16);
   static_assert(
@@ -106,35 +98,6 @@ struct KVarNK4V4FragmentLoader {
   KVarNHybridTailLayout tail;
   int const* page_table;
   int max_pages_per_seq;
-  std::uint32_t const* paired_nibble_half2_lut = nullptr;
-
-  /** Exact binary16 encoding for one unsigned four-bit cache value.
-   *
-   * Quantized K/V values are integers in [0, 15].  Constructing their half
-   * encodings with integer operations keeps the once-per-workgroup LUT setup
-   * independent of floating-point conversion modes.
-   */
-  CUTLASS_HOST_DEVICE static constexpr std::uint16_t
-  nibble_half_bits(std::uint8_t value) {
-    if (value == 0) return 0;
-    int const exponent = value >= 8 ? 3 : value >= 4 ? 2 : value >= 2 ? 1 : 0;
-    return static_cast<std::uint16_t>(
-        ((15 + exponent) << 10) +
-        ((int(value) - (1 << exponent)) << (10 - exponent)));
-  }
-
-  /** Pack the two little-endian nibbles of one cache byte as one half2 word.
-   *
-   * The low nibble occupies the low binary16 lane and the high nibble the
-   * high lane.  One SLM lookup therefore replaces two independent nibble
-   * expansions without changing the immutable xe2_dpas cache representation.
-   */
-  CUTLASS_HOST_DEVICE static constexpr std::uint32_t
-  paired_nibble_half2_bits(std::uint8_t packed) {
-    return std::uint32_t(nibble_half_bits(packed & 0x0f)) |
-           (std::uint32_t(nibble_half_bits(packed >> 4)) << 16);
-  }
-
   CUTLASS_DEVICE std::uint8_t const*
   record(int batch, int kv_head, int logical_tile) const {
     int const page = logical_tile / 2;
@@ -269,89 +232,11 @@ struct KVarNK4V4FragmentLoader {
   }
 
   template <int WordCount, class Fragment>
-  CUTLASS_DEVICE void fill_paired_nibble_half2_fragment(
-      Fragment& dst, std::uint8_t const* lane_bytes) const {
-    static_assert(PairedNibbleHalf2);
-    static_assert(
-        WordCount == kKPackedLaneWords || WordCount == kVPackedLaneWords);
-    // Read the unchanged packed cache in 16-byte vectors, then expand each
-    // byte with one SLM lookup to an exact binary16 pair.  Compared with a
-    // per-nibble table this halves lookup traffic; compared with ID18 it
-    // removes all shift/mask/integer-to-half operations from the hot loop.
-    // The table is shared by the complete 64-thread producer workgroup and
-    // costs exactly 1 KiB of SLM for this isolated specialization.
-    constexpr int kBytesPerChunk = 16;
-    constexpr int kLaneBytes = WordCount * sizeof(std::uint32_t);
-    static_assert(kLaneBytes % kBytesPerChunk == 0);
-    using ByteVector = sycl::vec<std::uint8_t, kBytesPerChunk>;
-    using Half2 = sycl::vec<sycl::half, 2>;
-    static_assert(sizeof(Half2) == sizeof(std::uint32_t));
-    CUTLASS_PRAGMA_UNROLL
-    for (int chunk = 0; chunk < kLaneBytes / kBytesPerChunk; ++chunk) {
-      ByteVector const bytes = *reinterpret_cast<ByteVector const*>(
-          lane_bytes + chunk * kBytesPerChunk);
-      CUTLASS_PRAGMA_UNROLL
-      for (int byte = 0; byte < kBytesPerChunk; ++byte) {
-        Half2 const pair =
-            sycl::bit_cast<Half2>(paired_nibble_half2_lut[bytes[byte]]);
-        int const output = chunk * (2 * kBytesPerChunk) + 2 * byte;
-        dst(output) = static_cast<typename Fragment::value_type>(pair[0]);
-        dst(output + 1) = static_cast<typename Fragment::value_type>(pair[1]);
-      }
-    }
-  }
-
-  template <int WordCount, class Fragment>
   CUTLASS_DEVICE static void
   fill_packed_lane_fragment(Fragment& dst, std::uint8_t const* lane_bytes) {
     static_assert(
         WordCount == kKPackedLaneWords || WordCount == kVPackedLaneWords);
-    if constexpr (SimdPackedUnpack) {
-      // The xe2_dpas lane ABI stores eight uint4 values in each little-endian
-      // word.  View it as bytes so one SIMD operation extracts all low nibbles
-      // and another extracts all high nibbles.  The two vector conversions are
-      // exact for [0, 15] and avoid the old eight scalar shift/mask/converts
-      // per packed word.  Interleaving low/high restores the immutable nibble
-      // order consumed by the FP16 MMA-B fragment.
-      constexpr int kBytesPerChunk = 16;
-      constexpr int kLaneBytes = WordCount * sizeof(std::uint32_t);
-      static_assert(kLaneBytes % kBytesPerChunk == 0);
-      using ByteVector = sycl::vec<std::uint8_t, kBytesPerChunk>;
-      using HalfVector = sycl::vec<sycl::half, kBytesPerChunk>;
-      CUTLASS_PRAGMA_UNROLL
-      for (int chunk = 0; chunk < kLaneBytes / kBytesPerChunk; ++chunk) {
-        ByteVector const bytes = *reinterpret_cast<ByteVector const*>(
-            lane_bytes + chunk * kBytesPerChunk);
-        ByteVector const low_bits = bytes & ByteVector{0x0f};
-        ByteVector const high_bits = bytes >> ByteVector{4};
-        HalfVector const low = low_bits.template convert<sycl::half>();
-        HalfVector const high = high_bits.template convert<sycl::half>();
-        CUTLASS_PRAGMA_UNROLL
-        for (int byte = 0; byte < kBytesPerChunk; ++byte) {
-          int const output = chunk * (2 * kBytesPerChunk) + 2 * byte;
-          dst(output) = static_cast<typename Fragment::value_type>(low[byte]);
-          dst(output + 1) =
-              static_cast<typename Fragment::value_type>(high[byte]);
-        }
-      }
-    } else if constexpr (VectorPackedLoads) {
-      // The host specialization validates the complete address induction:
-      // cache base, block/head strides, field offset, and these fixed lane
-      // extents.  Keep this as one explicit vector load per lane so this
-      // candidate differs from the scalar DPAS baseline only at the load.
-      using WordVector = sycl::vec<std::uint32_t, WordCount>;
-      WordVector const words = *reinterpret_cast<WordVector const*>(lane_bytes);
-      CUTLASS_PRAGMA_UNROLL
-      for (int word_index = 0; word_index < WordCount; ++word_index) {
-        std::uint32_t const word = words[word_index];
-        CUTLASS_PRAGMA_UNROLL
-        for (int nibble = 0; nibble < kValuesPerWord; ++nibble) {
-          dst(word_index * kValuesPerWord + nibble) =
-              static_cast<typename Fragment::value_type>(
-                  unpack_nibble(word, nibble));
-        }
-      }
-    } else {
+    {
       CUTLASS_PRAGMA_UNROLL
       for (int word_index = 0; word_index < WordCount; ++word_index) {
         std::uint32_t const word =
@@ -432,9 +317,7 @@ struct KVarNK4V4FragmentLoader {
         auto const* lane_bytes =
             rec + layout.k_packed_offset +
             (((half * 4 + dim_tile / 64) * 4 + subgroup) * 16 + lane) * 32;
-        if constexpr (PairedNibbleHalf2) {
-          fill_paired_nibble_half2_fragment<kKPackedLaneWords>(dst, lane_bytes);
-        } else {
+        {
           fill_packed_lane_fragment<kKPackedLaneWords>(dst, lane_bytes);
         }
       } else {
@@ -508,9 +391,7 @@ struct KVarNK4V4FragmentLoader {
         auto const* lane_bytes =
             rec + layout.v_packed_offset +
             (((half * 8 + value_tile / 32) * 4 + subgroup) * 16 + lane) * 16;
-        if constexpr (PairedNibbleHalf2) {
-          fill_paired_nibble_half2_fragment<kVPackedLaneWords>(dst, lane_bytes);
-        } else {
+        {
           fill_packed_lane_fragment<kVPackedLaneWords>(dst, lane_bytes);
         }
       } else {
@@ -545,43 +426,18 @@ struct KVarNK4V4FragmentLoader {
  * mainloop storage is empty when deciding its epilogue barrier.  Only the
  * explicitly instantiated paired-nibble candidate reserves the 1 KiB table.
  */
-template <class BaseStorage, bool PairedNibbleHalf2>
+template <class BaseStorage>
 struct KVarNDecodeSharedStorage {
   BaseStorage base;
 };
 
-template <class BaseStorage>
-struct KVarNDecodeSharedStorage<BaseStorage, true> {
-  std::uint32_t paired_nibble_half2_lut[256];
-  BaseStorage base;
-};
-
-/** D256/G128/K4V4 specialization of the Xe decode collective.
- *
- * The base collective is inherited only for its public fragment contract and
- * tested online-softmax implementation.  This operator never dereferences its
- * K_2D/V_2D arguments: K and V MMA-B fragments are reconstructed directly
- * from the packed KVarN record.
- */
 template <
     class TiledMMAQK_,
-    class TiledMMAQKInt_,
     class TiledMMAPV_,
     int VTiles_,
     class TensorQ_,
     class TensorK_,
-    class TensorV_,
-    bool DpasPacked_ = false,
-    bool VectorPackedLoads_ = false,
-    bool QKInt8U4_ = false,
-    bool ExactLiveRows_ = false,
-    bool PagePair_ = false,
-    bool NextPagePrefetch_ = false,
-    bool SimdPackedUnpack_ = false,
-    bool CurrentHalfVPrefetch_ = false,
-    bool ReusePageRecordCursor_ = false,
-    bool ReusePageMetadataCursor_ = false,
-    bool PairedNibbleHalf2_ = false>
+    class TensorV_>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -630,39 +486,15 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   using typename Base::TiledMMAQK;
   using typename Base::TileShapePV;
   using typename Base::TileShapeQK;
-  using TiledMMAQKInt = TiledMMAQKInt_;
 
   static constexpr int VTiles = VTiles_;
   static constexpr bool PagedKV = true;
   static constexpr bool CausalMask = false;
   static constexpr bool LocalMask = false;
   static constexpr bool InitializeSplitScratchSentinels = true;
-  static constexpr bool ExactLiveRows = ExactLiveRows_;
-  static constexpr bool PagePair = PagePair_;
-  static constexpr bool NextPagePrefetch = NextPagePrefetch_;
-  static constexpr bool SimdPackedUnpack = SimdPackedUnpack_;
-  static constexpr bool CurrentHalfVPrefetch = CurrentHalfVPrefetch_;
-  static constexpr bool ReusePageRecordCursor = ReusePageRecordCursor_;
-  static constexpr bool ReusePageMetadataCursor = ReusePageMetadataCursor_;
-  static constexpr bool PairedNibbleHalf2 = PairedNibbleHalf2_;
   static constexpr int QueryRows = cute::size<0>(TileShapeQK{});
-  static constexpr int BiasRows = ExactLiveRows ? QueryRows : 8;
-  static_assert(QueryRows <= 8);
-  static_assert(!NextPagePrefetch || DpasPacked_);
-  static_assert(!NextPagePrefetch || !PagePair);
-  static_assert(!CurrentHalfVPrefetch || DpasPacked_);
-  static_assert(!CurrentHalfVPrefetch || !PagePair);
-  static_assert(!ReusePageRecordCursor || DpasPacked_);
-  static_assert(!ReusePageRecordCursor || !PagePair);
-  static_assert(!ReusePageMetadataCursor || DpasPacked_);
-  static_assert(!ReusePageMetadataCursor || ReusePageRecordCursor_);
-  static_assert(!ReusePageMetadataCursor || !PagePair);
-  static_assert(
-      !PairedNibbleHalf2 ||
-      (DpasPacked_ && VectorPackedLoads_ && !SimdPackedUnpack_ && !PagePair));
-  static_assert(!PairedNibbleHalf2 || !ReusePageMetadataCursor_);
-  static_assert(
-      !SimdPackedUnpack || (DpasPacked_ && VectorPackedLoads_ && !QKInt8U4_));
+  static constexpr int BiasRows = 8;
+  static_assert(QueryRows == 6);
   // Each split stores a bounded normalized partial. KVarN reducers combine
   // it using weights reconstructed from the producer-written natural LSE.
 
@@ -684,20 +516,12 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     int window_size_left;
   };
 
-  using SharedStorage =
-      KVarNDecodeSharedStorage<typename Base::SharedStorage, PairedNibbleHalf2>;
+  using SharedStorage = KVarNDecodeSharedStorage<typename Base::SharedStorage>;
 
   Params params;
-  std::uint32_t* paired_nibble_half2_lut;
 
   KVarNDecodeFwdMainloop(Params const& params_, SharedStorage& storage)
-      : Base(params_.base, storage.base),
-        params(params_),
-        paired_nibble_half2_lut(nullptr) {
-    if constexpr (PairedNibbleHalf2) {
-      paired_nibble_half2_lut = storage.paired_nibble_half2_lut;
-    }
-  }
+      : Base(params_.base, storage.base), params(params_) {}
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
     return args.kvarn.cache != nullptr && args.seq_lens != nullptr &&
@@ -740,20 +564,6 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     static_assert(get<2>(TileShapeQK{}) == 64);
     static_assert(get<2>(TileShapePV{}) == 64);
 
-    if constexpr (PairedNibbleHalf2) {
-      // All active workgroups have exactly 64 threads.  Four disjoint stores
-      // per thread initialize the complete table before any subgroup reads it.
-      constexpr int kThreads = SGPerWG::value * cute::intel::sg_size;
-      static_assert(kThreads == 64);
-      for (int packed = thr_id; packed < 256; packed += kThreads) {
-        paired_nibble_half2_lut[packed] =
-            KVarNK4V4FragmentLoader<true, true, false, true>::
-                paired_nibble_half2_bits(static_cast<std::uint8_t>(packed));
-      }
-      sycl::group_barrier(
-          sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    }
-
     Tensor cQ = make_identity_tensor(Q_2D.shape());
     Tensor cK = make_identity_tensor(select<1, 2>(TileShapeQK{}));  // (k,d)
     Tensor cV = make_identity_tensor(select<1, 2>(TileShapePV{}));  // (v,k)
@@ -792,386 +602,19 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
-    KVarNK4V4FragmentLoader<
-        DpasPacked_,
-        VectorPackedLoads_,
-        SimdPackedUnpack_,
-        PairedNibbleHalf2_>
-        loader{
-            params.kvarn,
-            params.tail,
-            params.base.ptr_page_table,
-            params.base.max_pages_per_seq,
-            paired_nibble_half2_lut};
+    KVarNK4V4FragmentLoader<true> loader{
+        params.kvarn,
+        params.tail,
+        params.base.ptr_page_table,
+        params.base.max_pages_per_seq};
     int const actual_seq_len = params.seq_lens[idx_b];
     // Legacy single-split scheduler orders grid.z batch-major:
     //   flat = batch * num_kv_heads + kv_head.
     int kv_head = int(BlockIdxZ()) % 4;
 
-    if constexpr (PagePair_) {
-      // A scheduler work unit is one complete 128-token page for this
-      // specialization.  Keep the established K64 MMA fragments, but build
-      // both halves while the page lookup, query transform, and per-page
-      // scalar metadata are live.  The two score fragments are then consumed
-      // in their original order so online-softmax rounding remains aligned
-      // with the scalar Q6 implementation.
-      static_assert(DpasPacked_);
-      static_assert(!VectorPackedLoads_);
-      static_assert(!QKInt8U4_);
-      auto tSrSSecond = thr_mma_qk.partition_sg_fragment_C(cP);
-
-      for (int page = blk_k0; page < blk_k1; ++page) {
-        int const first_k_tile = page * 2;
-        if (page * KVarNK4V4FragmentLoader<>::kGroup >= actual_seq_len) {
-          break;
-        }
-        // This predicate is uniform for the workgroup.  In particular, a
-        // hybrid tail page ending in its first K64 half may leave the second
-        // half entirely uninitialized; do not even materialize that half,
-        // since a later PV MMA would otherwise allow 0 * NaN to poison the
-        // output after its logits were masked.
-        bool const has_live_second_half =
-            (first_k_tile + 1) * 64 < actual_seq_len;
-
-        // One lookup and address calculation serve both K64 halves.  This is
-        // also important for the hybrid path: a page cannot change storage
-        // class between its first and second half.
-        int const physical = loader.physical_block(idx_b, first_k_tile);
-        int const slot = params.tail.block_to_slot[physical];
-        auto const* rec =
-            slot < 0 ? params.kvarn.cache +
-                           std::int64_t(physical) * params.kvarn.block_stride +
-                           std::int64_t(kv_head) * params.kvarn.head_stride
-                     : nullptr;
-
-        clear(tSrS);
-        clear(tSrSSecond);
-        float k_zp_bias[BiasRows] = {};
-        CUTLASS_PRAGMA_UNROLL
-        for (int d_tile = 0; d_tile < 256; d_tile += 64) {
-          // K column scale and zero point are page-wide.  Transform Q once,
-          // then reuse the exact same fp16 fragment for both packed halves.
-          copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
-          reorder(tQrQ, tSrQ);
-          if (slot < 0) {
-            using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
-            static_assert(KDimFragment{}.size() == 4);
-            KDimFragment k_dim_scale;
-            KDimFragment k_dim_zp;
-            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
-                                 .get_local_id()[0];
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < k_dim_scale.size(); ++i) {
-              int const dim = d_tile + lane + i * intel::sg_size;
-              k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_s_col_offset + 2 * dim);
-              k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_zp_offset + 2 * dim);
-            }
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrQ.size(); ++i) {
-              auto coord = tSrQ.tv_layout()(lane, i);
-              int const query_row = int(get<0>(coord));
-              float const query_value = static_cast<float>(tSrQ(i));
-              float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
-              k_zp_bias[query_row] += query_value * dim_zp;
-              float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
-              tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
-                  query_value * dim_scale);
-            }
-          }
-
-          loader.fill_k_fragment(
-              tSrK, rec, slot, kv_head, first_k_tile, qk_token_sg, d_tile);
-          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-          if (has_live_second_half) {
-            loader.fill_k_fragment(
-                tSrK,
-                rec,
-                slot,
-                kv_head,
-                first_k_tile + 1,
-                qk_token_sg,
-                d_tile);
-            cute::gemm(mma_qk, tSrQ, tSrK, tSrSSecond);
-          }
-        }
-
-        if (slot < 0) {
-          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-          CUTLASS_PRAGMA_UNROLL
-          for (int query_row = 0; query_row < BiasRows; ++query_row) {
-            k_zp_bias[query_row] = sycl::reduce_over_group(
-                subgroup, k_zp_bias[query_row], sycl::plus<float>());
-          }
-          int const lane = subgroup.get_local_id()[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            auto coord = tSrS.tv_layout()(lane, i);
-            float const bias = k_zp_bias[int(get<0>(coord))];
-            tSrS(i) += bias;
-            if (has_live_second_half) {
-              tSrSSecond(i) += bias;
-            }
-          }
-
-          FragSCol first_k_row_scale;
-          FragSCol second_k_row_scale;
-          int first_token = qk_token_sg + lane;
-          int second_token = 64 + qk_token_sg + lane;
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < first_k_row_scale.size(); ++i,
-                   first_token += intel::sg_size,
-                   second_token += intel::sg_size) {
-            first_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.k_s_row_offset + 2 * first_token);
-            if (has_live_second_half) {
-              second_k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_s_row_offset + 2 * second_token);
-            }
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            tSrS(i) *= broadcast<1>(first_k_row_scale, tSrS, i);
-            if (has_live_second_half) {
-              tSrSSecond(i) *= broadcast<1>(second_k_row_scale, tSrSSecond, i);
-            }
-          }
-        }
-
-        // A physical page is always safe to read in full, including a hybrid
-        // tail page.  Mask the unused tokens in the final partial page after
-        // fragment materialization, exactly as the K64 baseline does.
-        if ((first_k_tile + 1) * 64 > actual_seq_len) {
-          FragSCol mask;
-          int token = first_k_tile * 64 + qk_token_sg +
-                      sycl::ext::oneapi::this_work_item::get_sub_group()
-                          .get_local_id()[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < mask.size(); ++i, token += intel::sg_size) {
-            mask(i) = token < actual_seq_len ? ElementS(sycl::nan(0u))
-                                             : ElementS(-INFINITY);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(mask, tSrS, i));
-          }
-        }
-        if (has_live_second_half && (first_k_tile + 2) * 64 > actual_seq_len) {
-          FragSCol mask;
-          int token = (first_k_tile + 1) * 64 + qk_token_sg +
-                      sycl::ext::oneapi::this_work_item::get_sub_group()
-                          .get_local_id()[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < mask.size(); ++i, token += intel::sg_size) {
-            mask(i) = token < actual_seq_len ? ElementS(sycl::nan(0u))
-                                             : ElementS(-INFINITY);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrSSecond.size(); ++i) {
-            tSrSSecond(i) =
-                sycl::fmin(tSrSSecond(i), broadcast<1>(mask, tSrSSecond, i));
-          }
-        }
-
-        using VTokenFragment = decltype(reduce<0>(tArP, sycl::plus<void>{}));
-        SingleFragA fragment_shape;
-        using VDimFragment =
-            decltype(reduce<0>(fragment_shape, sycl::plus<void>{}));
-        VDimFragment page_v_dim_scale[VTiles];
-
-        this->softmax(
-            params.base.scale, page == blk_k0, tSrS, tA_max, tA_sum, tArA);
-        reorder(tSrS, tArP);
-
-        if (slot < 0) {
-          float v_zp_bias[BiasRows] = {};
-          int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
-                               .get_local_id()[0];
-          VTokenFragment v_token_scale;
-          VTokenFragment v_token_zp;
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < v_token_scale.size(); ++i) {
-            int const token = pv_token_sg + lane + i * intel::sg_size;
-            v_token_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.v_s_row_offset + 2 * token);
-            v_token_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.v_zp_offset + 2 * token);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArP.size(); ++i) {
-            auto coord = tArP.tv_layout()(lane, i);
-            int const query_row = int(get<0>(coord));
-            float const probability = static_cast<float>(tArP(i));
-            float const token_scale = broadcast<1>(v_token_scale, tArP, i);
-            float const token_zp = broadcast<1>(v_token_zp, tArP, i);
-            v_zp_bias[query_row] += probability * token_zp;
-            tArP(i) = static_cast<typename decltype(tArP)::value_type>(
-                probability * token_scale);
-          }
-          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-          CUTLASS_PRAGMA_UNROLL
-          for (int query_row = 0; query_row < BiasRows; ++query_row) {
-            v_zp_bias[query_row] = sycl::reduce_over_group(
-                subgroup, v_zp_bias[query_row], sycl::plus<float>());
-          }
-
-          CUTLASS_PRAGMA_UNROLL
-          for (int vv = 0; vv < VTiles; ++vv) {
-            auto& v_dim_scale = page_v_dim_scale[vv];
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < v_dim_scale.size(); ++i) {
-              int const dim =
-                  vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
-              v_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.v_s_col_offset + 2 * dim);
-            }
-            auto output_tile = tArA(_, _, _, vv);
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < output_tile.size(); ++i) {
-              output_tile(i) /= broadcast<1>(v_dim_scale, fragment_shape, i);
-            }
-            loader.fill_v_fragment(
-                tArV,
-                rec,
-                slot,
-                kv_head,
-                first_k_tile,
-                pv_token_sg,
-                vv * get<1>(TileShapePV{}));
-            cute::gemm(mma_pv, tArP, tArV, output_tile);
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < output_tile.size(); ++i) {
-              auto coord = fragment_shape.tv_layout()(lane, i);
-              output_tile(i) += v_zp_bias[int(get<0>(coord))];
-            }
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int vv = 0; vv < VTiles; ++vv) {
-            loader.fill_v_fragment(
-                tArV,
-                rec,
-                slot,
-                kv_head,
-                first_k_tile,
-                pv_token_sg,
-                vv * get<1>(TileShapePV{}));
-            cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
-          }
-        }
-
-        if (!has_live_second_half) {
-          // Packed V accumulation temporarily uses the page's inverse column
-          // scale so both halves can share one scale frame.  Ordinarily the
-          // second-half path restores that frame; do it here before leaving a
-          // page whose second half is wholly inactive.
-          if (slot < 0) {
-            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
-                                 .get_local_id()[0];
-            CUTLASS_PRAGMA_UNROLL
-            for (int vv = 0; vv < VTiles; ++vv) {
-              auto output_tile = tArA(_, _, _, vv);
-              CUTLASS_PRAGMA_UNROLL
-              for (int i = 0; i < output_tile.size(); ++i) {
-                output_tile(i) *=
-                    broadcast<1>(page_v_dim_scale[vv], fragment_shape, i);
-              }
-            }
-          }
-          continue;
-        }
-
-        // Consume the second half only after the first half's PV update.  The
-        // output remains in this page's V-column-scale frame across the
-        // second softmax rescale, preserving the established online ordering.
-        this->softmax(
-            params.base.scale, false, tSrSSecond, tA_max, tA_sum, tArA);
-        reorder(tSrSSecond, tArP);
-
-        if (slot < 0) {
-          float v_zp_bias[BiasRows] = {};
-          int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
-                               .get_local_id()[0];
-          VTokenFragment v_token_scale;
-          VTokenFragment v_token_zp;
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < v_token_scale.size(); ++i) {
-            int const token = 64 + pv_token_sg + lane + i * intel::sg_size;
-            v_token_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.v_s_row_offset + 2 * token);
-            v_token_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                rec + params.kvarn.v_zp_offset + 2 * token);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArP.size(); ++i) {
-            auto coord = tArP.tv_layout()(lane, i);
-            int const query_row = int(get<0>(coord));
-            float const probability = static_cast<float>(tArP(i));
-            float const token_scale = broadcast<1>(v_token_scale, tArP, i);
-            float const token_zp = broadcast<1>(v_token_zp, tArP, i);
-            v_zp_bias[query_row] += probability * token_zp;
-            tArP(i) = static_cast<typename decltype(tArP)::value_type>(
-                probability * token_scale);
-          }
-          auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-          CUTLASS_PRAGMA_UNROLL
-          for (int query_row = 0; query_row < BiasRows; ++query_row) {
-            v_zp_bias[query_row] = sycl::reduce_over_group(
-                subgroup, v_zp_bias[query_row], sycl::plus<float>());
-          }
-
-          CUTLASS_PRAGMA_UNROLL
-          for (int vv = 0; vv < VTiles; ++vv) {
-            auto output_tile = tArA(_, _, _, vv);
-            loader.fill_v_fragment(
-                tArV,
-                rec,
-                slot,
-                kv_head,
-                first_k_tile + 1,
-                pv_token_sg,
-                vv * get<1>(TileShapePV{}));
-            cute::gemm(mma_pv, tArP, tArV, output_tile);
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < output_tile.size(); ++i) {
-              auto coord = fragment_shape.tv_layout()(lane, i);
-              output_tile(i) += v_zp_bias[int(get<0>(coord))];
-              output_tile(i) *=
-                  broadcast<1>(page_v_dim_scale[vv], fragment_shape, i);
-            }
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int vv = 0; vv < VTiles; ++vv) {
-            loader.fill_v_fragment(
-                tArV,
-                rec,
-                slot,
-                kv_head,
-                first_k_tile + 1,
-                pv_token_sg,
-                vv * get<1>(TileShapePV{}));
-            cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
-          }
-        }
-      }
-      return;
-    }
-
     // ID20 keeps only page-wide metadata live across the sequential K64 loop.
-    // Unlike PagePair it never retains a second score fragment: half zero is
-    // fully consumed before half one starts. These fragments are dead and
-    // eliminated for every specialization whose metadata cursor is disabled.
     using KDimMetadataFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
     static_assert(KDimMetadataFragment{}.size() == 4);
-    KDimMetadataFragment page_k_dim_scale[4];
-    float page_k_zp_bias[BiasRows] = {};
-    SingleFragA metadata_fragment_shape;
-    using VDimMetadataFragment =
-        decltype(reduce<0>(metadata_fragment_shape, sycl::plus<void>{}));
-    VDimMetadataFragment page_v_dim_scale[VTiles];
-
     int record_cursor_slot = 0;
     std::uint8_t const* record_cursor = nullptr;
     for (int k_tile = blk_k0; k_tile < blk_k1; ++k_tile) {
@@ -1186,7 +629,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       }
       int slot;
       std::uint8_t const* rec;
-      if constexpr (ReusePageRecordCursor) {
+      {
         // Each physical page supplies two consecutive K64 tiles.  Refresh at
         // every even tile, plus an odd split start, then carry the resolved
         // storage class and record address into the second half.  The first
@@ -1206,22 +649,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         }
         slot = record_cursor_slot;
         rec = record_cursor;
-      } else {
-        int const physical = loader.physical_block(idx_b, k_tile);
-        slot = params.tail.block_to_slot[physical];
-        rec = slot < 0
-                  ? params.kvarn.cache +
-                        std::int64_t(physical) * params.kvarn.block_stride +
-                        std::int64_t(kv_head) * params.kvarn.head_stride
-                  : nullptr;
       }
-      bool const refresh_page_metadata = (k_tile & 1) == 0 || k_tile == blk_k0;
-      if constexpr (NextPagePrefetch) {
-        using Loader = KVarNK4V4FragmentLoader<
-            DpasPacked_,
-            VectorPackedLoads_,
-            SimdPackedUnpack_,
-            PairedNibbleHalf2_>;
+      {
+        using Loader = KVarNK4V4FragmentLoader<true>;
         static_assert(
             SGPerWG::value * cute::intel::sg_size ==
             Loader::kPagePrefetchThreads);
@@ -1256,91 +686,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       }
       clear(tSrS);
       float k_zp_bias[BiasRows] = {};
-      if constexpr (QKInt8U4_) {
-        if (slot < 0) {
-          // Variant 1 keeps the PV path and cache ABI unchanged. Only packed
-          // QK uses signed-int8 x unsigned-int4 DPAS. Quantize each 64-wide Q
-          // slice independently so its scale can be folded back into the
-          // corresponding integer accumulator before the four slices sum.
-          TiledMMAQKInt mma_qk_int{};
-          auto thr_mma_qk_int = mma_qk_int.get_slice(thr_id);
-          auto tIrQ = thr_mma_qk_int.partition_sg_fragment_A(gQ(_, _, 0));
-          auto tIrK = thr_mma_qk_int.partition_sg_fragment_B(cK);
-          auto tIrS = thr_mma_qk_int.partition_sg_fragment_C(cP);
-          auto tQrQInt8 = make_subgroup_tensor(
-              make_tensor<std::int8_t>(tSrQ.layout()), tSrQ.tv_layout());
-          auto tSrSPartial = make_subgroup_tensor(
-              make_tensor<float>(tSrS.layout()), tSrS.tv_layout());
-
-          CUTLASS_PRAGMA_UNROLL
-          for (int d_tile = 0; d_tile < 256; d_tile += 64) {
-            copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
-            reorder(tQrQ, tSrQ);
-            using KDimFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
-            static_assert(KDimFragment{}.size() == 4);
-            KDimFragment k_dim_scale;
-            int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
-                                 .get_local_id()[0];
-            KDimFragment k_dim_zp;
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < k_dim_scale.size(); ++i) {
-              int const dim = d_tile + lane + i * intel::sg_size;
-              k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_s_col_offset + 2 * dim);
-              k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                  rec + params.kvarn.k_zp_offset + 2 * dim);
-            }
-
-            float q_amax = 0.0f;
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrQ.size(); ++i) {
-              auto coord = tSrQ.tv_layout()(lane, i);
-              int const query_row = int(get<0>(coord));
-              float const query_value = static_cast<float>(tSrQ(i));
-              float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
-              k_zp_bias[query_row] += query_value * dim_zp;
-              float const dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
-              float const scaled_query = query_value * dim_scale;
-              tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
-                  scaled_query);
-              q_amax = sycl::fmax(q_amax, sycl::fabs(scaled_query));
-            }
-
-            auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-            q_amax = sycl::reduce_over_group(
-                subgroup, q_amax, sycl::maximum<float>());
-            float const q_scale = q_amax > 0.0f ? q_amax / 127.0f : 1.0f;
-            float const q_inv_scale = 1.0f / q_scale;
-
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrQ.size(); ++i) {
-              float const quantized =
-                  sycl::rint(static_cast<float>(tSrQ(i)) * q_inv_scale);
-              tQrQInt8(i) = static_cast<std::int8_t>(
-                  sycl::clamp(quantized, -127.0f, 127.0f));
-            }
-            reorder(tQrQInt8, tIrQ);
-            loader.fill_k_fragment_by_coordinate(
-                tIrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
-            clear(tIrS);
-            cute::gemm(mma_qk_int, tIrQ, tIrK, tIrS);
-            reorder(tIrS, tSrSPartial);
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrS.size(); ++i) {
-              tSrS(i) += tSrSPartial(i) * q_scale;
-            }
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int d_tile = 0; d_tile < 256; d_tile += 64) {
-            copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
-            reorder(tQrQ, tSrQ);
-            loader.fill_k_fragment(
-                tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
-            cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-          }
-        }
-      } else {
+      {
         CUTLASS_PRAGMA_UNROLL
         for (int d_tile = 0; d_tile < 256; d_tile += 64) {
           copy(copy_q, tQgQ(_, _, _, d_tile / 64), tQrQ);
@@ -1350,19 +696,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
             int const lane = sycl::ext::oneapi::this_work_item::get_sub_group()
                                  .get_local_id()[0];
             KDimMetadataFragment k_dim_zp;
-            if constexpr (ReusePageMetadataCursor) {
-              if (refresh_page_metadata) {
-                CUTLASS_PRAGMA_UNROLL
-                for (int i = 0; i < k_dim_scale.size(); ++i) {
-                  int const dim = d_tile + lane + i * intel::sg_size;
-                  page_k_dim_scale[d_tile / 64](i) =
-                      KVarNK4V4FragmentLoader<>::load_f16(
-                          rec + params.kvarn.k_s_col_offset + 2 * dim);
-                  k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                      rec + params.kvarn.k_zp_offset + 2 * dim);
-                }
-              }
-            } else {
+            {
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < k_dim_scale.size(); ++i) {
                 int const dim = d_tile + lane + i * intel::sg_size;
@@ -1377,15 +711,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
               auto coord = tSrQ.tv_layout()(lane, i);
               int const query_row = int(get<0>(coord));
               float const query_value = static_cast<float>(tSrQ(i));
-              if constexpr (ReusePageMetadataCursor) {
-                // The zero point is page-wide, so derive and reduce its query
-                // bias only on the first owned half. Half one consumes the
-                // cached subgroup result below without reloading K zero point.
-                if (refresh_page_metadata) {
-                  float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
-                  k_zp_bias[query_row] += query_value * dim_zp;
-                }
-              } else {
+              {
                 float const dim_zp = broadcast<1>(k_dim_zp, tSrQ, i);
                 k_zp_bias[query_row] += query_value * dim_zp;
               }
@@ -1393,10 +719,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
               // KVarN page. Apply it to the much smaller Q fragment instead of
               // scaling every unpacked K element.
               float dim_scale;
-              if constexpr (ReusePageMetadataCursor) {
-                dim_scale =
-                    broadcast<1>(page_k_dim_scale[d_tile / 64], tSrQ, i);
-              } else {
+              {
                 dim_scale = broadcast<1>(k_dim_scale, tSrQ, i);
               }
               tSrQ(i) = static_cast<typename decltype(tSrQ)::value_type>(
@@ -1411,18 +734,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
 
       if (slot < 0) {
         auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
-        if constexpr (ReusePageMetadataCursor) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int query_row = 0; query_row < BiasRows; ++query_row) {
-            if (refresh_page_metadata) {
-              k_zp_bias[query_row] = sycl::reduce_over_group(
-                  subgroup, k_zp_bias[query_row], sycl::plus<float>());
-              page_k_zp_bias[query_row] = k_zp_bias[query_row];
-            } else {
-              k_zp_bias[query_row] = page_k_zp_bias[query_row];
-            }
-          }
-        } else {
+        {
           CUTLASS_PRAGMA_UNROLL
           for (int query_row = 0; query_row < BiasRows; ++query_row) {
             k_zp_bias[query_row] = sycl::reduce_over_group(
@@ -1468,19 +780,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         }
       }
 
-      if constexpr (CurrentHalfVPrefetch) {
+      {
         if (slot < 0) {
-          if constexpr (ReusePageMetadataCursor) {
-            if (refresh_page_metadata) {
-              loader.template prefetch_dpas_v_half_l1<true>(
-                  rec, k_tile & 1, thr_id);
-            } else {
-              // V column scale remains live from the first half. Only packed
-              // V and half-local row scale/zero point need another L1 hint.
-              loader.template prefetch_dpas_v_half_l1<false>(
-                  rec, k_tile & 1, thr_id);
-            }
-          } else {
+          {
             loader.prefetch_dpas_v_half_l1(rec, k_tile & 1, thr_id);
           }
         }
@@ -1543,21 +845,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
           using VDimFragment =
               decltype(reduce<0>(fragment_shape, sycl::plus<void>{}));
           VDimFragment v_dim_scale;
-          if constexpr (ReusePageMetadataCursor) {
-            if (enter_v_scale_frame) {
-              CUTLASS_PRAGMA_UNROLL
-              for (int i = 0; i < v_dim_scale.size(); ++i) {
-                int const dim =
-                    vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
-                page_v_dim_scale[vv](i) = KVarNK4V4FragmentLoader<>::load_f16(
-                    rec + params.kvarn.v_s_col_offset + 2 * dim);
-              }
-            }
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < v_dim_scale.size(); ++i) {
-              v_dim_scale(i) = page_v_dim_scale[vv](i);
-            }
-          } else {
+          {
             if (enter_v_scale_frame || leave_v_scale_frame) {
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < v_dim_scale.size(); ++i) {
