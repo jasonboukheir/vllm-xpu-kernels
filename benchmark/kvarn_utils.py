@@ -103,6 +103,20 @@ def _v_dpas_coord(lane: int, slot: int) -> tuple[int, int]:
     )
 
 
+# Cache the lane/slot ownership tables once. Broadcasting these small CPU
+# tensors across half/tile/subgroup dimensions avoids millions of scalar
+# Tensor.__setitem__ calls when long-context fixtures pack many records.
+_K_LANE = torch.arange(16, dtype=torch.int64)[:, None]
+_K_SLOT = torch.arange(64, dtype=torch.int64)[None, :]
+_K_TOKEN = _K_LANE // 2 + 8 * (_K_SLOT % 2)
+_K_DIM = 2 * (_K_SLOT // 2) + _K_LANE % 2
+_V_LANE = torch.arange(16, dtype=torch.int64)[:, None]
+_V_SLOT = torch.arange(32, dtype=torch.int64)[None, :]
+_V_INNER = _V_SLOT % 16
+_V_DIM = _V_LANE // 2 + 8 * (_V_INNER % 2) + 16 * (_V_SLOT // 16)
+_V_TOKEN = 2 * (_V_INNER // 2) + _V_LANE % 2
+
+
 def pack_dpas_k4v4(
     q_k: torch.Tensor, q_v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -118,28 +132,18 @@ def pack_dpas_k4v4(
     if bool((q_k > 15).any()) or bool((q_v > 15).any()):
         raise ValueError("DPAS prototype inputs must contain uint4 values")
 
-    k_slots = torch.empty((2, 4, 4, 16, 64), dtype=torch.uint8)
-    v_slots = torch.empty((2, 8, 4, 16, 32), dtype=torch.uint8)
-    for half in range(2):
-        for tile in range(4):
-            for subgroup in range(4):
-                for lane in range(16):
-                    for slot in range(64):
-                        token, dim = _k_dpas_coord(lane, slot)
-                        k_slots[half, tile, subgroup, lane, slot] = q_k[
-                            tile * 64 + dim,
-                            half * 64 + subgroup * 16 + token,
-                        ]
-    for half in range(2):
-        for tile in range(8):
-            for subgroup in range(4):
-                for lane in range(16):
-                    for slot in range(32):
-                        dim, token = _v_dpas_coord(lane, slot)
-                        v_slots[half, tile, subgroup, lane, slot] = q_v[
-                            half * 64 + subgroup * 16 + token,
-                            tile * 32 + dim,
-                        ]
+    half = torch.arange(2, dtype=torch.int64)[:, None, None, None, None]
+    subgroup = torch.arange(4, dtype=torch.int64)[None, None, :, None, None]
+    k_tile = torch.arange(4, dtype=torch.int64)[None, :, None, None, None]
+    v_tile = torch.arange(8, dtype=torch.int64)[None, :, None, None, None]
+    k_slots = q_k[
+        k_tile * 64 + _K_DIM[None, None, None, :, :],
+        half * 64 + subgroup * 16 + _K_TOKEN[None, None, None, :, :],
+    ]
+    v_slots = q_v[
+        half * 64 + subgroup * 16 + _V_TOKEN[None, None, None, :, :],
+        v_tile * 32 + _V_DIM[None, None, None, :, :],
+    ]
     k_bytes = k_slots[..., 0::2] | (k_slots[..., 1::2] << 4)
     v_bytes = v_slots[..., 0::2] | (v_slots[..., 1::2] << 4)
     return k_bytes.flatten(), v_bytes.flatten()

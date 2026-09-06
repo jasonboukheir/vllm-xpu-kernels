@@ -33,43 +33,27 @@ from benchmark.kvarn_utils import (  # noqa: E402
     swizzle_record_dpas_k4v4,
 )
 
-R1_P2_DPAS_Q6 = 2
-R1_P5_DPAS_VECTOR_LOAD = 3
-R1_P2_P5_DPAS_Q6_VECTOR_LOAD = 4
-R2_Q6_CACHED_WEIGHTS = 6
-R2_Q6_EXACT_ROWS = 7
-R2_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
-Q6_PAGE_PAIR = 9
-Q6_MAIN_GRF128 = 10
-Q6_SPLIT_REDUCER_SPECIALIZED = 11
-Q6_NEXT_PAGE_PREFETCH = 12
-Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
-Q6_SIMD_UNPACK = 14
-Q6_BLOCK_OUTPUT_STORE = 15
-Q6_CURRENT_HALF_V_PREFETCH = 16
-Q6_PAGE_RECORD_CURSOR = 17
 Q6_PREFETCH_RECORD_CURSOR = 18
-Q6_PAGE_METADATA_CURSOR = 20
-Q6_PAIRED_NIBBLE_HALF2 = 21
-
-Q6_FACTORY_VARIANTS = (
-    R1_P2_DPAS_Q6,
-    R1_P2_P5_DPAS_Q6_VECTOR_LOAD,
-    R2_Q6_CACHED_WEIGHTS,
-    R2_Q6_EXACT_ROWS,
-    R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
-    Q6_PAGE_PAIR,
-    Q6_MAIN_GRF128,
-    Q6_SPLIT_REDUCER_SPECIALIZED,
-    Q6_NEXT_PAGE_PREFETCH,
-    Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-    Q6_SIMD_UNPACK,
-    Q6_BLOCK_OUTPUT_STORE,
-    Q6_CURRENT_HALF_V_PREFETCH,
-    Q6_PAGE_RECORD_CURSOR,
-    Q6_PREFETCH_RECORD_CURSOR,
-    Q6_PAGE_METADATA_CURSOR,
-    Q6_PAIRED_NIBBLE_HALF2,
+RETIRED_KERNEL_VARIANTS = (
+    0,
+    1,
+    2,
+    3,
+    4,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    20,
+    21,
 )
 
 
@@ -86,6 +70,18 @@ def native_library() -> None:
 def _tail_tensors() -> tuple[torch.Tensor, torch.Tensor]:
     key = torch.zeros((1, 128, 4, 256), dtype=torch.float16, device="xpu")
     return key, torch.zeros_like(key)
+
+
+def _dpas(cache: torch.Tensor) -> torch.Tensor:
+    """Pack a canonical CPU fixture for the sole qualified decode layout."""
+    layout = KVarNLayout(record_stride=cache.stride(1))
+    packed = cache.clone()
+    for block in range(packed.size(0)):
+        for kv_head in range(packed.size(1)):
+            packed[block, kv_head] = swizzle_record_dpas_k4v4(
+                cache[block, kv_head], layout
+            )
+    return packed.xpu()
 
 
 def _make_long_structured_cache(
@@ -301,7 +297,7 @@ def test_structured_permuted_pages(seq_len: int, record_stride: int) -> None:
     tail_key, tail_value = _tail_tensors()
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor([pages], dtype=torch.int32, device="xpu"),
         torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
         torch.full((3,), -1, dtype=torch.int32, device="xpu"),
@@ -310,6 +306,11 @@ def test_structured_permuted_pages(seq_len: int, record_stride: int) -> None:
         output,
         seq_len,
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     expected = torch.full_like(output.cpu(), expected_value(pages, seq_len))
     torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-3)
@@ -335,7 +336,7 @@ def test_ragged_batch_matches_independent_fp32_oracle(
     tail_key, tail_value = _tail_tensors()
     torch.ops._vllm_fa2_C.kvarn_decode(
         query.xpu(),
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor(pages, dtype=torch.int32, device="xpu"),
         torch.tensor(lengths, dtype=torch.int32, device="xpu"),
         torch.full((6,), -1, dtype=torch.int32, device="xpu"),
@@ -344,6 +345,11 @@ def test_ragged_batch_matches_independent_fp32_oracle(
         output,
         max(lengths),
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     references = [
         reference_decode(
@@ -364,15 +370,8 @@ def test_ragged_batch_matches_independent_fp32_oracle(
 
 
 @pytest.mark.parametrize("record_stride", [35072, 65536])
-@pytest.mark.parametrize(
-    ("dpas_layout", "kernel_variant"),
-    [(False, 0), (True, 0), (True, 1)],
-    ids=["natural-baseline", "dpas-baseline", "dpas-qk-i8u4"],
-)
 def test_nonuniform_kvarn_factors_across_page_boundary(
     record_stride: int,
-    dpas_layout: bool,
-    kernel_variant: int,
 ) -> None:
     """Exercise separable K and V factors with no unit-scale shortcuts.
 
@@ -402,14 +401,12 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
             _put_half(cache[block, kv_head], layout.v_s_row_offset, v_row_scale)
             _put_half(cache[block, kv_head], layout.v_zp_offset, v_row_zp)
 
-    packed_cache = cache
-    if dpas_layout:
-        packed_cache = cache.clone()
-        for block in range(packed_cache.size(0)):
-            for kv_head in range(packed_cache.size(1)):
-                packed_cache[block, kv_head] = swizzle_record_dpas_k4v4(
-                    cache[block, kv_head], layout
-                )
+    packed_cache = cache.clone()
+    for block in range(packed_cache.size(0)):
+        for kv_head in range(packed_cache.size(1)):
+            packed_cache[block, kv_head] = swizzle_record_dpas_k4v4(
+                cache[block, kv_head], layout
+            )
 
     generator = torch.Generator().manual_seed(314159)
     query = torch.randn((3, 24, 256), generator=generator).to(torch.float16)
@@ -431,8 +428,8 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
         False,
         False,
         0,
-        kernel_variant,
-        dpas_layout,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     reference = torch.cat(
         [
@@ -447,26 +444,22 @@ def test_nonuniform_kvarn_factors_across_page_boundary(
             for batch in range(3)
         ]
     )
-    tolerance = 6e-2 if kernel_variant == 1 else 3e-2
     torch.testing.assert_close(
-        output.cpu().float(), reference, atol=tolerance, rtol=tolerance
+        output.cpu().float(), reference, atol=3e-2, rtol=3e-2
     )
     assert torch.isfinite(output).all()
 
 
-def test_qk_i8u4_requires_dpas_layout() -> None:
+def test_qualified_decode_requires_dpas_layout() -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(
         RuntimeError,
-        match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
-            "16, 17, 18, 20, and 21 require dpas_layout=True"
-        ),
+        match="native KVarN decode requires xe2_dpas layout",
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
             query,
-            cache.xpu(),
+            _dpas(cache),
             torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
             torch.ones((1,), dtype=torch.int32, device="xpu"),
             torch.full((1,), -1, dtype=torch.int32, device="xpu"),
@@ -476,8 +469,8 @@ def test_qk_i8u4_requires_dpas_layout() -> None:
             1.0 / 16.0,
             False,
             False,
-            1,
-            1,
+            0,
+            Q6_PREFETCH_RECORD_CURSOR,
             False,
         )
 
@@ -521,10 +514,7 @@ def test_kvarn_dpas_fragment_coordinate_tables_are_bijections() -> None:
     torch.testing.assert_close(v_coords, frozen_v, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dpas_layout", [False, True])
-def test_k_column_scale_reaches_every_token_subgroup(
-    dpas_layout: bool,
-) -> None:
+def test_k_column_scale_reaches_every_token_subgroup() -> None:
     """Catch mixing MMA-A scale ownership with MMA-B cache fragments."""
     layout = KVarNLayout(record_stride=35072)
     cache = torch.zeros((2, 4, layout.tile_bytes_aligned), dtype=torch.uint8)
@@ -553,7 +543,7 @@ def test_k_column_scale_reaches_every_token_subgroup(
     tail_key, tail_value = _tail_tensors()
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor([[0, 1]], dtype=torch.int32, device="xpu"),
         torch.tensor([256], dtype=torch.int32, device="xpu"),
         torch.full((2,), -1, dtype=torch.int32, device="xpu"),
@@ -565,8 +555,8 @@ def test_k_column_scale_reaches_every_token_subgroup(
         False,
         False,
         1,
-        0,
-        dpas_layout,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
 
     # Page 0 has logit 1 and value 0; page 1 has logit 5 and value 1.
@@ -576,194 +566,19 @@ def test_k_column_scale_reaches_every_token_subgroup(
     assert torch.isfinite(output).all()
 
 
-def test_factory_dpas_variants_match_canonical_ragged_and_hybrid() -> None:
-    cache, layout = make_random_cache(6)
-    swizzled = cache.clone()
-    for block in range(6):
-        for head in range(4):
-            swizzled[block, head] = swizzle_record_dpas_k4v4(
-                cache[block, head], layout
-            )
-
-    generator = torch.Generator().manual_seed(271828)
-    query = torch.randn((3, 24, 256), generator=generator).half().xpu()
-    pages = torch.tensor(
-        [[5, 0, 1], [4, 1, 2], [3, 2, 0]], dtype=torch.int32, device="xpu"
-    )
-    lengths = torch.tensor([127, 129, 257], dtype=torch.int32, device="xpu")
-    block_to_slot = torch.full((6,), -1, dtype=torch.int32, device="xpu")
-    block_to_slot[5] = 0
-    tail_key = torch.randn(
-        (1, 128, 4, 256), generator=generator, dtype=torch.float16
-    ).xpu()
-    tail_value = torch.randn(
-        (1, 128, 4, 256), generator=generator, dtype=torch.float16
-    ).xpu()
-    canonical_output = torch.empty_like(query)
-    q8_output = torch.empty_like(query)
-    q8_vector_output = torch.empty_like(query)
-    q6_outputs = {
-        kernel_variant: torch.empty_like(query)
-        for kernel_variant in Q6_FACTORY_VARIANTS
-    }
-    canonical_xpu = cache.xpu()
-    swizzled_xpu = swizzled.xpu()
-
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        query,
-        canonical_xpu,
-        pages,
-        lengths,
-        block_to_slot,
-        tail_key,
-        tail_value,
-        canonical_output,
-        257,
-        1.0 / 16.0,
-        False,
-        False,
-        0,
-        0,
-        False,
-    )
-    swizzled_xpu = swizzled.xpu()
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        query,
-        swizzled_xpu,
-        pages,
-        lengths,
-        block_to_slot,
-        tail_key,
-        tail_value,
-        q8_output,
-        257,
-        1.0 / 16.0,
-        False,
-        False,
-        0,
-        0,
-        True,
-    )
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        query,
-        swizzled_xpu,
-        pages,
-        lengths,
-        block_to_slot,
-        tail_key,
-        tail_value,
-        q8_vector_output,
-        257,
-        1.0 / 16.0,
-        False,
-        False,
-        0,
-        R1_P5_DPAS_VECTOR_LOAD,
-        True,
-    )
-    for kernel_variant, output in q6_outputs.items():
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            query,
-            swizzled_xpu,
-            pages,
-            lengths,
-            block_to_slot,
-            tail_key,
-            tail_value,
-            output,
-            257,
-            1.0 / 16.0,
-            False,
-            False,
-            0,
-            kernel_variant,
-            True,
-        )
-    torch.testing.assert_close(q8_output, canonical_output, rtol=0, atol=0)
-    torch.testing.assert_close(q8_vector_output, q8_output, rtol=0, atol=0)
-    for output in q6_outputs.values():
-        torch.testing.assert_close(output, q8_output, rtol=0, atol=0)
-
-
-def test_r1_p5_dpas_vector_load_fails_closed_without_dpas_layout() -> None:
-    cache, _ = make_cache(1)
-    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
-            "16, 17, 18, 20, and 21 require dpas_layout=True"
-        ),
-    ):
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            query,
-            cache.xpu(),
-            torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
-            torch.ones((1,), dtype=torch.int32, device="xpu"),
-            torch.full((1,), -1, dtype=torch.int32, device="xpu"),
-            *_tail_tensors(),
-            torch.empty_like(query),
-            1,
-            1.0 / 16.0,
-            False,
-            False,
-            0,
-            R1_P5_DPAS_VECTOR_LOAD,
-            False,
-        )
-
-
-@pytest.mark.parametrize("misalignment", ["base", "record_stride"])
-def test_r1_p5_dpas_vector_load_rejects_misaligned_cache(
-    misalignment: str,
-) -> None:
-    layout = KVarNLayout(record_stride=35072)
-    if misalignment == "base":
-        storage = torch.zeros(
-            4 * layout.tile_bytes_aligned + 1,
-            dtype=torch.uint8,
-            device="xpu",
-        )
-        cache = storage[1:].view(1, 4, layout.tile_bytes_aligned)
-        expected = "32-byte-aligned packed_cache base"
-    else:
-        cache = torch.zeros(
-            (1, 4, layout.tile_bytes_aligned + 4),
-            dtype=torch.uint8,
-            device="xpu",
-        )
-        expected = "32-byte-aligned packed_cache block and head strides"
-    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
-    with pytest.raises(RuntimeError, match=expected):
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            query,
-            cache,
-            torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
-            torch.ones((1,), dtype=torch.int32, device="xpu"),
-            torch.full((1,), -1, dtype=torch.int32, device="xpu"),
-            *_tail_tensors(),
-            torch.empty_like(query),
-            1,
-            1.0 / 16.0,
-            False,
-            False,
-            0,
-            R1_P5_DPAS_VECTOR_LOAD,
-            True,
-        )
-
-
-@pytest.mark.parametrize("kernel_variant", [5, -1, 99])
+@pytest.mark.parametrize(
+    "kernel_variant", RETIRED_KERNEL_VARIANTS + (-1, 5, 19, 99)
+)
 def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
     cache, _ = make_cache(1)
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     with pytest.raises(
         RuntimeError,
-        match=f"unsupported native KVarN kernel_variant {kernel_variant}",
+        match="only the qualified KVarN decoder",
     ):
         torch.ops._vllm_fa2_C.kvarn_decode(
             query,
-            cache.xpu(),
+            _dpas(cache),
             torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
             torch.ones((1,), dtype=torch.int32, device="xpu"),
             torch.full((1,), -1, dtype=torch.int32, device="xpu"),
@@ -779,131 +594,7 @@ def test_unimplemented_kernel_variants_fail_closed(kernel_variant: int) -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "kernel_variant",
-    [
-        R1_P2_DPAS_Q6,
-        R1_P5_DPAS_VECTOR_LOAD,
-        R1_P2_P5_DPAS_Q6_VECTOR_LOAD,
-        R2_Q6_CACHED_WEIGHTS,
-        R2_Q6_EXACT_ROWS,
-        R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
-        Q6_PAGE_PAIR,
-        Q6_MAIN_GRF128,
-        Q6_SPLIT_REDUCER_SPECIALIZED,
-        Q6_NEXT_PAGE_PREFETCH,
-        Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-        Q6_SIMD_UNPACK,
-        Q6_BLOCK_OUTPUT_STORE,
-    ],
-)
-def test_factory_variants_are_dpas_only(kernel_variant: int) -> None:
-    cache, _ = make_cache(1)
-    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
-    arguments = (
-        query,
-        cache.xpu(),
-        torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
-        torch.ones((1,), dtype=torch.int32, device="xpu"),
-        torch.full((1,), -1, dtype=torch.int32, device="xpu"),
-        *_tail_tensors(),
-        torch.empty_like(query),
-        1,
-        1.0 / 16.0,
-        False,
-        False,
-        1,
-        kernel_variant,
-        False,
-    )
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "kernel variants 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "
-            "16, 17, 18, 20, and 21 require dpas_layout=True"
-        ),
-    ):
-        torch.ops._vllm_fa2_C.kvarn_decode(*arguments)
-
-
-def test_r1_p2_dpas_q6_t64_matches_q8_at_262k_high_addresses() -> None:
-    """Keep Q6 exact across the service limit and high cache addresses."""
-    num_blocks = 2048
-    cache, _, _, _, _ = _make_long_structured_cache(num_blocks)
-    base = torch.arange(num_blocks, dtype=torch.int64)
-    page_rows = torch.stack(
-        (
-            base,
-            (base * 5 + 17) % num_blocks,
-            base.flip(0),
-            torch.cat((torch.tensor([2047, 1023]), base[2:])),
-        )
-    )
-    seq_lengths = (262144, 131071, 65536, 192)
-    generator = torch.Generator().manual_seed(20260903)
-    query = torch.randn((4, 24, 256), generator=generator).half().xpu()
-    cache_xpu = cache.xpu()
-    arguments = (
-        query,
-        cache_xpu,
-        page_rows.to(dtype=torch.int32, device="xpu"),
-        torch.tensor(seq_lengths, dtype=torch.int32, device="xpu"),
-        torch.full((num_blocks,), -1, dtype=torch.int32, device="xpu"),
-        *_tail_tensors(),
-    )
-    natural = torch.empty_like(query)
-    q8 = torch.empty_like(query)
-    q6 = torch.empty_like(query)
-    q8_vector = torch.empty_like(query)
-    q6_vector = torch.empty_like(query)
-    q6_simd_unpack = torch.empty_like(query)
-
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        natural,
-        max(seq_lengths),
-        1.0 / 16.0,
-        False,
-        False,
-        16,
-        0,
-        False,
-    )
-
-    # The structured cache uses uniform nibbles in each packed K/V payload,
-    # so its canonical and DPAS byte orders are identical. Metadata and page
-    # addressing remain nonuniform and exercise the high-address path.
-    for kernel_variant, output in (
-        (0, q8),
-        (R1_P2_DPAS_Q6, q6),
-        (R1_P5_DPAS_VECTOR_LOAD, q8_vector),
-        (R1_P2_P5_DPAS_Q6_VECTOR_LOAD, q6_vector),
-        (Q6_SIMD_UNPACK, q6_simd_unpack),
-    ):
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            *arguments,
-            output,
-            max(seq_lengths),
-            1.0 / 16.0,
-            False,
-            False,
-            16,
-            kernel_variant,
-            True,
-        )
-
-    torch.testing.assert_close(q8, natural, rtol=0, atol=0)
-    torch.testing.assert_close(q6, q8, rtol=0, atol=0)
-    torch.testing.assert_close(q8_vector, q8, rtol=0, atol=0)
-    torch.testing.assert_close(q6_vector, q8, rtol=0, atol=0)
-    torch.testing.assert_close(q6_simd_unpack, q8, rtol=0, atol=0)
-    assert torch.isfinite(q6).all()
-
-
-@pytest.mark.parametrize("kernel_variant", Q6_FACTORY_VARIANTS)
-def test_q6_multisplit_lse_owns_all_six_distinct_query_rows(
-    kernel_variant: int,
-) -> None:
+def test_q6_multisplit_lse_owns_all_six_distinct_query_rows() -> None:
     """Q6's two Q subtiles must each publish their own split statistics."""
     seq_len = 4096
     splits = 16
@@ -962,99 +653,10 @@ def test_q6_multisplit_lse_owns_all_six_distinct_query_rows(
         )
         return output, softmax_lse
 
-    q8_output, q8_lse = decode(0)
-    q6_output, q6_lse = decode(kernel_variant)
+    q6_output, q6_lse = decode(Q6_PREFETCH_RECORD_CURSOR)
     assert torch.isfinite(q6_lse).all()
-    # Every row must be independently observable in the control fixture.
-    assert torch.unique(q8_lse[0, :6].cpu(), dim=0).shape[0] == 6
-    if kernel_variant == Q6_PAGE_PAIR:
-        # Pairing two K64 fragments changes the compiler's FP32 evaluation
-        # graph without changing token or query-row ownership. Bound that
-        # permitted reassociation to one representable FP32 value.
-        q8_lse_cpu = q8_lse.cpu()
-        q6_lse_cpu = q6_lse.cpu()
-        lower = torch.nextafter(
-            q8_lse_cpu, torch.full_like(q8_lse_cpu, -torch.inf)
-        )
-        upper = torch.nextafter(
-            q8_lse_cpu, torch.full_like(q8_lse_cpu, torch.inf)
-        )
-        assert torch.all((q6_lse_cpu >= lower) & (q6_lse_cpu <= upper))
-    else:
-        torch.testing.assert_close(q6_lse, q8_lse, atol=0, rtol=0)
-    torch.testing.assert_close(q6_output, q8_output, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    ("batch", "splits"),
-    [
-        pytest.param(1, 1, id="b1-direct"),
-        pytest.param(1, 2, id="b1-split2"),
-        pytest.param(1, 4, id="b1-split4"),
-        pytest.param(4, 8, id="b4-split8"),
-        pytest.param(1, 16, id="b1-split16"),
-        pytest.param(1, 17, id="b1-generic-split17"),
-        pytest.param(1, 24, id="b1-generic-split24"),
-        pytest.param(4, 32, id="b4-split32"),
-    ],
-)
-def test_q6_block_output_store_matches_scalar_across_reducers(
-    batch: int, splits: int
-) -> None:
-    """ID15 changes only the main-kernel output-store policy."""
-    seq_len = 4096
-    pages_per_row = (seq_len + 127) // 128
-    canonical, layout = make_random_cache(pages_per_row)
-    swizzled = canonical.clone()
-    for block in range(pages_per_row):
-        for kv_head in range(4):
-            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
-                canonical[block, kv_head], layout
-            )
-
-    generator = torch.Generator().manual_seed(1500 + batch + splits)
-    query = torch.randn(
-        (batch, 24, 256), generator=generator, dtype=torch.float16
-    ).xpu()
-    pages = torch.arange(pages_per_row, dtype=torch.int32, device="xpu").repeat(
-        batch, 1
-    )
-    seq_lens = torch.arange(
-        seq_len, seq_len - batch, -1, dtype=torch.int32, device="xpu"
-    )
-    arguments = (
-        query,
-        swizzled.xpu(),
-        pages,
-        seq_lens,
-        torch.full((pages_per_row,), -1, dtype=torch.int32, device="xpu"),
-        *_tail_tensors(),
-    )
-    scalar_output = torch.empty_like(query)
-    block_output = torch.empty_like(query)
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        scalar_output,
-        seq_len,
-        1.0 / 16.0,
-        False,
-        False,
-        splits,
-        R1_P2_DPAS_Q6,
-        True,
-    )
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        block_output,
-        seq_len,
-        1.0 / 16.0,
-        False,
-        False,
-        splits,
-        Q6_BLOCK_OUTPUT_STORE,
-        True,
-    )
-    torch.testing.assert_close(block_output, scalar_output, atol=0, rtol=0)
+    assert torch.unique(q6_lse[0, :6].cpu(), dim=0).shape[0] == 6
+    assert torch.isfinite(q6_output).all()
 
 
 def test_full_precision_tail_and_packed_history_share_softmax() -> None:
@@ -1068,7 +670,7 @@ def test_full_precision_tail_and_packed_history_share_softmax() -> None:
     block_to_slot[2] = 0
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor([pages], dtype=torch.int32, device="xpu"),
         torch.tensor([129], dtype=torch.int32, device="xpu"),
         block_to_slot,
@@ -1077,6 +679,11 @@ def test_full_precision_tail_and_packed_history_share_softmax() -> None:
         output,
         129,
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     expected = torch.full_like(output.cpu(), (128 * 0.75) / 129)
     torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-3)
@@ -1108,7 +715,7 @@ def test_multiple_full_precision_tail_pages_share_one_softmax(
     output = torch.empty_like(query)
     torch.ops._vllm_fa2_C.kvarn_decode(
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor([pages], dtype=torch.int32, device="xpu"),
         torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
         block_to_slot,
@@ -1117,6 +724,11 @@ def test_multiple_full_precision_tail_pages_share_one_softmax(
         output,
         seq_len,
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     counts = (
         min(seq_len, 128),
@@ -1147,7 +759,7 @@ def test_two_random_tail_pages_match_fp32_attention_at_first_append() -> None:
     output = torch.empty_like(query_cpu, device="xpu")
     torch.ops._vllm_fa2_C.kvarn_decode(
         query_cpu.xpu(),
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor([pages], dtype=torch.int32, device="xpu"),
         torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
         lookup,
@@ -1156,6 +768,11 @@ def test_two_random_tail_pages_match_fp32_attention_at_first_append() -> None:
         output,
         8192,
         1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     keys = torch.cat((tail_key_cpu[0], tail_key_cpu[1, :1]))
     values = torch.cat((tail_value_cpu[0], tail_value_cpu[1, :1]))
@@ -1168,41 +785,6 @@ def test_two_random_tail_pages_match_fp32_attention_at_first_append() -> None:
     )
     torch.testing.assert_close(
         output.cpu()[0].float(), reference, atol=3e-3, rtol=3e-3
-    )
-
-
-def test_q6_page_pair_ignores_poisoned_inactive_hybrid_second_half() -> None:
-    """An exact K64 hybrid tail must not execute the page's second PV MMA."""
-    seq_len = 64
-    cache, _ = make_cache(1)
-    tail_key = torch.zeros((1, 128, 4, 256), dtype=torch.float16)
-    tail_value = torch.full_like(tail_key, 0.375)
-    tail_key[:, 64:].fill_(float("nan"))
-    tail_value[:, 64:].fill_(float("nan"))
-    query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
-    output = torch.full_like(query, float("nan"))
-
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        query,
-        cache.xpu(),
-        torch.zeros((1, 1), dtype=torch.int32, device="xpu"),
-        torch.tensor([seq_len], dtype=torch.int32, device="xpu"),
-        torch.zeros((1,), dtype=torch.int32, device="xpu"),
-        tail_key.xpu(),
-        tail_value.xpu(),
-        output,
-        seq_len,
-        1.0 / 16.0,
-        False,
-        False,
-        1,
-        Q6_PAGE_PAIR,
-        True,
-    )
-
-    assert torch.isfinite(output).all()
-    torch.testing.assert_close(
-        output.cpu(), torch.full_like(output.cpu(), 0.375), atol=2e-3, rtol=2e-3
     )
 
 
@@ -1222,15 +804,35 @@ def test_shared_prefix_is_deterministic() -> None:
     repeat = torch.empty_like(query)
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.tensor(pages, dtype=torch.int32, device="xpu"),
         seq_lens,
         block_to_slot,
         tail_key,
         tail_value,
     )
-    torch.ops._vllm_fa2_C.kvarn_decode(*arguments, output, 128, 1.0 / 16.0)
-    torch.ops._vllm_fa2_C.kvarn_decode(*arguments, repeat, 128, 1.0 / 16.0)
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        output,
+        128,
+        1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
+    )
+    torch.ops._vllm_fa2_C.kvarn_decode(
+        *arguments,
+        repeat,
+        128,
+        1.0 / 16.0,
+        False,
+        False,
+        0,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
+    )
     torch.testing.assert_close(output, repeat, atol=0, rtol=0)
     torch.testing.assert_close(
         output, output[0:1].expand_as(output), atol=0, rtol=0
@@ -1250,7 +852,7 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage() -> None:
     tail_key, tail_value = _tail_tensors()
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         pages,
         seq_lens,
         block_to_slot,
@@ -1269,7 +871,15 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage() -> None:
     )
 
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, legacy, 129, 1.0 / 16.0, False, False, 16, 0, False
+        *arguments,
+        legacy,
+        129,
+        1.0 / 16.0,
+        False,
+        False,
+        16,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     for _ in range(3):
         torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
@@ -1283,8 +893,8 @@ def test_decode_with_scratch_matches_legacy_and_reuses_storage() -> None:
             False,
             False,
             16,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
         assert pointers == tuple(
             tensor.data_ptr() for tensor in (temp_output, exp_sums, max_logits)
@@ -1301,7 +911,7 @@ def test_multisplit_scratch_requires_exact_split_extent(
     query = torch.zeros((1, 24, 256), dtype=torch.float16, device="xpu")
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.arange(16, dtype=torch.int32, device="xpu").reshape(1, 16),
         torch.tensor([2048], dtype=torch.int32, device="xpu"),
         torch.full((16,), -1, dtype=torch.int32, device="xpu"),
@@ -1331,8 +941,8 @@ def test_multisplit_scratch_requires_exact_split_extent(
             False,
             False,
             2,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
 
 
@@ -1355,7 +965,7 @@ def test_split_local_scratch_survives_allocator_pressure(
     actual = torch.empty_like(query)
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         pages,
         seq_lens,
         block_to_slot,
@@ -1364,12 +974,28 @@ def test_split_local_scratch_survives_allocator_pressure(
     )
 
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, expected, 6000, 1.0 / 16.0, False, False, splits, 0, False
+        *arguments,
+        expected,
+        6000,
+        1.0 / 16.0,
+        False,
+        False,
+        splits,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     torch.xpu.synchronize()
     for _ in range(16):
         torch.ops._vllm_fa2_C.kvarn_decode(
-            *arguments, actual, 6000, 1.0 / 16.0, False, False, splits, 0, False
+            *arguments,
+            actual,
+            6000,
+            1.0 / 16.0,
+            False,
+            False,
+            splits,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
         # Match all three local scratch allocation classes before consuming
         # the result, maximizing the chance of premature allocator reuse.
@@ -1406,7 +1032,7 @@ def test_split_matches_split1(
     tail_key, tail_value = _tail_tensors()
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         pages,
         seq_lens,
         block_to_slot,
@@ -1416,7 +1042,15 @@ def test_split_matches_split1(
     split1 = torch.empty_like(query)
     split_output = torch.empty_like(query)
     torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments, split1, seq_len, 1.0 / 16.0, False, False, 1, 0, False
+        *arguments,
+        split1,
+        seq_len,
+        1.0 / 16.0,
+        False,
+        False,
+        1,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
         *arguments,
@@ -1426,8 +1060,8 @@ def test_split_matches_split1(
         False,
         False,
         splits,
-        0,
-        False,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     torch.testing.assert_close(split_output, split1, atol=2e-2, rtol=2e-2)
 
@@ -1451,7 +1085,7 @@ def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
     )
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         pages,
         seq_lens,
         block_to_slot,
@@ -1502,8 +1136,8 @@ def test_ragged_b4_ignores_poisoned_globally_inactive_splits(
             fused_hadamard,
             False,
             splits,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
@@ -1565,7 +1199,7 @@ def test_fused_output_hadamard_matches_separate_transform(
     tail_key, tail_value = _tail_tensors()
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         pages,
         seq_lens,
         block_to_slot,
@@ -1584,8 +1218,8 @@ def test_fused_output_hadamard_matches_separate_transform(
         False,
         False,
         splits,
-        0,
-        False,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
     torch.ops._vllm_fa2_C.kvarn_hadamard(
         rotated.view(-1, 256), expected.view(-1, 256)
@@ -1598,8 +1232,8 @@ def test_fused_output_hadamard_matches_separate_transform(
         True,
         False,
         splits,
-        0,
-        False,
+        Q6_PREFETCH_RECORD_CURSOR,
+        True,
     )
 
     assert torch.isfinite(fused).all()
@@ -1612,7 +1246,7 @@ def test_fused_output_hadamard_rejects_single_split() -> None:
     with pytest.raises(RuntimeError, match="requires a multi-split"):
         torch.ops._vllm_fa2_C.kvarn_decode(
             query,
-            cache.xpu(),
+            _dpas(cache),
             torch.arange(4, dtype=torch.int32, device="xpu").reshape(1, 4),
             torch.tensor([128], dtype=torch.int32, device="xpu"),
             torch.full((4,), -1, dtype=torch.int32, device="xpu"),
@@ -1623,204 +1257,9 @@ def test_fused_output_hadamard_rejects_single_split() -> None:
             True,
             False,
             1,
-            0,
-            False,
-        )
-
-
-@pytest.mark.parametrize(
-    ("batch", "splits"),
-    [
-        pytest.param(1, 2, id="policy-split2"),
-        pytest.param(1, 4, id="policy-split4"),
-        pytest.param(1, 32, id="b1-split32"),
-        pytest.param(4, 8, id="b4-split8"),
-        pytest.param(12, 16, id="b12-split16"),
-        pytest.param(1, 17, id="generic-fallback-split17"),
-        pytest.param(1, 24, id="generic-fallback-split24"),
-    ],
-)
-@pytest.mark.parametrize(
-    ("runtime_variant", "specialized_variant"),
-    [
-        pytest.param(
-            R1_P2_DPAS_Q6,
-            Q6_SPLIT_REDUCER_SPECIALIZED,
-            id="base-mainloop",
-        ),
-        pytest.param(
-            Q6_NEXT_PAGE_PREFETCH,
-            Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-            id="next-page-prefetch-mainloop",
-        ),
-    ],
-)
-def test_q6_specialized_fused_reducer_matches_runtime_reducer(
-    batch: int,
-    splits: int,
-    runtime_variant: int,
-    specialized_variant: int,
-) -> None:
-    """Specialized variants change only the reducer after Q6 production."""
-    seq_len = 4096
-    pages_per_row = (seq_len + 127) // 128
-    canonical, layout = make_random_cache(pages_per_row)
-    swizzled = canonical.clone()
-    for block in range(pages_per_row):
-        for kv_head in range(4):
-            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
-                canonical[block, kv_head], layout
-            )
-
-    generator = torch.Generator().manual_seed(1100 + batch + splits)
-    query = torch.randn(
-        (batch, 24, 256), generator=generator, dtype=torch.float16
-    ).xpu()
-    pages = torch.arange(pages_per_row, dtype=torch.int32, device="xpu").repeat(
-        batch, 1
-    )
-    seq_lens = torch.arange(
-        seq_len, seq_len - batch, -1, dtype=torch.int32, device="xpu"
-    )
-    arguments = (
-        query,
-        swizzled.xpu(),
-        pages,
-        seq_lens,
-        torch.full((pages_per_row,), -1, dtype=torch.int32, device="xpu"),
-        *_tail_tensors(),
-    )
-    runtime_output = torch.empty_like(query)
-    specialized_output = torch.empty_like(query)
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        runtime_output,
-        seq_len,
-        1.0 / 16.0,
-        True,
-        False,
-        splits,
-        runtime_variant,
-        True,
-    )
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        specialized_output,
-        seq_len,
-        1.0 / 16.0,
-        True,
-        False,
-        splits,
-        specialized_variant,
-        True,
-    )
-    torch.testing.assert_close(
-        specialized_output, runtime_output, atol=0, rtol=0
-    )
-
-
-def test_q6_next_page_prefetch_handles_split_parity_and_hybrid_target() -> None:
-    """An odd split start may look ahead to a hybrid next physical page."""
-    batch = 4
-    splits = 8
-    max_seq_len = 33 * 64
-    pages_per_row = (max_seq_len + 127) // 128
-    canonical, layout = make_random_cache(pages_per_row)
-    swizzled = canonical.clone()
-    for block in range(pages_per_row):
-        for kv_head in range(4):
-            swizzled[block, kv_head] = swizzle_record_dpas_k4v4(
-                canonical[block, kv_head], layout
-            )
-
-    max_kv_tiles = (max_seq_len + 63) // 64
-    tiles_per_split = (max_kv_tiles + splits - 1) // splits
-    split_starts = [
-        split * tiles_per_split
-        for split in range(splits)
-        if split * tiles_per_split < max_kv_tiles
-    ]
-    assert tiles_per_split == 5
-    assert {start % 2 for start in split_starts} == {0, 1}
-
-    # Split 1 starts on the second half of page 2. Its first prefetch target
-    # is page 3, which deliberately resides in the full-precision tail pool.
-    odd_split_start = split_starts[1]
-    next_page_tile = (odd_split_start & ~1) + 2
-    hybrid_page = next_page_tile // 2
-    assert odd_split_start % 2 == 1
-    assert hybrid_page == 3
-
-    tail_key = torch.empty((1, 128, 4, 256), dtype=torch.float16)
-    tail_value = torch.empty_like(tail_key)
-    for kv_head in range(4):
-        key_page, value_page = dequant_record(
-            canonical[hybrid_page, kv_head], layout
-        )
-        tail_key[0, :, kv_head] = key_page
-        tail_value[0, :, kv_head] = value_page
-
-    generator = torch.Generator().manual_seed(12008)
-    query = torch.randn(
-        (batch, 24, 256), generator=generator, dtype=torch.float16
-    ).xpu()
-    pages = torch.arange(pages_per_row, dtype=torch.int32, device="xpu").repeat(
-        batch, 1
-    )
-    seq_lens = torch.tensor(
-        [max_seq_len, 2049, 1985, 1921], dtype=torch.int32, device="xpu"
-    )
-    block_to_slot = torch.full(
-        (pages_per_row,), -1, dtype=torch.int32, device="xpu"
-    )
-    block_to_slot[hybrid_page] = 0
-    arguments = (
-        query,
-        swizzled.xpu(),
-        pages,
-        seq_lens,
-        block_to_slot,
-        tail_key.xpu(),
-        tail_value.xpu(),
-    )
-    baseline = torch.empty_like(query)
-    prefetched = {
-        variant: torch.empty_like(query)
-        for variant in (
-            Q6_NEXT_PAGE_PREFETCH,
-            Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-            Q6_CURRENT_HALF_V_PREFETCH,
-            Q6_PAGE_RECORD_CURSOR,
             Q6_PREFETCH_RECORD_CURSOR,
-            Q6_PAGE_METADATA_CURSOR,
-            Q6_PAIRED_NIBBLE_HALF2,
-        )
-    }
-    torch.ops._vllm_fa2_C.kvarn_decode(
-        *arguments,
-        baseline,
-        max_seq_len,
-        1.0 / 16.0,
-        False,
-        False,
-        splits,
-        R1_P2_DPAS_Q6,
-        True,
-    )
-    for variant, output in prefetched.items():
-        torch.ops._vllm_fa2_C.kvarn_decode(
-            *arguments,
-            output,
-            max_seq_len,
-            1.0 / 16.0,
-            False,
-            False,
-            splits,
-            variant,
             True,
         )
-        assert torch.isfinite(output).all()
-        torch.testing.assert_close(output, baseline, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("with_scratch", [False, True])
@@ -1836,7 +1275,7 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
     query = torch.randn((1, 24, 256), generator=generator).half().xpu()
     arguments = (
         query,
-        cache.xpu(),
+        _dpas(cache),
         torch.arange(pages_per_row, dtype=torch.int32, device="xpu").reshape(
             1, pages_per_row
         ),
@@ -1865,8 +1304,8 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
             True,
             False,
             splits,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
         torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
             *arguments,
@@ -1877,8 +1316,8 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
             True,
             True,
             splits,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
     else:
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1889,8 +1328,8 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
             True,
             False,
             splits,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
         torch.ops._vllm_fa2_C.kvarn_decode(
             *arguments,
@@ -1900,8 +1339,8 @@ def test_fused_bf16_output_matches_fp16_copy_contract(
             True,
             True,
             splits,
-            0,
-            False,
+            Q6_PREFETCH_RECORD_CURSOR,
+            True,
         )
 
     torch.testing.assert_close(
@@ -1915,7 +1354,7 @@ def test_bf16_output_requires_fused_unrotation() -> None:
     with pytest.raises(RuntimeError, match="requires unrotate_output"):
         torch.ops._vllm_fa2_C.kvarn_decode(
             query,
-            cache.xpu(),
+            _dpas(cache),
             torch.arange(4, dtype=torch.int32, device="xpu").reshape(1, 4),
             torch.tensor([128], dtype=torch.int32, device="xpu"),
             torch.full((4,), -1, dtype=torch.int32, device="xpu"),
@@ -1926,62 +1365,20 @@ def test_bf16_output_requires_fused_unrotation() -> None:
             False,
             True,
             16,
-            0,
-            False,
-        )
-
-
-_LONG_CONTEXT_LAYOUT_SPLITS = (
-    [
-        pytest.param(False, splits, 0, id=f"natural-split{splits}")
-        for splits in (1, 2, 4, 8, 16, 17, 24, 32)
-    ]
-    + [
-        pytest.param(True, splits, 0, id=f"dpas-split{splits}")
-        for splits in (1, 16, 24, 32)
-    ]
-    + [
-        pytest.param(True, splits, 1, id=f"dpas-qk-i8u4-split{splits}")
-        for splits in (1, 16, 24, 32)
-    ]
-    + [
-        pytest.param(
+            Q6_PREFETCH_RECORD_CURSOR,
             True,
-            24,
-            kernel_variant,
-            id=variant_id,
         )
-        for kernel_variant, variant_id in (
-            (R1_P2_DPAS_Q6, "r1-p2-dpas-q6"),
-            (R1_P5_DPAS_VECTOR_LOAD, "r1-p5-dpas-vector-load"),
-            (
-                R1_P2_P5_DPAS_Q6_VECTOR_LOAD,
-                "r1-p2-p5-dpas-q6-vector-load",
-            ),
-            (R2_Q6_CACHED_WEIGHTS, "r2-q6-cached-weights"),
-            (R2_Q6_EXACT_ROWS, "r2-q6-exact-rows"),
-            (
-                R2_Q6_CACHED_WEIGHTS_EXACT_ROWS,
-                "r2-q6-cached-weights-exact-rows",
-            ),
-            (Q6_PAGE_PAIR, "q6-page-pair"),
-            (Q6_MAIN_GRF128, "q6_main_grf128"),
-            (Q6_SPLIT_REDUCER_SPECIALIZED, "q6-split-reducer-specialized"),
-            (Q6_NEXT_PAGE_PREFETCH, "q6-next-page-prefetch"),
-            (
-                Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-                "q6-next-page-prefetch-split-reducer",
-            ),
-            (Q6_SIMD_UNPACK, "q6-simd-unpack"),
-            (Q6_BLOCK_OUTPUT_STORE, "q6-block-output-store"),
-            (Q6_CURRENT_HALF_V_PREFETCH, "q6-current-half-v-prefetch"),
-            (Q6_PAGE_RECORD_CURSOR, "q6-page-record-cursor"),
-            (Q6_PREFETCH_RECORD_CURSOR, "q6-prefetch-record-cursor"),
-            (Q6_PAGE_METADATA_CURSOR, "q6-page-metadata-cursor"),
-            (Q6_PAIRED_NIBBLE_HALF2, "q6-paired-nibble-half2"),
-        )
-    ]
-)
+
+
+_LONG_CONTEXT_LAYOUT_SPLITS = [
+    pytest.param(
+        True,
+        splits,
+        Q6_PREFETCH_RECORD_CURSOR,
+        id=f"qualified-id18-split{splits}",
+    )
+    for splits in (1, 16, 24, 32)
+]
 
 
 @pytest.mark.parametrize(
@@ -2070,7 +1467,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     block_to_slot[hybrid_physical] = 0
     arguments = (
         query.xpu(),
-        cache.xpu(),
+        _dpas(cache),
         page_rows.to(dtype=torch.int32, device="xpu"),
         torch.tensor(seq_lengths, dtype=torch.int32, device="xpu"),
         block_to_slot,
@@ -2118,7 +1515,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         softmax_lse_cpu = exp_sums.cpu()
         legacy_max_logits_cpu = max_logits.cpu()
         invalid_lse = torch.finfo(torch.float32).min
-        work_unit_tokens = 128 if kernel_variant == Q6_PAGE_PAIR else 64
+        work_unit_tokens = 64
         max_work_units = (
             max(seq_lengths) + work_unit_tokens - 1
         ) // work_unit_tokens
@@ -2222,26 +1619,3 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     assert torch.isfinite(repeat).all()
     torch.testing.assert_close(output.cpu(), expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(output, repeat, atol=0, rtol=0)
-
-    if kernel_variant == Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER:
-        runtime_fused = torch.empty_like(output)
-        specialized_fused = torch.empty_like(output)
-        for variant, target in (
-            (Q6_NEXT_PAGE_PREFETCH, runtime_fused),
-            (Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER, specialized_fused),
-        ):
-            torch.ops._vllm_fa2_C.kvarn_decode(
-                *arguments,
-                target,
-                max(seq_lengths),
-                1.0 / 16.0,
-                True,
-                False,
-                splits,
-                variant,
-                dpas_layout,
-            )
-        assert torch.isfinite(specialized_fused).all()
-        torch.testing.assert_close(
-            specialized_fused, runtime_fused, atol=0, rtol=0
-        )

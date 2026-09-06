@@ -10,7 +10,11 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from benchmark.kvarn_utils import KVarNLayout, dequant_record
+from benchmark.kvarn_utils import (
+    KVarNLayout,
+    dequant_record,
+    swizzle_record_dpas_k4v4,
+)
 
 
 def _put_half(record: torch.Tensor, offset: int, values: torch.Tensor) -> None:
@@ -154,9 +158,19 @@ def main() -> None:
     args = parser.parse_args()
     torch.ops.load_library(args.library)
 
-    cpu_cache, _ = make_cache(3, args.record_stride)
+    cpu_cache, layout = make_cache(3, args.record_stride)
     assert cpu_cache.shape == (3, 4, args.record_stride)
-    cache = cpu_cache.xpu()
+
+    def native_cache(canonical, layout):
+        packed = canonical.clone()
+        for block in range(packed.shape[0]):
+            for head in range(packed.shape[1]):
+                packed[block, head] = swizzle_record_dpas_k4v4(
+                    canonical[block, head], layout
+                )
+        return packed.xpu()
+
+    cache = native_cache(cpu_cache, layout)
     block_to_slot = torch.full((3,), -1, dtype=torch.int32, device="xpu")
     tail_key = torch.zeros((1, 128, 4, 256), dtype=torch.float16, device="xpu")
     tail_value = torch.zeros_like(tail_key)
@@ -182,8 +196,8 @@ def main() -> None:
             False,
             False,
             0,
-            0,
-            False,
+            18,
+            True,
         )
         torch.xpu.synchronize()
         expected = torch.full_like(output.cpu(), expected_value(pages, seq_len))
@@ -214,8 +228,8 @@ def main() -> None:
         False,
         False,
         0,
-        0,
-        False,
+        18,
+        True,
     )
     torch.xpu.synchronize()
     hybrid_expected = torch.full_like(output.cpu(), (128 * 0.75) / 129)
@@ -239,7 +253,7 @@ def main() -> None:
     scale = 1.0 / 16.0
     torch.ops._vllm_fa2_C.kvarn_decode(
         random_query.xpu(),
-        random_cache.xpu(),
+        native_cache(random_cache, random_layout),
         random_table,
         random_seq_lens,
         random_map,
@@ -251,8 +265,8 @@ def main() -> None:
         False,
         False,
         0,
-        0,
-        False,
+        18,
+        True,
     )
     torch.xpu.synchronize()
     reference = torch.cat(
