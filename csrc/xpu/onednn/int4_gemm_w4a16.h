@@ -59,6 +59,9 @@ static inline void dnnl_matmul_w4a16_int4(
 
   auto f_attr = [&](primitive_attr& pattr) {
     pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    // Avoid floating-point global K-parallel strategies whose accumulation
+    // order can change between otherwise identical executions.
+    pattr.set_deterministic(true);
     pattr.set_scales(
         DNNL_ARG_WEIGHTS,
         /* mask */ (1 << 0) + (1 << 1),
