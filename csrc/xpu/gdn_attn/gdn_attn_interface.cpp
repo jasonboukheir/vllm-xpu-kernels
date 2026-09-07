@@ -116,7 +116,10 @@ std::vector<torch::Tensor> causal_conv1d_spec(
       num_accepted_tokens.size(0) == num_spec_decodes,
       "num_accepted_tokens size must be num_spec_decodes");
 
-  TORCH_CHECK(spec_token == num_spec_decodes * (num_speculative_tokens + 1));
+  // Query lengths may shrink at the context/scheduling boundary. State
+  // columns retain full capacity for rollback from the previous iteration.
+  TORCH_CHECK(spec_token >= num_spec_decodes);
+  TORCH_CHECK(spec_token <= num_spec_decodes * (num_speculative_tokens + 1));
   TORCH_CHECK(spec_token > 0, "spec_token must be > 0 for causal_conv1d_spec");
 
   TORCH_CHECK(

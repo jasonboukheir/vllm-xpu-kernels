@@ -504,6 +504,7 @@ struct causal_conv1d_spec_kernel {
       const T* conv_bias,
       T* conv_states,
       const int conv_states_stride_0,
+      const int* query_start_loc,
       const int* token_indx,
       const int* cache_indices,
       const int cache_indices_stride_0,
@@ -530,6 +531,7 @@ struct causal_conv1d_spec_kernel {
         conv_bias(conv_bias),
         conv_states(conv_states),
         conv_states_stride_0(conv_states_stride_0),
+        query_start_loc(query_start_loc),
         token_indx(token_indx),
         cache_indices(cache_indices),
         cache_indices_stride_0(cache_indices_stride_0),
@@ -564,6 +566,9 @@ struct causal_conv1d_spec_kernel {
     const int batch_id = item.get_group(0);
     const int local_group_id = item.get_group(1);
     const int local_id = item.get_local_linear_id();
+    const int seq_start = query_start_loc[batch_id];
+    const int seq_tokens = query_start_loc[batch_id + 1] - seq_start;
+    assert(seq_tokens > 0 && seq_tokens <= num_spec_tokens);
     const int qkvz_elems_id =
         local_group_id * elems_per_group + local_id * elems_per_item;
 
@@ -616,8 +621,8 @@ struct causal_conv1d_spec_kernel {
     }
 
     // -- b / a reorder (mixed_ba GLOBAL → b_out/a_out LOCAL) ----------------
-    for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
-      const int token_id_local = batch_id * num_spec_tokens + t_local;
+    for (int t_local = 0; t_local < seq_tokens; ++t_local) {
+      const int token_id_local = seq_start + t_local;
       const int global_t = token_indx[token_id_local];
       if constexpr (ReorderInput) {
         if (qkvz_elems_id < num_v_heads) {
@@ -654,8 +659,8 @@ struct causal_conv1d_spec_kernel {
     if (is_z) {
       int z_elems_id =
           k_heads_id * z_dim + qkvz_dim_id - (q_dim + k_dim + v_dim);
-      for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
-        const int token_id_local = batch_id * num_spec_tokens + t_local;
+      for (int t_local = 0; t_local < seq_tokens; ++t_local) {
+        const int token_id_local = seq_start + t_local;
         const int global_t = token_indx[token_id_local];
 #pragma unroll
         for (int e = 0; e < elems_per_item; ++e) {
@@ -674,10 +679,9 @@ struct causal_conv1d_spec_kernel {
     // Single cache line (column 0); accepted window starts at row init_row.
     int init_row = num_accepted_tokens[batch_id] - 1;
     if (init_row < 0) init_row = 0;
-    // Match the effective state length used by the CUDA/Triton path.  The
-    // leading stride may span interleaved states from multiple layers, so it
-    // cannot be used to recover this dimension.
-    const int state_len = Width - 1 + (num_spec_tokens - 1);
+    // Write only the history needed by this step's rollback positions. The
+    // allocation still holds full-capacity history from the previous step.
+    const int state_len = Width - 2 + seq_tokens;
     const int state_id = cache_indices[batch_id * cache_indices_stride_0 + 0];
     const bool has_conv_state = (state_id != pad_slot_id);
     T* state_line_ptr = has_conv_state
@@ -713,8 +717,8 @@ struct causal_conv1d_spec_kernel {
       }
     }
 
-    for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
-      const int token_id_local = batch_id * num_spec_tokens + t_local;
+    for (int t_local = 0; t_local < seq_tokens; ++t_local) {
+      const int token_id_local = seq_start + t_local;
       const int global_t = token_indx[token_id_local];
 
       // Shift window left by 1 (for t_local == 0 the trailing slot is fresh).
@@ -794,7 +798,7 @@ struct causal_conv1d_spec_kernel {
     // from row init_row+1, rows [hist_rows, state_len) = the K draft inputs.
     // In-place left shift is safe since src row (init_row+1+j) >= dst row j.
     if (Width > 1 && has_conv_state) {
-      const int hist_rows = state_len - num_spec_tokens;
+      const int hist_rows = state_len - seq_tokens;
       for (int j = 0; j < state_len; ++j) {
         if (j < hist_rows) {
           const int src_row = init_row + 1 + j;
@@ -805,7 +809,7 @@ struct causal_conv1d_spec_kernel {
           }
         } else {
           const int draft_t = j - hist_rows;
-          const int token_id_local = batch_id * num_spec_tokens + draft_t;
+          const int token_id_local = seq_start + draft_t;
           const int global_t = token_indx[token_id_local];
 #pragma unroll
           for (int e = 0; e < elems_per_item; ++e) {
@@ -830,6 +834,7 @@ struct causal_conv1d_spec_kernel {
   const T* conv_bias;
   T* conv_states;
   const int conv_states_stride_0;
+  const int* query_start_loc;
   const int* token_indx;
   const int* cache_indices;
   const int cache_indices_stride_0;
@@ -904,6 +909,7 @@ void kernel_launcher(
           conv_bias,
           conv_states,
           conv_states_stride_0,
+          query_start_loc,
           token_indx,
           cache_indices,
           cache_indices_stride_0,
