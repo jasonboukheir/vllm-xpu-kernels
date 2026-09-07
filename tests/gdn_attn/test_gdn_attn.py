@@ -1337,7 +1337,6 @@ def test_gdn_attention_gqa_ratio3_prefill(dtype, reorder_input):
     mixed_ba_size = num_k_heads * (2 * num_v_heads // num_k_heads)
     mixed_qkv_size = num_k_heads * (
         2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
-
     projected_states_qkvz = torch.randn((num_actual_tokens, mixed_qkvz_size),
                                         dtype=dtype, device=device)
     projected_states_ba = torch.randn((num_actual_tokens, mixed_ba_size),
