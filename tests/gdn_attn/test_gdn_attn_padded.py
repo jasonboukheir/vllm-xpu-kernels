@@ -26,6 +26,169 @@ import torch
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 
 
+@pytest.mark.parametrize("lengths", [(2,), (1,), (3, 2, 1)])
+@pytest.mark.parametrize("accepted", [1, 3])
+@pytest.mark.parametrize("reorder_input", [False, True])
+@pytest.mark.parametrize("shape", [(4, 8, 32), (16, 48, 128)])
+@torch.inference_mode()
+def test_gdn_shortened_mtp_preserves_rollback(
+    lengths, accepted, reorder_input, shape
+):
+    """Short/ragged steps equal full-step prefixes, including continuation.
+
+    The state capacity stays three even when only one/two queries are run:
+    the previous iteration may have accepted all three. Compare both stages
+    against full-width execution, then continue from every accepted prefix.
+    Unscheduled output rows, rollback slots and adjacent layers are guards.
+    """
+    torch.manual_seed(20260907)
+    device, dtype = "xpu", torch.bfloat16
+    kh, vh, dim = shape
+    batch, capacity, width = len(lengths), 3, 4
+    total = batch * capacity
+    qkv_size = (2 * kh + vh) * dim
+    state_len = width - 2 + capacity
+    slots = (
+        torch.randperm(total, device=device)
+        .to(torch.int32)
+        .reshape(batch, capacity)
+    )
+    conv_storage = torch.randn(
+        total, 3, state_len, qkv_size, dtype=dtype, device=device
+    )
+    ref_conv_storage = conv_storage.clone()
+    initial_conv = conv_storage.clone()
+    conv, ref_conv = conv_storage[:, 1], ref_conv_storage[:, 1]
+    ssm = torch.randn(total, vh, dim, dim, device=device)
+    ref_ssm, initial_ssm = ssm.clone(), ssm.clone()
+    weights = torch.randn(qkv_size, width, dtype=dtype, device=device)
+    bias = torch.randn(qkv_size, dtype=dtype, device=device)
+    a_log = torch.randn(vh, device=device)
+    dt_bias = torch.randn(vh, dtype=dtype, device=device)
+
+    def run(conv_state, ssm_state, query_lengths, naccepted, qkvz, ba):
+        starts = [0]
+        indices = []
+        for n, length in enumerate(query_lengths):
+            starts.append(starts[-1] + length)
+            indices.extend(range(n * capacity, n * capacity + length))
+        indices = torch.tensor(indices, dtype=torch.int32, device=device)
+        out = torch.full((total + 2, vh, dim), 17, dtype=dtype, device=device)
+        z = out.clone()
+        torch.ops._xpu_C.gdn_attention(
+            out,
+            z,
+            qkvz,
+            ba,
+            kh,
+            vh,
+            dim,
+            dim,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            conv_weights=weights,
+            conv_bias=bias,
+            activation="silu",
+            A_log=a_log,
+            dt_bias=dt_bias,
+            num_prefills=0,
+            num_decodes=0,
+            num_spec_decodes=batch,
+            has_initial_state=None,
+            non_spec_query_start_loc=None,
+            non_spec_token_indx=None,
+            non_spec_state_indices_tensor=None,
+            spec_query_start_loc=torch.tensor(
+                starts, dtype=torch.int32, device=device
+            ),
+            spec_token_indx=indices,
+            spec_state_indices_tensor=slots,
+            num_accepted_tokens=torch.tensor(
+                naccepted, dtype=torch.int32, device=device
+            ),
+            num_actual_tokens=total,
+            tp_size=1,
+            reorder_input=reorder_input,
+            split_mixed_non_spec=False,
+        )
+        return out, z, indices.long()
+
+    def inputs():
+        return (
+            torch.randn(
+                total, (2 * kh + 2 * vh) * dim, dtype=dtype, device=device
+            ),
+            torch.randn(total, 2 * vh, dtype=dtype, device=device),
+        )
+
+    qkvz, ba = inputs()
+    expected, expected_z, _ = run(
+        ref_conv, ref_ssm, [capacity] * batch, [accepted] * batch, qkvz, ba
+    )
+    actual, actual_z, active = run(
+        conv, ssm, lengths, [accepted] * batch, qkvz, ba
+    )
+    torch.testing.assert_close(actual[active], expected[active], atol=0, rtol=0)
+    torch.testing.assert_close(
+        actual_z[active], expected_z[active], atol=0, rtol=0
+    )
+    inactive = torch.ones(total + 2, dtype=torch.bool, device=device)
+    inactive[active] = False
+    assert torch.all(actual[inactive] == 17)
+    assert torch.all(actual_z[inactive] == 17)
+    for n, length in enumerate(lengths):
+        conv_slot = int(slots[n, 0])
+        valid_rows = width - 2 + length
+        torch.testing.assert_close(
+            conv[conv_slot, :valid_rows],
+            ref_conv[conv_slot, :valid_rows],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            conv[conv_slot, valid_rows:],
+            initial_conv[conv_slot, 1, valid_rows:],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            ssm[slots[n, :length].long()],
+            ref_ssm[slots[n, :length].long()],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            ssm[slots[n, length:].long()],
+            initial_ssm[slots[n, length:].long()],
+            atol=0,
+            rtol=0,
+        )
+    torch.testing.assert_close(
+        conv_storage[:, (0, 2)], initial_conv[:, (0, 2)], atol=0, rtol=0
+    )
+
+    # A shortened step must leave the next full step's history correct too.
+    # Exercise every possible acceptance count, not only full acceptance.
+    for accepted_next in range(1, max(lengths) + 1):
+        counts = [min(accepted_next, length) for length in lengths]
+        qkvz, ba = inputs()
+        next_conv, next_ssm = conv.clone(), ssm.clone()
+        next_ref_conv, next_ref_ssm = ref_conv.clone(), ref_ssm.clone()
+        actual, actual_z, _ = run(
+            next_conv, next_ssm, [capacity] * batch, counts, qkvz, ba
+        )
+        expected, expected_z, _ = run(
+            next_ref_conv, next_ref_ssm, [capacity] * batch, counts, qkvz, ba
+        )
+        for result, reference in [
+            (actual, expected),
+            (actual_z, expected_z),
+            (next_conv, next_ref_conv),
+            (next_ssm, next_ref_ssm),
+        ]:
+            torch.testing.assert_close(result, reference, atol=0, rtol=0)
+
+
 def _build_inputs(num_actual_tokens, padded_size, dtype, device):
     """Allocate a minimal decode-only call shape with a padded leading dim."""
     num_k_heads = 1
