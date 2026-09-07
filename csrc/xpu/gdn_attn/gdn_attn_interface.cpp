@@ -452,12 +452,20 @@ std::vector<torch::Tensor> causal_conv1d_non_spec(
         {num_v_heads / tp_size, non_spec_token + padding_size},
         torch::dtype(torch::kFloat32).device(device).requires_grad(false));
 
+    // The SLM-tiled prefill kernel is disabled for correctness. It has produced
+    // corrupted q/k/v for prefills of at least one tile on Arc B70 with oneAPI
+    // 2026.0, even after its work-group metadata broadcast was replaced with
+    // per-work-item recomputation. Keep the dispatch explicit so it can be
+    // re-enabled only after a device-level determinism regression passes.
+    constexpr bool enable_tiled_prefill = false;
+
     // Determine whether fused l2norm is valid for the chosen conv1d path.
     // Tiled kernel: only valid when all Q+K features fit in a single
     // feature chunk, i.e. 2 * head_k_dim <= feats_per_wg (256).
     // Untiled kernel: always valid (entire QKV in one WG).
     constexpr int tiled_feats_per_wg = 256;  // wg_size(64) * elems_per_item(4)
-    const bool use_tiled = (non_spec_token >= gdn::conv1d_tile_size);
+    const bool use_tiled =
+        enable_tiled_prefill && non_spec_token >= gdn::conv1d_tile_size;
     const bool fuse_l2norm =
         use_tiled ? (2 * head_k_dim <= tiled_feats_per_wg) : true;
 
