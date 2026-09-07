@@ -2027,6 +2027,188 @@ def test_qwen38_gdn_state_carry_is_exact_on_canonical_boundaries():
 
 
 @torch.inference_mode()
+def test_qwen38_gdn_cached_decode_is_exact_in_mixed_prefill():
+    """A decode and fresh prefill must be separable in a mixed call.
+
+    Production ``split_decodes_and_prefills`` packs the one-token decode first
+    and the 127-token fresh prefill second. With no speculative requests,
+    metadata keeps that order without token-index indirection. The mixed call
+    selects the prefill-capable XPU route because ``num_prefills > 0``.
+    """
+    device = "xpu"
+    dtype = torch.bfloat16
+    torch.manual_seed(20260830)
+
+    num_k_heads, num_v_heads = 16, 48
+    head_k_dim = head_v_dim = 128
+    width, tp_size = 4, 1
+    cache_batch_size = 5
+    decode_state_id, prefill_state_id = 3, 1
+    prefill_tokens = 127
+
+    mixed_qkvz_size = num_k_heads * (
+        2 * head_k_dim
+        + 2 * head_v_dim * num_v_heads // num_k_heads)
+    mixed_ba_size = 2 * num_v_heads
+    mixed_qkv_size = num_k_heads * (
+        2 * head_k_dim
+        + head_v_dim * num_v_heads // num_k_heads)
+
+    num_mixed_tokens = 1 + prefill_tokens
+    projected_states_qkvz = torch.randn(
+        (num_mixed_tokens, mixed_qkvz_size), dtype=dtype, device=device)
+    projected_states_ba = torch.randn(
+        (num_mixed_tokens, mixed_ba_size), dtype=dtype, device=device)
+    conv_weights = torch.randn(
+        (mixed_qkv_size, width), dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_v_heads, dtype=dtype, device=device)
+
+    initial_conv_state = torch.randn(
+        (cache_batch_size, width - 1, mixed_qkv_size),
+        dtype=dtype,
+        device=device,
+    )
+    initial_ssm_state = torch.randn(
+        (cache_batch_size, num_v_heads, head_v_dim, head_k_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def run_non_spec(
+            qkvz, ba, query_start_loc, state_ids, has_initial_state,
+            num_prefills, num_decodes, split_mixed_non_spec=False):
+        num_actual_tokens = qkvz.shape[0]
+        conv_state = initial_conv_state.clone()
+        ssm_state = initial_ssm_state.clone()
+        core_attn_out = torch.empty(
+            (num_actual_tokens, num_v_heads, head_v_dim),
+            dtype=dtype,
+            device=device,
+        )
+        z = torch.empty_like(core_attn_out)
+        query_start_loc_tensor = torch.tensor(
+            query_start_loc, dtype=torch.int32, device=device)
+        state_indices = torch.tensor(
+            state_ids, dtype=torch.int32, device=device)
+        has_initial_state_tensor = torch.tensor(
+            has_initial_state, dtype=torch.bool, device=device)
+
+        torch.ops._xpu_C.gdn_attention(
+            core_attn_out,
+            z,
+            qkvz,
+            ba,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            conv_weights=conv_weights,
+            conv_bias=None,
+            activation="silu",
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            num_spec_decodes=0,
+            has_initial_state=has_initial_state_tensor,
+            non_spec_query_start_loc=query_start_loc_tensor,
+            non_spec_token_indx=None,
+            non_spec_state_indices_tensor=state_indices,
+            spec_query_start_loc=None,
+            spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            num_accepted_tokens=None,
+            num_actual_tokens=num_actual_tokens,
+            tp_size=tp_size,
+            reorder_input=True,
+            split_mixed_non_spec=split_mixed_non_spec,
+        )
+        torch.xpu.synchronize()
+        return {
+            "core_attn_out": core_attn_out.cpu(),
+            "z": z.cpu(),
+            "conv_state": {
+                state_id: conv_state[state_id].cpu()
+                for state_id in state_ids
+            },
+            "ssm_state": {
+                state_id: ssm_state[state_id].cpu()
+                for state_id in state_ids
+            },
+        }
+
+    def request_snapshot(result, token_slice, state_id):
+        return {
+            "core_attn_out": result["core_attn_out"][token_slice],
+            "z": result["z"][token_slice],
+            "conv_state": result["conv_state"][state_id],
+            "ssm_state": result["ssm_state"][state_id],
+        }
+
+    decode_alone = run_non_spec(
+        projected_states_qkvz[:1],
+        projected_states_ba[:1],
+        (0, 1),
+        (decode_state_id, ),
+        (True, ),
+        num_prefills=0,
+        num_decodes=1,
+    )
+    prefill_alone = run_non_spec(
+        projected_states_qkvz[1:],
+        projected_states_ba[1:],
+        (0, prefill_tokens),
+        (prefill_state_id, ),
+        (False, ),
+        num_prefills=1,
+        num_decodes=0,
+    )
+    decode_with_prefill = run_non_spec(
+        projected_states_qkvz,
+        projected_states_ba,
+        (0, 1, num_mixed_tokens),
+        (decode_state_id, prefill_state_id),
+        (True, False),
+        num_prefills=1,
+        num_decodes=1,
+        split_mixed_non_spec=True,
+    )
+
+    comparisons = (
+        (
+            "cached decode",
+            request_snapshot(decode_alone, slice(None), decode_state_id),
+            request_snapshot(decode_with_prefill, slice(0, 1),
+                             decode_state_id),
+        ),
+        (
+            "fresh prefill",
+            request_snapshot(prefill_alone, slice(None), prefill_state_id),
+            request_snapshot(decode_with_prefill, slice(1, None),
+                             prefill_state_id),
+        ),
+    )
+    failures = []
+    for request_name, expected_snapshot, actual_snapshot in comparisons:
+        for field_name, expected in expected_snapshot.items():
+            actual = actual_snapshot[field_name]
+            if torch.equal(actual, expected):
+                continue
+            mismatch = actual != expected
+            max_abs_diff = (
+                (actual.float() - expected.float()).abs().max().item())
+            failures.append(
+                f"{request_name} {field_name} changed in mixed route: "
+                f"mismatches={mismatch.sum().item()}, "
+                f"max_abs_diff={max_abs_diff}")
+    if failures:
+        pytest.fail("\n".join(failures))
+
+
+@torch.inference_mode()
 def test_qwen38_gdn_t107_async_chain_is_exact():
     """Queued T=107 fresh-state prefills must remain bitwise repeatable.
 
