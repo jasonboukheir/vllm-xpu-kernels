@@ -232,8 +232,8 @@ def build_decode_split_plan(
     - sum(splits_per_seq) == work_list.size(0) == total_wgs
     - For every emitted work item, kv_tile_count >= 1
     - For each seq, the work items partition [0, kv_tiles) exactly once
-    - splits_per_seq[i] <= num_kv_splits (so Oaccum/exp_sums/max_logits
-      buffer indexing is safe)
+    - splits_per_seq[i] <= num_kv_splits (so Oaccum/LSE scratch buffer
+      indexing is safe)
     - splits_per_seq[i] folds in {single-split heuristic, balanced
       assignment, hard cap}; the kernel never needs to second-guess it.
     """
@@ -749,5 +749,4 @@ def _fallback_varlen_attn(
     if return_softmax_lse:
         return result[0], result[1]
     return result, None
-
 
