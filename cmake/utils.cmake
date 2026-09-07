@@ -545,11 +545,13 @@ endfunction()
 # Arguments: LIBRARY_NAME: Name of the library to create (e.g.,
 # attn_kernels_xe_2) DESTINATION: Installation destination directory (optional,
 # defaults to vllm_xpu_kernels) INCLUDE_CMAKE_SOURCE_DIR: Optional flag to
-# include ${CMAKE_SOURCE_DIR} in include directories
+# include ${CMAKE_SOURCE_DIR} in include directories. MIXED_GRF_SIZE: Preserve
+# per-kernel grf_size properties instead of forcing the complete AOT library
+# into large-GRF mode.
 #
 function(add_xe2_kernel_library LIBRARY_NAME)
   cmake_parse_arguments(
-    PARSE_ARGV 1 ARG "INCLUDE_CMAKE_SOURCE_DIR" # Boolean options
+    PARSE_ARGV 1 ARG "INCLUDE_CMAKE_SOURCE_DIR;MIXED_GRF_SIZE" # Boolean options
     "DESTINATION" # Single value keywords
     "" # Multi-value keywords
   )
@@ -601,11 +603,15 @@ function(add_xe2_kernel_library LIBRARY_NAME)
   # Set link options for XE2 devices
   set(XE2_GPU_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
   if(XE2_AOT_DEVICES)
-    list(
-      APPEND
-      XE2_GPU_LINK_FLAGS
-      "-device ${XE2_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread"
-    )
+    if(ARG_MIXED_GRF_SIZE)
+      list(APPEND XE2_GPU_LINK_FLAGS "-device ${XE2_AOT_DEVICES}")
+    else()
+      list(
+        APPEND
+        XE2_GPU_LINK_FLAGS
+        "-device ${XE2_AOT_DEVICES} -internal_options -cl-intel-256-GRF-per-thread"
+      )
+    endif()
   endif()
   target_link_options(${LIBRARY_NAME} PRIVATE ${XE2_GPU_LINK_FLAGS})
 endfunction()
