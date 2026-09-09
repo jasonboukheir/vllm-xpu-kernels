@@ -151,6 +151,7 @@ void MoEGEMMLauncher(
           MoE::MoEGEMM<
               TENSOR_A_DTYPE,
               TENSOR_B_DTYPE,
+              policy::ScaleRoundToNearest,
               GmemTiledCopyA,
               GmemTiledCopyB,
               GmemTiledCopyD,
@@ -299,6 +300,47 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
         group_size == 32 || group_size == 64 || group_size == 128 ||
             group_size == 256,
         "group_size must be 32, 64, 128 or 256");
+
+    // Read on each eligible invocation so offline comparisons can alternate
+    // the original policy and both candidates within the same process.
+    // Full N tiles avoid extending the existing scale-load tail contract.
+    if (is_B_int4 && num_experts == 1 && A_avg_M > 128 &&
+        A_dtype == at::kBFloat16 && ptr_D.dtype() == at::kBFloat16 &&
+        ptr_scales->dtype() == at::kBFloat16 && group_size == 128 &&
+        N % 128 == 0 &&
+        (!ptr_bias.has_value() || ptr_bias->dtype() == at::kBFloat16)) {
+      auto dense_policy = vllm::xpu::getEnv("VLLM_XPU_INT4_DENSE_POLICY");
+      if (dense_policy.has_value() && !dense_policy->empty()) {
+        if (*dense_policy == "128x128") {
+          MoEGEMMLauncherCallER(
+              'R',
+              'C',
+              w4a16_dense_policy_128x128,
+              A_DTYPE::BITS16,
+              B_DTYPE::INT4,
+              bfloat16_t,
+              uint8_t,
+              bfloat16_t);
+        } else if (*dense_policy == "256x128") {
+          MoEGEMMLauncherCallER(
+              'R',
+              'C',
+              w4a16_dense_policy_256x128,
+              A_DTYPE::BITS16,
+              B_DTYPE::INT4,
+              bfloat16_t,
+              uint8_t,
+              bfloat16_t);
+        } else {
+          TORCH_CHECK(
+              false,
+              "VLLM_XPU_INT4_DENSE_POLICY must be unset, empty, 128x128 "
+              "or 256x128; got ",
+              *dense_policy);
+        }
+        return ptr_D;
+      }
+    }
 
 #define W4A16LauncherCallER(policy)    \
   if (is_B_int4) {                     \

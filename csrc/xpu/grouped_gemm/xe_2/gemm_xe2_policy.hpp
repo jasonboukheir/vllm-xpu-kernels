@@ -8,6 +8,7 @@ using namespace cute;
 
 class xe_gemm_policy_base {
  public:
+  static constexpr bool ScaleRoundToNearest = false;
   using WGTile = Shape<_256, _256, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
@@ -82,6 +83,27 @@ class w4a16_policy : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_128, _256, _32>;
   using SGLayout = Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;
+
+  using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
+};
+
+// Dense E=1 experiments retain the existing K mainloop and signed INT4
+// format. The first reduces the workgroup's barrier domain; the second
+// additionally reuses each dequantized B fragment over more M rows.
+class w4a16_dense_policy_128x128 : public xe_gemm_policy_base {
+ public:
+  static constexpr bool ScaleRoundToNearest = true;
+  using WGTile = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
+
+  using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
+};
+
+class w4a16_dense_policy_256x128 : public xe_gemm_policy_base {
+ public:
+  static constexpr bool ScaleRoundToNearest = true;
+  using WGTile = Shape<_256, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
 
   using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
 };

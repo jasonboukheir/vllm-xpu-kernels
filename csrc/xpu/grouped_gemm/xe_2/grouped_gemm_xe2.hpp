@@ -61,6 +61,7 @@ CUTE_DEVICE auto make_moe_tensor(T* ptr, int r, int c) {
 template <
     A_DTYPE TENSOR_A_DTYPE,
     B_DTYPE TENSOR_B_DTYPE,
+    bool ScaleRoundToNearest,
     class GmemTiledCopyA,
     class GmemTiledCopyB,
     class GmemTiledCopyD,
@@ -196,7 +197,8 @@ CUTE_DEVICE void MoEGEMM(
       GmemTiledCopyB,                   \
       GmemTiledCopyD,                   \
       TENSOR_B_DTYPE,                   \
-      GroupSize>(                       \
+      GroupSize,                       \
+      ScaleRoundToNearest>(            \
       A_tensor,                         \
       B_tensor,                         \
       ptr_Scales_curr_batch,            \

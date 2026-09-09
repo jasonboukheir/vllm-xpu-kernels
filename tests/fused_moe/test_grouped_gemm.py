@@ -335,6 +335,142 @@ def test_xe_grouped_gemm_int4(m, n, k, e, topk, dtype, has_bias):
     torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("m,k", [(2048, 5120), (1535, 17408), (2047, 17408)])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_xe_grouped_gemm_int4_dense_policies(m, k, has_bias, monkeypatch):
+    """Real prefill M/K, bounded N, BF16 oracle and caller-owned tails."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU required")
+    seed_everything(7)
+    n, group_size = 512, 128
+    dtype = torch.bfloat16
+    input_A = torch.randn((m, k), dtype=dtype, device=DEVICE) / 10
+    raw = torch.randint(0, 256, (1, n, k // 2), dtype=torch.uint8,
+                        device=DEVICE)
+    input_B = implement_zp(raw).view(torch.int8)
+    scales = (torch.rand((1, n, k // group_size), device=DEVICE) / 10
+              + 0.01).to(dtype)
+    weights = dequantize_uint4(raw[0], scales[0], group_size)
+    bias = (torch.linspace(-0.1, 0.1, n, device=DEVICE).to(dtype)[None, :]
+            if has_bias else None)
+    reference = input_A.float() @ weights.float().T
+    if bias is not None:
+        reference += bias.float()
+    reference = reference.to(dtype)
+    rows = torch.tensor([m], dtype=torch.int32, device=DEVICE)
+
+    def run(activations):
+        storage = torch.full((m + 2, n), -42, dtype=dtype, device=DEVICE)
+        output = storage[1:-1]
+        output.fill_(float("nan"))
+        result = torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+            activations, None, input_B, scales, bias, output, rows, n, k, 1)
+        torch.xpu.synchronize()
+        assert result.data_ptr() == output.data_ptr()
+        assert torch.all(storage[[0, -1]] == -42)
+        assert torch.isfinite(output).all()
+        return output
+
+    # The original kernel truncates dequantized BF16 weights; its distinct
+    # arithmetic is checked exactly by the identity test below. Preserve its
+    # output here while requiring both candidates to meet the RNE oracle.
+    monkeypatch.delenv("VLLM_XPU_INT4_DENSE_POLICY", raising=False)
+    original = run(input_A)
+    for policy in ("128x128", "256x128", "128x128"):
+        monkeypatch.setenv("VLLM_XPU_INT4_DENSE_POLICY", policy)
+        output = run(input_A)
+        torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
+        for _ in range(3):
+            decoy = run(-input_A)
+            pressure = torch.empty((1048573,), dtype=torch.uint8,
+                                   device=DEVICE)
+            repeated = run(input_A)
+            torch.testing.assert_close(repeated, output, atol=0, rtol=0)
+            del decoy, pressure, repeated
+
+    monkeypatch.delenv("VLLM_XPU_INT4_DENSE_POLICY", raising=False)
+    torch.testing.assert_close(run(input_A), original, atol=0, rtol=0)
+    monkeypatch.setenv("VLLM_XPU_INT4_DENSE_POLICY", "invalid")
+    with pytest.raises(RuntimeError, match="VLLM_XPU_INT4_DENSE_POLICY"):
+        run(input_A)
+
+
+def test_xe_grouped_gemm_int4_dense_rounding(monkeypatch):
+    """Identity inputs isolate RNE candidates from original RTZ dequant."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU required")
+    m, n, k = 256, 256, 128
+    dtype = torch.bfloat16
+    # Build the independent oracle on CPU, including positive/negative scales
+    # and the halfway products that distinguish ties-to-even from truncation.
+    unsigned = (torch.arange(n)[:, None] + torch.arange(k)[None, :]) % 16
+    raw = (unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)).to(torch.uint8)
+    packed = raw.bitwise_xor(0x88).view(torch.int8)[None, :].to(DEVICE)
+    scale_values = [0.0634765625, -0.0634765625, 0.10107421875,
+                    -0.10107421875]
+    scales_cpu = torch.tensor(scale_values, dtype=dtype).repeat(n // 4)
+    products = (unsigned - 8).float() * scales_cpu[:, None].float()
+    rne_weights = products.to(dtype)
+    rtz_weights = (products.view(torch.int32).bitwise_and(-65536)
+                   .view(torch.float32).to(dtype))
+    assert not torch.equal(rne_weights, rtz_weights)
+    references = {
+        "rne": torch.cat((rne_weights.T, -rne_weights.T)),
+        "rtz": torch.cat((rtz_weights.T, -rtz_weights.T)),
+    }
+    input_A = torch.cat((torch.eye(k), -torch.eye(k))).to(dtype).to(DEVICE)
+    scales = scales_cpu.reshape(1, n, 1).to(DEVICE)
+    rows = torch.tensor([m], dtype=torch.int32, device=DEVICE)
+
+    for policy in (None, "128x128", None, "256x128", "128x128", ""):
+        if policy is None:
+            monkeypatch.delenv("VLLM_XPU_INT4_DENSE_POLICY", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_XPU_INT4_DENSE_POLICY", policy)
+        storage = torch.full((m + 2, n), -42, dtype=dtype, device=DEVICE)
+        output = storage[1:-1]
+        output.fill_(float("nan"))
+        result = torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+            input_A, None, packed, scales, None, output, rows, n, k, 1)
+        torch.xpu.synchronize()
+        assert result.data_ptr() == output.data_ptr()
+        assert torch.all(storage[[0, -1]] == -42)
+        expected = references["rne" if policy else "rtz"]
+        torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("m,e,dtype,group_size", [
+    (128, 1, torch.bfloat16, 128),
+    (129, 2, torch.bfloat16, 128),
+    (129, 1, torch.float16, 128),
+    (129, 1, torch.bfloat16, 64),
+])
+def test_xe_grouped_gemm_int4_dense_scope(m, e, dtype, group_size,
+                                        monkeypatch):
+    """An invalid selector is ignored outside the dense BF16 G128 scope."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU required")
+    seed_everything(7)
+    n, k = 256, 512
+    input_A = torch.randn((m * e, k), dtype=dtype, device=DEVICE) / 10
+    raw = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8,
+                        device=DEVICE)
+    input_B = implement_zp(raw).view(torch.int8)
+    scales = torch.full((e, n, k // group_size), 0.125, dtype=dtype,
+                        device=DEVICE)
+    rows = torch.full((e,), m, dtype=torch.int32, device=DEVICE)
+
+    def run():
+        output = torch.empty((m * e, n), dtype=dtype, device=DEVICE)
+        return torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+            input_A, None, input_B, scales, None, output, rows, n, k, e)
+
+    monkeypatch.delenv("VLLM_XPU_INT4_DENSE_POLICY", raising=False)
+    original = run()
+    monkeypatch.setenv("VLLM_XPU_INT4_DENSE_POLICY", "invalid")
+    torch.testing.assert_close(run(), original, atol=0, rtol=0)
+
+
 def dequantize_mxfp4(qweight, scales, group_size, dtype):
     import numpy as np
     k = qweight.shape[1] * 2
