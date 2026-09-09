@@ -252,6 +252,7 @@ template <
     class GmemTiledCopyC,
     B_DTYPE TENSOR_B_DTYPE,
     int GroupSize,
+    bool ScaleRoundToNearest,
     class ATensor,
     class BTensor,
     class DTensor,
@@ -268,6 +269,9 @@ CUTE_DEVICE void xe_gemm_4bits(
     TiledMMA const& mma) {
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
+  static_assert(
+      !ScaleRoundToNearest ||
+      (TENSOR_B_DTYPE == B_DTYPE::INT4 && std::is_same_v<TA, bfloat16_t>));
   static constexpr int group_size = GroupSize;
   static constexpr int sg_local_range = 16;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -472,7 +476,15 @@ CUTE_DEVICE void xe_gemm_4bits(
       for (int c = 0; c < channel_num; ++c) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
-          if constexpr (std::is_same_v<TA, half_t>) {
+          if constexpr (ScaleRoundToNearest) {
+            // BF16-destination inline MUL truncates the dequantized value.
+            // The dense candidates use FP32 multiplication followed by an
+            // explicit round-to-nearest-even conversion to match the oracle.
+            float product =
+                static_cast<float>(tCrB(cute::tuple(c, _), n, _)[i]) *
+                scales[n * channel_num + c];
+            tCrB(cute::tuple(c, _), n, _)[i] = bfloat16_t(product);
+          } else if constexpr (std::is_same_v<TA, half_t>) {
             tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
           } else {
             tCrB(cute::tuple(c, _), n, _)[i] = apply_scale(

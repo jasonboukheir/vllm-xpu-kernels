@@ -121,6 +121,20 @@ VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_full.conf VLLM_PAGED_DECODE_CONFIG=paged
 
 See [KERNEL_CONFIGURATION.md](KERNEL_CONFIGURATION.md) for detailed guidance on kernel configuration, presets, and troubleshooting missing kernels.
 
+For offline Xe2 dense INT4 experiments, `VLLM_XPU_INT4_DENSE_POLICY=128x128`
+or `256x128` selects an alternative grouped GEMM tile. This applies only to
+one expert, more than 128 rows, BF16 activations/output/scales/bias, group
+size 128, and N divisible by 128. The existing signed INT4 packing and
+operator ABI are retained. The variable is read on every eligible call;
+unset or empty selects the original policy. Other inputs retain their
+existing dispatch, and an unknown value raises an error for eligible inputs.
+These policies are experimental and do not change vLLM's serving dispatch.
+They explicitly round dequantized BF16 weights to nearest, ties to even.
+The original kernel's BF16 scale multiplication truncates toward zero;
+its arithmetic is preserved when the selector is unset or empty. The
+candidate rounding is checked against an independent CPU identity oracle,
+including non-power-of-two scales, before performance comparisons.
+
 ## Testing
 
 Run the full test suite with pytest:
