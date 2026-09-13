@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 #include "kvarn_decode.hpp"
 
@@ -31,7 +32,7 @@ constexpr int64_t kDpasVVectorAlignment = 16;
 constexpr int64_t kKVarNDecodeKernel = 18;
 
 using KVarNDpasPrefetchLoader =
-    cutlass::fmha::collective::KVarNK4V4FragmentLoader<true>;
+    cutlass::fmha::collective::KVarNFragmentLoader<true>;
 static_assert(kPackedBytes % kDpasKVectorAlignment == 0);
 static_assert(kVPackedOffset % kDpasVVectorAlignment == 0);
 static_assert(kRecordBytes % kDpasKVectorAlignment == 0);
@@ -63,7 +64,7 @@ std::tuple<at::Tensor, at::Tensor>
 kvarn_fragment_coords_xe2(const at::Tensor& device_anchor) {
   TORCH_CHECK(device_anchor.is_xpu(), "device_anchor must be on XPU");
 
-  using Config = KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig;
+  using Config = KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<>;
   Config::TiledMMAQK mma_qk{};
   Config::TiledMMAPV mma_pv{};
   auto qk_slice = mma_qk.get_slice(0);
@@ -122,7 +123,10 @@ void kvarn_decode_with_scratch_xe2(
     bool write_bf16_output,
     int64_t requested_num_kv_splits,
     int64_t kernel_variant,
-    bool dpas_layout) {
+    bool dpas_layout,
+    int64_t value_bits) {
+  TORCH_CHECK(value_bits == 2 || value_bits == 4, "value_bits must be 2 or 4");
+  int const record_bytes = kRecordBytes + (value_bits - 4) * 4096;
   check_xpu(query, "query");
   check_xpu(packed_cache, "packed_cache");
   check_xpu(block_table, "block_table");
@@ -192,10 +196,10 @@ void kvarn_decode_with_scratch_xe2(
       packed_cache.dim() == 3 && packed_cache.size(1) == kKVHeads,
       "packed_cache must have shape [num_blocks, 4, record_bytes]");
   TORCH_CHECK(
-      packed_cache.size(0) > 0 && packed_cache.size(2) >= kRecordBytes,
-      "packed_cache must contain at least one block and each K4V4 record must "
+      packed_cache.size(0) > 0 && packed_cache.size(2) >= record_bytes,
+      "packed_cache must contain at least one block and each KVarN record must "
       "contain at least ",
-      kRecordBytes,
+      record_bytes,
       " bytes");
   TORCH_CHECK(
       packed_cache.is_contiguous(),
@@ -243,7 +247,7 @@ void kvarn_decode_with_scratch_xe2(
       "only the qualified KVarN decoder (18) is supported");
   TORCH_CHECK(dpas_layout, "native KVarN decode requires xe2_dpas layout");
 
-  cutlass::fmha::collective::KVarNK4V4Layout layout{
+  cutlass::fmha::collective::KVarNLayout layout{
       static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
       packed_cache.stride(0),
       packed_cache.stride(1),
@@ -253,9 +257,9 @@ void kvarn_decode_with_scratch_xe2(
       kKZpOffset,
       kKSRowOffset,
       kVPackedOffset,
-      kVSColOffset,
-      kVSRowOffset,
-      kVZpOffset};
+      kVSColOffset + static_cast<int>(value_bits - 4) * 4096,
+      kVSRowOffset + static_cast<int>(value_bits - 4) * 4096,
+      kVZpOffset + static_cast<int>(value_bits - 4) * 4096};
   int const num_kv_splits =
       validated_split_count(max_seq_len, requested_num_kv_splits);
   TORCH_CHECK(
@@ -323,7 +327,11 @@ void kvarn_decode_with_scratch_xe2(
   args.legacy_max_logits = max_logits.data_ptr<float>();
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   auto status =
-      KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(queue, args);
+      value_bits == 2
+          ? KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<2>::run(
+                queue, args)
+          : KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<4>::run(
+                queue, args);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
       "native KVarN decode rejected the validated problem");
@@ -344,7 +352,9 @@ void kvarn_decode_xe2(
     bool write_bf16_output,
     int64_t requested_num_kv_splits,
     int64_t kernel_variant,
-    bool dpas_layout) {
+    bool dpas_layout,
+    int64_t value_bits) {
+  TORCH_CHECK(value_bits == 2 || value_bits == 4, "value_bits must be 2 or 4");
   int const num_kv_splits =
       validated_split_count(max_seq_len, requested_num_kv_splits);
   int64_t const batch = query.size(0);
@@ -373,7 +383,8 @@ void kvarn_decode_xe2(
       write_bf16_output,
       num_kv_splits,
       kernel_variant,
-      dpas_layout);
+      dpas_layout,
+      value_bits);
 
   // Multi-split decode consumes these function-local tensors asynchronously
   // in both the main kernel and its reducer. Keep their allocations live on
@@ -401,7 +412,10 @@ void kvarn_materialize_packed_kv_xe2(
     at::Tensor& key_output,
     at::Tensor& value_output,
     int64_t max_seq_len,
-    bool dpas_layout) {
+    bool dpas_layout,
+    int64_t value_bits) {
+  TORCH_CHECK(value_bits == 2 || value_bits == 4, "value_bits must be 2 or 4");
+  int const record_bytes = kRecordBytes + (value_bits - 4) * 4096;
   for (auto const& item :
        {std::pair<at::Tensor const*, char const*>{
             &packed_cache, "packed_cache"},
@@ -423,7 +437,7 @@ void kvarn_materialize_packed_kv_xe2(
   TORCH_CHECK(
       packed_cache.scalar_type() == at::kByte && packed_cache.dim() == 3 &&
           packed_cache.size(1) == kKVHeads &&
-          packed_cache.size(2) >= kRecordBytes && packed_cache.is_contiguous(),
+          packed_cache.size(2) >= record_bytes && packed_cache.is_contiguous(),
       "packed_cache must be contiguous uint8 [num_blocks, 4, record_bytes]");
   TORCH_CHECK(
       block_table.scalar_type() == at::kInt && block_table.dim() == 2 &&
@@ -459,7 +473,7 @@ void kvarn_materialize_packed_kv_xe2(
           block_table.size(1) <= std::numeric_limits<int>::max(),
       "invalid materialization extent");
 
-  cutlass::fmha::collective::KVarNK4V4Layout layout{
+  cutlass::fmha::collective::KVarNLayout layout{
       static_cast<std::uint8_t const*>(packed_cache.const_data_ptr()),
       packed_cache.stride(0),
       packed_cache.stride(1),
@@ -469,9 +483,9 @@ void kvarn_materialize_packed_kv_xe2(
       kKZpOffset,
       kKSRowOffset,
       kVPackedOffset,
-      kVSColOffset,
-      kVSRowOffset,
-      kVZpOffset};
+      kVSColOffset + static_cast<int>(value_bits - 4) * 4096,
+      kVSRowOffset + static_cast<int>(value_bits - 4) * 4096,
+      kVZpOffset + static_cast<int>(value_bits - 4) * 4096};
   cutlass::fmha::collective::KVarNHybridTailLayout tail{
       block_to_slot.const_data_ptr<int>(),
       static_cast<cutlass::half_t const*>(tail_key.const_data_ptr()),
@@ -487,66 +501,75 @@ void kvarn_materialize_packed_kv_xe2(
   int const max_blocks = static_cast<int>((max_seq_len + kGroup - 1) / kGroup);
   int const table_stride = static_cast<int>(block_table.stride(0));
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  queue.parallel_for(
-      sycl::nd_range<1>(
-          sycl::range<1>(
-              static_cast<size_t>(batch) * max_blocks * kKVHeads * 256),
-          sycl::range<1>(256)),
-      [=](sycl::nd_item<1> item) {
-        int const group_id = static_cast<int>(item.get_group_linear_id());
-        int const kv_head = group_id % kKVHeads;
-        int const logical_block = (group_id / kKVHeads) % max_blocks;
-        int const request = group_id / (kKVHeads * max_blocks);
-        int const seq_len = lengths[request];
-        int const token_base = logical_block * kGroup;
-        if (token_base >= seq_len) return;
-        int const physical = page_table[request * table_stride + logical_block];
-        int const slot = tail.block_to_slot[physical];
-        auto const* rec =
-            slot < 0
-                ? layout.cache + std::int64_t(physical) * layout.block_stride +
-                      std::int64_t(kv_head) * layout.head_stride
-                : nullptr;
-        cutlass::fmha::collective::KVarNK4V4FragmentLoader<> loader{
-            layout, tail, page_table, table_stride};
-        int const local_id = static_cast<int>(item.get_local_linear_id());
-        for (int linear = local_id; linear < kGroup * kHeadDim; linear += 256) {
-          int const token = linear / kHeadDim;
-          int const dim = linear % kHeadDim;
-          if (token_base + token >= seq_len) continue;
-          float kval;
-          float vval;
-          if (slot < 0) {
-            float const kq = dpas_layout
-                                 ? loader.load_k_dpas_quantized(rec, token, dim)
-                                 : loader.load_k_quantized(rec, token, dim);
-            float const vq = dpas_layout
-                                 ? loader.load_v_dpas_quantized(rec, token, dim)
-                                 : loader.load_v_quantized(rec, token, dim);
-            float const kcol = decltype(loader)::load_f16(
-                rec + layout.k_s_col_offset + 2 * dim);
-            float const kzp =
-                decltype(loader)::load_f16(rec + layout.k_zp_offset + 2 * dim);
-            float const krow = decltype(loader)::load_f16(
-                rec + layout.k_s_row_offset + 2 * token);
-            float const vcol = decltype(loader)::load_f16(
-                rec + layout.v_s_col_offset + 2 * dim);
-            float const vrow = decltype(loader)::load_f16(
-                rec + layout.v_s_row_offset + 2 * token);
-            float const vzp = decltype(loader)::load_f16(
-                rec + layout.v_zp_offset + 2 * token);
-            kval = (kq * kcol + kzp) * krow;
-            vval = (vq * vrow + vzp) * vcol;
-          } else {
-            kval = loader.load_tail(tail.key, slot, token, kv_head, dim);
-            vval = loader.load_tail(tail.value, slot, token, kv_head, dim);
+  auto launch = [&](auto bits) {
+    constexpr int ValueBits = decltype(bits)::value;
+    queue.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(
+                static_cast<size_t>(batch) * max_blocks * kKVHeads * 256),
+            sycl::range<1>(256)),
+        [=](sycl::nd_item<1> item) {
+          int const group_id = static_cast<int>(item.get_group_linear_id());
+          int const kv_head = group_id % kKVHeads;
+          int const logical_block = (group_id / kKVHeads) % max_blocks;
+          int const request = group_id / (kKVHeads * max_blocks);
+          int const seq_len = lengths[request];
+          int const token_base = logical_block * kGroup;
+          if (token_base >= seq_len) return;
+          int const physical =
+              page_table[request * table_stride + logical_block];
+          int const slot = tail.block_to_slot[physical];
+          auto const* rec =
+              slot < 0 ? layout.cache +
+                             std::int64_t(physical) * layout.block_stride +
+                             std::int64_t(kv_head) * layout.head_stride
+                       : nullptr;
+          cutlass::fmha::collective::KVarNFragmentLoader<false, ValueBits>
+              loader{layout, tail, page_table, table_stride};
+          int const local_id = static_cast<int>(item.get_local_linear_id());
+          for (int linear = local_id; linear < kGroup * kHeadDim;
+               linear += 256) {
+            int const token = linear / kHeadDim;
+            int const dim = linear % kHeadDim;
+            if (token_base + token >= seq_len) continue;
+            float kval;
+            float vval;
+            if (slot < 0) {
+              float const kq =
+                  dpas_layout ? loader.load_k_dpas_quantized(rec, token, dim)
+                              : loader.load_k_quantized(rec, token, dim);
+              float const vq =
+                  dpas_layout ? loader.load_v_dpas_quantized(rec, token, dim)
+                              : loader.load_v_quantized(rec, token, dim);
+              float const kcol = decltype(loader)::load_f16(
+                  rec + layout.k_s_col_offset + 2 * dim);
+              float const kzp = decltype(loader)::load_f16(
+                  rec + layout.k_zp_offset + 2 * dim);
+              float const krow = decltype(loader)::load_f16(
+                  rec + layout.k_s_row_offset + 2 * token);
+              float const vcol = decltype(loader)::load_f16(
+                  rec + layout.v_s_col_offset + 2 * dim);
+              float const vrow = decltype(loader)::load_f16(
+                  rec + layout.v_s_row_offset + 2 * token);
+              float const vzp = decltype(loader)::load_f16(
+                  rec + layout.v_zp_offset + 2 * token);
+              kval = (kq * kcol + kzp) * krow;
+              vval = (vq * vrow + vzp) * vcol;
+            } else {
+              kval = loader.load_tail(tail.key, slot, token, kv_head, dim);
+              vval = loader.load_tail(tail.value, slot, token, kv_head, dim);
+            }
+            std::int64_t const out_token =
+                cumulative[request] + token_base + token;
+            std::int64_t const out_index =
+                (out_token * kKVHeads + kv_head) * kHeadDim + dim;
+            key[out_index] = static_cast<cutlass::half_t>(kval);
+            value[out_index] = static_cast<cutlass::half_t>(vval);
           }
-          std::int64_t const out_token =
-              cumulative[request] + token_base + token;
-          std::int64_t const out_index =
-              (out_token * kKVHeads + kv_head) * kHeadDim + dim;
-          key[out_index] = static_cast<cutlass::half_t>(kval);
-          value[out_index] = static_cast<cutlass::half_t>(vval);
-        }
-      });
+        });
+  };
+  if (value_bits == 2)
+    launch(std::integral_constant<int, 2>{});
+  else
+    launch(std::integral_constant<int, 4>{});
 }

@@ -11,4 +11,5 @@ void kvarn_pack_balanced_kv_xe2(
     const at::Tensor& value_sinkhorn_row,
     const at::Tensor& block_ids,
     at::Tensor& packed_cache,
-    bool dpas_layout);
+    bool dpas_layout,
+    int64_t value_bits);

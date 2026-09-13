@@ -31,6 +31,7 @@ from benchmark.kvarn_utils import (  # noqa: E402
     _v_dpas_coord,
     dequant_record,
     swizzle_record_dpas_k4v4,
+    swizzle_record_dpas_kv,
 )
 
 Q6_PREFETCH_RECORD_CURSOR = 18
@@ -72,13 +73,13 @@ def _tail_tensors() -> tuple[torch.Tensor, torch.Tensor]:
     return key, torch.zeros_like(key)
 
 
-def _dpas(cache: torch.Tensor) -> torch.Tensor:
+def _dpas(cache: torch.Tensor, value_bits: int = 4) -> torch.Tensor:
     """Pack a canonical CPU fixture for the sole qualified decode layout."""
-    layout = KVarNLayout(record_stride=cache.stride(1))
+    layout = KVarNLayout(value_bits=value_bits, record_stride=cache.stride(1))
     packed = cache.clone()
     for block in range(packed.size(0)):
         for kv_head in range(packed.size(1)):
-            packed[block, kv_head] = swizzle_record_dpas_k4v4(
+            packed[block, kv_head] = swizzle_record_dpas_kv(
                 cache[block, kv_head], layout
             )
     return packed.xpu()
@@ -86,9 +87,12 @@ def _dpas(cache: torch.Tensor) -> torch.Tensor:
 
 def _make_long_structured_cache(
     num_blocks: int,
+    value_bits: int = 4,
 ) -> tuple[torch.Tensor, KVarNLayout, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a vectorized long-context cache with page-sensitive K/V rows."""
-    layout = KVarNLayout(record_stride=35072)
+    layout = KVarNLayout(
+        value_bits=value_bits, record_stride=18688 + 4096 * value_bits
+    )
     cache = torch.zeros(
         num_blocks, 4, layout.tile_bytes_aligned, dtype=torch.uint8
     )
@@ -105,7 +109,7 @@ def _make_long_structured_cache(
         :,
         :,
         layout.v_packed_offset : layout.v_packed_offset + layout.v_packed_bytes,
-    ] = 0x11
+    ] = 0x55 if value_bits == 2 else 0x11
 
     one_dim = torch.ones(layout.head_dim, dtype=torch.float16).view(torch.uint8)
     one_row = torch.ones(layout.group, dtype=torch.float16).view(torch.uint8)
@@ -1385,13 +1389,14 @@ _LONG_CONTEXT_LAYOUT_SPLITS = [
     ("dpas_layout", "splits", "kernel_variant"),
     _LONG_CONTEXT_LAYOUT_SPLITS,
 )
+@pytest.mark.parametrize("value_bits", [2, 4])
 def test_long_context_ragged_b4_matches_structured_oracle(
-    dpas_layout: bool, splits: int, kernel_variant: int
+    dpas_layout: bool, splits: int, kernel_variant: int, value_bits: int
 ) -> None:
     """Exercise packed and hybrid traversal through the 262K boundary."""
     num_blocks = 2048
     cache, layout, page_scores, value_rows, column_scales = (
-        _make_long_structured_cache(num_blocks)
+        _make_long_structured_cache(num_blocks, value_bits)
     )
     base = torch.arange(num_blocks, dtype=torch.int64)
     page_rows = torch.stack(
@@ -1467,7 +1472,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
     block_to_slot[hybrid_physical] = 0
     arguments = (
         query.xpu(),
-        _dpas(cache),
+        _dpas(cache, value_bits),
         page_rows.to(dtype=torch.int32, device="xpu"),
         torch.tensor(seq_lengths, dtype=torch.int32, device="xpu"),
         block_to_slot,
@@ -1498,6 +1503,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         splits,
         kernel_variant,
         dpas_layout,
+        value_bits,
     )
     torch.ops._vllm_fa2_C.kvarn_decode(
         *arguments,
@@ -1509,6 +1515,7 @@ def test_long_context_ragged_b4_matches_structured_oracle(
         splits,
         kernel_variant,
         dpas_layout,
+        value_bits,
     )
     if splits > 1:
         partials_cpu = temp_output.cpu().view(4, splits, 24, 256)

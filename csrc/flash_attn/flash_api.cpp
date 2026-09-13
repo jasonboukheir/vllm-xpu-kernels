@@ -459,7 +459,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "tail_value, "
       "Tensor! output, int max_seq_len, float softmax_scale, "
       "bool unrotate_output=False, bool write_bf16_output=False, "
-      "int num_kv_splits=0, int kernel_variant=18, bool dpas_layout=True) -> "
+      "int num_kv_splits=0, int kernel_variant=18, bool dpas_layout=True, int "
+      "value_bits=4) -> "
       "()");
   ops.impl("kvarn_decode", torch::kXPU, &kvarn_decode_xe2);
   ops.def(
@@ -471,7 +472,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(d!) output, "
       "int max_seq_len, float softmax_scale, bool unrotate_output=False, "
       "bool write_bf16_output=False, int num_kv_splits=0, "
-      "int kernel_variant=18, bool dpas_layout=True) "
+      "int kernel_variant=18, bool dpas_layout=True, int value_bits=4) "
       "-> ()");
   ops.impl(
       "kvarn_decode_with_scratch", torch::kXPU, &kvarn_decode_with_scratch_xe2);
@@ -479,14 +480,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "kvarn_materialize_packed_kv(Tensor packed_cache, Tensor block_table, "
       "Tensor seq_lens, Tensor cu_seqlens_k, Tensor block_to_slot, Tensor "
       "tail_key, Tensor tail_value, Tensor(a!) key_output, Tensor(b!) "
-      "value_output, int max_seq_len, bool dpas_layout=False) -> ()");
+      "value_output, int max_seq_len, bool dpas_layout=False, int "
+      "value_bits=4) -> ()");
   ops.impl(
       "kvarn_materialize_packed_kv",
       torch::kXPU,
       &kvarn_materialize_packed_kv_xe2);
   ops.def(
       "kvarn_dequant(Tensor packed_cache, Tensor! key_out, Tensor! value_out, "
-      "bool dpas_layout=False) "
+      "bool dpas_layout=False, int value_bits=4) "
       "-> ()");
   ops.impl("kvarn_dequant", torch::kXPU, &kvarn_dequant_xe2);
   ops.def(
@@ -517,7 +519,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "kvarn_pack_balanced_kv(Tensor key_balanced, Tensor key_sinkhorn_col, "
       "Tensor key_sinkhorn_row, Tensor value_balanced, Tensor "
       "value_sinkhorn_col, Tensor value_sinkhorn_row, Tensor block_ids, "
-      "Tensor! packed_cache, bool dpas_layout=False) -> ()");
+      "Tensor! packed_cache, bool dpas_layout=False, int value_bits=4) -> ()");
   ops.impl("kvarn_pack_balanced_kv", torch::kXPU, &kvarn_pack_balanced_kv_xe2);
   ops.def("kvarn_hadamard(Tensor input, Tensor! output) -> ()");
   ops.impl("kvarn_hadamard", torch::kXPU, &kvarn_hadamard_xe2);

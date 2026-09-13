@@ -117,20 +117,18 @@ _V_DIM = _V_LANE // 2 + 8 * (_V_INNER % 2) + 16 * (_V_SLOT // 16)
 _V_TOKEN = 2 * (_V_INNER // 2) + _V_LANE % 2
 
 
-def pack_dpas_k4v4(
-    q_k: torch.Tensor, q_v: torch.Tensor
+def pack_dpas_kv(
+    q_k: torch.Tensor, q_v: torch.Tensor, value_bits: int = 4
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack logical uint4 K[D,G]/V[G,D] in retained Xe2 B-fragment order.
-
-    This is an independent CPU prototype. It does not describe the production
-    KVarN record yet and intentionally rejects non-D256/G128 inputs.
-    """
+    """Pack K4 and V2/V4 in Xe2 B-fragment order, low bits first."""
     if q_k.shape != (256, 128) or q_v.shape != (128, 256):
         raise ValueError("DPAS prototype requires K[256,128] and V[128,256]")
     if q_k.dtype != torch.uint8 or q_v.dtype != torch.uint8:
         raise ValueError("DPAS prototype inputs must have dtype uint8")
-    if bool((q_k > 15).any()) or bool((q_v > 15).any()):
-        raise ValueError("DPAS prototype inputs must contain uint4 values")
+    if value_bits not in (2, 4):
+        raise ValueError("DPAS values must use two or four bits")
+    if bool((q_k > 15).any()) or bool((q_v >= 1 << value_bits).any()):
+        raise ValueError("DPAS inputs exceed their declared bit width")
 
     half = torch.arange(2, dtype=torch.int64)[:, None, None, None, None]
     subgroup = torch.arange(4, dtype=torch.int64)[None, None, :, None, None]
@@ -145,27 +143,32 @@ def pack_dpas_k4v4(
         v_tile * 32 + _V_DIM[None, None, None, :, :],
     ]
     k_bytes = k_slots[..., 0::2] | (k_slots[..., 1::2] << 4)
-    v_bytes = v_slots[..., 0::2] | (v_slots[..., 1::2] << 4)
+    fields = 8 // value_bits
+    v_bytes = torch.zeros_like(v_slots[..., ::fields])
+    for field in range(fields):
+        v_bytes |= v_slots[..., field::fields] << (field * value_bits)
     return k_bytes.flatten(), v_bytes.flatten()
 
 
-def unpack_dpas_k4v4(
-    k_packed: torch.Tensor, v_packed: torch.Tensor
+def unpack_dpas_kv(
+    k_packed: torch.Tensor, v_packed: torch.Tensor, value_bits: int = 4
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Invert :func:`pack_dpas_k4v4` into logical uint4 K[D,G]/V[G,D]."""
+    """Invert DPAS payloads into logical K[D,G]/V[G,D] integer codes."""
+    if value_bits not in (2, 4):
+        raise ValueError("DPAS values must use two or four bits")
     if (
         k_packed.dtype != torch.uint8
         or v_packed.dtype != torch.uint8
         or k_packed.numel() != 256 * 128 // 2
-        or v_packed.numel() != 128 * 256 // 2
+        or v_packed.numel() != 128 * 256 * value_bits // 8
     ):
         raise ValueError(
-            "DPAS prototype payloads must be 16,384 uint8 bytes each"
+            "DPAS payload sizes must match D256/G128 and the bit widths"
         )
     k_bytes = k_packed.reshape(2, 4, 4, 16, 32)
-    v_bytes = v_packed.reshape(2, 8, 4, 16, 16)
+    v_bytes = v_packed.reshape(2, 8, 4, 16, 4 * value_bits)
     k_slots = torch.stack((k_bytes & 15, k_bytes >> 4), dim=-1).flatten(-2)
-    v_slots = torch.stack((v_bytes & 15, v_bytes >> 4), dim=-1).flatten(-2)
+    v_slots = unpack_lowbit(v_bytes, 32, value_bits)
     q_k = torch.empty((256, 128), dtype=torch.uint8)
     q_v = torch.empty((128, 256), dtype=torch.uint8)
     for half in range(2):
@@ -189,34 +192,51 @@ def unpack_dpas_k4v4(
     return q_k, q_v
 
 
-def swizzle_record_dpas_k4v4(
+def swizzle_record_dpas_kv(
     record: torch.Tensor, layout: KVarNLayout
 ) -> torch.Tensor:
     """Copy a canonical record and replace only its K/V payload orientation."""
     if record.dtype != torch.uint8 or record.ndim != 1:
         raise ValueError("record must be a one-dimensional uint8 tensor")
-    if (layout.head_dim, layout.group, layout.key_bits, layout.value_bits) != (
-        256,
-        128,
-        4,
-        4,
+    if (layout.head_dim, layout.group, layout.key_bits) != (256, 128, 4) or (
+        layout.value_bits not in (2, 4)
     ):
-        raise ValueError("DPAS prototype requires D256/G128/K4V4")
+        raise ValueError("DPAS layout requires D256/G128/K4 and V2/V4")
     result = record.clone()
     canonical_k = record[: layout.k_packed_bytes].reshape(256, 64)
     canonical_v = record[
         layout.v_packed_offset : layout.v_packed_offset + layout.v_packed_bytes
-    ].reshape(128, 128)
+    ].reshape(128, 32 * layout.value_bits)
     if not bool(canonical_k.any()) and not bool(canonical_v.any()):
         return result
     q_k = unpack_lowbit(canonical_k, 128, 4)
-    q_v = unpack_lowbit(canonical_v, 256, 4)
-    k_packed, v_packed = pack_dpas_k4v4(q_k, q_v)
+    q_v = unpack_lowbit(canonical_v, 256, layout.value_bits)
+    k_packed, v_packed = pack_dpas_kv(q_k, q_v, layout.value_bits)
     result[: layout.k_packed_bytes] = k_packed
     result[
         layout.v_packed_offset : layout.v_packed_offset + layout.v_packed_bytes
     ] = v_packed
     return result
+
+
+def pack_dpas_k4v4(
+    q_k: torch.Tensor, q_v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return pack_dpas_kv(q_k, q_v, 4)
+
+
+def unpack_dpas_k4v4(
+    k_packed: torch.Tensor, v_packed: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return unpack_dpas_kv(k_packed, v_packed, 4)
+
+
+def swizzle_record_dpas_k4v4(
+    record: torch.Tensor, layout: KVarNLayout
+) -> torch.Tensor:
+    if layout.value_bits != 4:
+        raise ValueError("K4V4 swizzle requires four-bit values")
+    return swizzle_record_dpas_kv(record, layout)
 
 
 def _half_field(record: torch.Tensor, offset: int, count: int) -> torch.Tensor:

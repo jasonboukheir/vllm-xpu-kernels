@@ -12,13 +12,13 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
-/** Runtime description of one KVarN K4V4 cache record.
+/** Runtime description of one KVarN K4V2 or K4V4 cache record.
  *
  * Offsets are deliberately supplied by KVarNConfig.  In particular, the
  * historical 17,920-byte D=128 layout must never be baked into a D=256
  * kernel.  All offsets and strides below are bytes.
  */
-struct KVarNK4V4Layout {
+struct KVarNLayout {
   std::uint8_t const* cache;
   std::int64_t block_stride;
   std::int64_t head_stride;
@@ -50,51 +50,52 @@ struct KVarNHybridTailLayout {
 
 /** Register-fragment loader for the first native KVarN decode prototype.
  *
- * Logical cache geometry is fixed to D=256, G=128 and K4V4.  The enclosing
+ * Logical cache geometry is fixed to D=256, G=128, K4 and V2/V4. The enclosing
  * attention mainloop uses a K tile of 64, so each physical page is visited as
  * two consecutive tiles.  `CoordFragment` must be produced by partitioning a
  * CUTE identity tensor with the same MMA thread slice as `Fragment`; this is
  * what makes the register assignment independent of undocumented fragment
  * linear order.
  */
-template <bool DpasPacked = false>
-struct KVarNK4V4FragmentLoader {
+template <bool DpasPacked = false, int ValueBits = 4>
+struct KVarNFragmentLoader {
+  static_assert(ValueBits == 2 || ValueBits == 4);
   static constexpr int kHeadDim = 256;
   static constexpr int kGroup = 128;
   static constexpr int kTileK = 64;
-  static constexpr int kValuesPerWord = 8;
   static constexpr int kKRowBytes = kGroup / 2;
-  static constexpr int kVRowBytes = kHeadDim / 2;
+  static constexpr int kVRowBytes = kHeadDim * ValueBits / 8;
   static constexpr int kKPackedLaneWords = 8;
-  static constexpr int kVPackedLaneWords = 4;
+  static constexpr int kVPackedLaneWords = ValueBits;
   static constexpr int kKPackedLaneBytes =
       kKPackedLaneWords * sizeof(std::uint32_t);
   static constexpr int kVPackedLaneBytes =
       kVPackedLaneWords * sizeof(std::uint32_t);
   static constexpr int kPackedBytes = kHeadDim * kGroup / 2;
+  static constexpr int kVPackedBytes = kHeadDim * kGroup * ValueBits / 8;
   static constexpr int kColumnBytes = kHeadDim * sizeof(cutlass::half_t);
   static constexpr int kRowBytes = kGroup * sizeof(cutlass::half_t);
   static constexpr int kHalfRowBytes = kRowBytes / 2;
   static constexpr int kKMetadataBytes = 2 * kColumnBytes + kRowBytes;
   static constexpr int kVMetadataBytes = kColumnBytes + 2 * kRowBytes;
-  static constexpr int kPackedHalfBytes = kPackedBytes / 2;
+  static constexpr int kVPackedHalfBytes = kVPackedBytes / 2;
   static constexpr int kActiveRecordBytes =
-      2 * kPackedBytes + kKMetadataBytes + kVMetadataBytes;
+      kPackedBytes + kVPackedBytes + kKMetadataBytes + kVMetadataBytes;
   static constexpr int kPagePrefetchThreads = 4 * cute::intel::sg_size;
 
   static_assert(kKPackedLaneBytes == 32);
-  static_assert(kVPackedLaneBytes == 16);
+  static_assert(kVPackedLaneBytes == 4 * ValueBits);
   static_assert(
       sizeof(sycl::vec<std::uint32_t, kKPackedLaneWords>) == kKPackedLaneBytes);
   static_assert(
       sizeof(sycl::vec<std::uint32_t, kVPackedLaneWords>) == kVPackedLaneBytes);
   static_assert(kPackedBytes == 16384);
-  static_assert(kActiveRecordBytes == 35072);
+  static_assert(kActiveRecordBytes == (ValueBits == 4 ? 35072 : 26880));
   static_assert(kPackedBytes % kPagePrefetchThreads == 0);
   static_assert(kKMetadataBytes % kPagePrefetchThreads == 0);
   static_assert(kVMetadataBytes % kPagePrefetchThreads == 0);
 
-  KVarNK4V4Layout layout;
+  KVarNLayout layout;
   KVarNHybridTailLayout tail;
   int const* page_table;
   int max_pages_per_seq;
@@ -165,6 +166,31 @@ struct KVarNK4V4FragmentLoader {
         syclex::properties{syclex::prefetch_hint_L1});
   }
 
+  template <bool FullPage>
+  CUTLASS_DEVICE void
+  prefetch_tail_page_l2(int slot, int kv_head, int thread) const {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    static_assert(kPagePrefetchThreads == kTileK);
+    constexpr int kRows = FullPage ? kGroup : kTileK;
+    // FP16 storage interleaves heads by token. Each work-item owns a complete
+    // contiguous head row, avoiding hints for another head's data. The caller
+    // proves that this page and the selected half belong to the current split.
+    CUTLASS_PRAGMA_UNROLL
+    for (int token = thread; token < kRows; token += kPagePrefetchThreads) {
+      auto const offset = std::int64_t(slot) * tail.slot_stride +
+                          std::int64_t(token) * tail.token_stride +
+                          std::int64_t(kv_head) * tail.head_stride;
+      syclex::prefetch(
+          reinterpret_cast<std::uint8_t const*>(tail.key + offset),
+          kColumnBytes,
+          syclex::properties{syclex::prefetch_hint_L2});
+      syclex::prefetch(
+          reinterpret_cast<std::uint8_t const*>(tail.value + offset),
+          kColumnBytes,
+          syclex::properties{syclex::prefetch_hint_L2});
+    }
+  }
+
   /** Prefetch exactly the packed-cache ranges used by the next physical page.
    *
    * All 64 work-items own disjoint byte ranges.  The partial-page form omits
@@ -191,7 +217,9 @@ struct KVarNK4V4FragmentLoader {
           rec + layout.k_s_col_offset, thread);
     }
 
-    prefetch_lane_partition_l2<kPackedRangeBytes>(
+    constexpr int kVPackedRangeBytes =
+        BothHalves ? kVPackedBytes : kVPackedBytes / 2;
+    prefetch_lane_partition_l2<kVPackedRangeBytes>(
         rec + layout.v_packed_offset, thread);
     if constexpr (BothHalves) {
       prefetch_lane_partition_l2<kVMetadataBytes>(
@@ -219,8 +247,8 @@ struct KVarNK4V4FragmentLoader {
   CUTLASS_DEVICE void
   prefetch_dpas_v_half_l1(std::uint8_t const* rec, int half, int thread) const {
     static_assert(DpasPacked);
-    prefetch_lane_partition_l1<kPackedHalfBytes>(
-        rec + layout.v_packed_offset + half * kPackedHalfBytes, thread);
+    prefetch_lane_partition_l1<kVPackedHalfBytes>(
+        rec + layout.v_packed_offset + half * kVPackedHalfBytes, thread);
     if constexpr (IncludeColumnScale) {
       prefetch_lane_partition_l1<kColumnBytes>(
           rec + layout.v_s_col_offset, thread);
@@ -231,7 +259,7 @@ struct KVarNK4V4FragmentLoader {
         rec + layout.v_zp_offset + half * kHalfRowBytes, thread);
   }
 
-  template <int WordCount, class Fragment>
+  template <int WordCount, int Bits = 4, class Fragment>
   CUTLASS_DEVICE static void
   fill_packed_lane_fragment(Fragment& dst, std::uint8_t const* lane_bytes) {
     static_assert(
@@ -242,10 +270,10 @@ struct KVarNK4V4FragmentLoader {
         std::uint32_t const word =
             load_u32(lane_bytes + word_index * sizeof(std::uint32_t));
         CUTLASS_PRAGMA_UNROLL
-        for (int nibble = 0; nibble < kValuesPerWord; ++nibble) {
-          dst(word_index * kValuesPerWord + nibble) =
+        for (int field = 0; field < 32 / Bits; ++field) {
+          dst(word_index * (32 / Bits) + field) =
               static_cast<typename Fragment::value_type>(
-                  unpack_nibble(word, nibble));
+                  (word >> (Bits * field)) & ((1u << Bits) - 1));
         }
       }
     }
@@ -260,9 +288,13 @@ struct KVarNK4V4FragmentLoader {
 
   CUTLASS_DEVICE float
   load_v_quantized(std::uint8_t const* rec, int token, int dim) const {
+    constexpr int values_per_word = 32 / ValueBits;
     auto word = load_u32(
-        rec + layout.v_packed_offset + token * kVRowBytes + (dim / 8) * 4);
-    return float(unpack_nibble(word, dim & 7));
+        rec + layout.v_packed_offset + token * kVRowBytes +
+        (dim / values_per_word) * 4);
+    return float(
+        (word >> (ValueBits * (dim % values_per_word))) &
+        ((1u << ValueBits) - 1));
   }
 
   CUTLASS_DEVICE float
@@ -293,9 +325,13 @@ struct KVarNK4V4FragmentLoader {
     int const slot = 16 * (dim32 / 16) + inner;
     auto const* lane_bytes =
         rec + layout.v_packed_offset +
-        (((half * 8 + value_tile) * 4 + subgroup) * 16 + lane) * 16;
-    auto const word = load_u32(lane_bytes + (slot / 8) * 4);
-    return float(unpack_nibble(word, slot % 8));
+        (((half * 8 + value_tile) * 4 + subgroup) * 16 + lane) *
+            kVPackedLaneBytes;
+    constexpr int values_per_word = 32 / ValueBits;
+    auto const word = load_u32(lane_bytes + (slot / values_per_word) * 4);
+    return float(
+        (word >> (ValueBits * (slot % values_per_word))) &
+        ((1u << ValueBits) - 1));
   }
 
   template <class Fragment>
@@ -390,9 +426,11 @@ struct KVarNK4V4FragmentLoader {
         int const half = logical_tile & 1;
         auto const* lane_bytes =
             rec + layout.v_packed_offset +
-            (((half * 8 + value_tile / 32) * 4 + subgroup) * 16 + lane) * 16;
+            (((half * 8 + value_tile / 32) * 4 + subgroup) * 16 + lane) *
+                kVPackedLaneBytes;
         {
-          fill_packed_lane_fragment<kVPackedLaneWords>(dst, lane_bytes);
+          fill_packed_lane_fragment<kVPackedLaneWords, ValueBits>(
+              dst, lane_bytes);
         }
       } else {
         CUTLASS_PRAGMA_UNROLL
@@ -437,7 +475,8 @@ template <
     int VTiles_,
     class TensorQ_,
     class TensorK_,
-    class TensorV_>
+    class TensorV_,
+    int ValueBits = 4>
 struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                                     XeDefault<1>,
                                     true,
@@ -500,14 +539,14 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
 
   struct Arguments {
     typename Base::Arguments base;
-    KVarNK4V4Layout kvarn;
+    KVarNLayout kvarn;
     KVarNHybridTailLayout tail;
     int const* seq_lens;
   };
 
   struct Params {
     typename Base::Params base;
-    KVarNK4V4Layout kvarn;
+    KVarNLayout kvarn;
     KVarNHybridTailLayout tail;
     int const* seq_lens;
     // XeFMHAFwdSplitKVKernel reads these two scheduling fields directly from
@@ -527,7 +566,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     return args.kvarn.cache != nullptr && args.seq_lens != nullptr &&
            args.tail.block_to_slot != nullptr && args.tail.key != nullptr &&
            args.tail.value != nullptr && args.base.ptr_page_table != nullptr &&
-           args.base.page_size == KVarNK4V4FragmentLoader<>::kGroup;
+           args.base.page_size == KVarNFragmentLoader<false, ValueBits>::kGroup;
   }
 
   static constexpr Params
@@ -602,7 +641,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
-    KVarNK4V4FragmentLoader<true> loader{
+    KVarNFragmentLoader<true, ValueBits> loader{
         params.kvarn,
         params.tail,
         params.base.ptr_page_table,
@@ -651,7 +690,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         rec = record_cursor;
       }
       {
-        using Loader = KVarNK4V4FragmentLoader<true>;
+        using Loader = KVarNFragmentLoader<true, ValueBits>;
         static_assert(
             SGPerWG::value * cute::intel::sg_size ==
             Loader::kPagePrefetchThreads);
@@ -681,6 +720,20 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
             } else {
               loader.template prefetch_dpas_page_l2<false>(next_rec, thr_id);
             }
+          } else if constexpr (ValueBits == 2) {
+            // The two-bit quality policy keeps more recent pages in FP16.
+            // Cover those pages with the same next-page lead time as packed
+            // history, without changing the arithmetic or K4V4 scheduling.
+            bool const consumes_next_second_half =
+                next_page_tile + 1 < blk_k1 &&
+                (next_page_tile + 1) * 64 < actual_seq_len;
+            if (consumes_next_second_half) {
+              loader.template prefetch_tail_page_l2<true>(
+                  next_slot, kv_head, thr_id);
+            } else {
+              loader.template prefetch_tail_page_l2<false>(
+                  next_slot, kv_head, thr_id);
+            }
           }
         }
       }
@@ -700,9 +753,10 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < k_dim_scale.size(); ++i) {
                 int const dim = d_tile + lane + i * intel::sg_size;
-                k_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                    rec + params.kvarn.k_s_col_offset + 2 * dim);
-                k_dim_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+                k_dim_scale(i) =
+                    KVarNFragmentLoader<false, ValueBits>::load_f16(
+                        rec + params.kvarn.k_s_col_offset + 2 * dim);
+                k_dim_zp(i) = KVarNFragmentLoader<false, ValueBits>::load_f16(
                     rec + params.kvarn.k_zp_offset + 2 * dim);
               }
             }
@@ -752,7 +806,7 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         int token = (k_tile & 1) * 64 + qk_token_sg + lane;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < k_row_scale.size(); ++i, token += intel::sg_size) {
-          k_row_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+          k_row_scale(i) = KVarNFragmentLoader<false, ValueBits>::load_f16(
               rec + params.kvarn.k_s_row_offset + 2 * token);
         }
         CUTLASS_PRAGMA_UNROLL
@@ -807,9 +861,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
         for (int i = 0; i < v_token_scale.size(); ++i) {
           int const token =
               (k_tile & 1) * 64 + pv_token_sg + lane + i * intel::sg_size;
-          v_token_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
+          v_token_scale(i) = KVarNFragmentLoader<false, ValueBits>::load_f16(
               rec + params.kvarn.v_s_row_offset + 2 * token);
-          v_token_zp(i) = KVarNK4V4FragmentLoader<>::load_f16(
+          v_token_zp(i) = KVarNFragmentLoader<false, ValueBits>::load_f16(
               rec + params.kvarn.v_zp_offset + 2 * token);
         }
         CUTLASS_PRAGMA_UNROLL
@@ -851,8 +905,9 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
               for (int i = 0; i < v_dim_scale.size(); ++i) {
                 int const dim =
                     vv * get<1>(TileShapePV{}) + lane + i * intel::sg_size;
-                v_dim_scale(i) = KVarNK4V4FragmentLoader<>::load_f16(
-                    rec + params.kvarn.v_s_col_offset + 2 * dim);
+                v_dim_scale(i) =
+                    KVarNFragmentLoader<false, ValueBits>::load_f16(
+                        rec + params.kvarn.v_s_col_offset + 2 * dim);
               }
             }
           }

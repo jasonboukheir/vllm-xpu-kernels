@@ -24,7 +24,7 @@ struct kvarn_decode_args_t {
   float softmax_scale;
   bool unrotate_output;
   bool write_bf16_output;
-  cutlass::fmha::collective::KVarNK4V4Layout layout;
+  cutlass::fmha::collective::KVarNLayout layout;
 };
 
 /** Compile-time policy contract for the first KVarN kernel.
@@ -469,6 +469,7 @@ struct KVarNReduceSplitOutputHadamardSpecializedKernel {
  * the surrounding XeFMHA kernel's type contract and are never dereferenced by
  * the custom mainloop.
  */
+template <int ValueBits = 4>
 struct KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig {
   static constexpr int MainGrfSize = 256;
   static constexpr bool UsesSpecializedSplitReducer = true;
@@ -518,7 +519,8 @@ struct KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig {
       VTiles,
       TensorQ,
       TensorK,
-      TensorV>;
+      TensorV,
+      ValueBits>;
   using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
       Mainloop,
       TileShapeO,
@@ -846,11 +848,11 @@ struct KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig {
 };
 
 static_assert(
-    KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::KVWorkUnitTokens ==
+    KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<>::KVWorkUnitTokens ==
     64);
 static_assert(
-    cute::size<0>(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::
+    cute::size<0>(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<>::
                       Epilogue::TileShapeO{}) == 6);
 static_assert(
-    cute::size<1>(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::
+    cute::size<1>(KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<>::
                       Epilogue::TileShapeO{}) == 256);
