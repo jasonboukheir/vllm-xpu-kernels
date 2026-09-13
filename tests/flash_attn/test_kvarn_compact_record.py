@@ -17,12 +17,76 @@ import torch
 
 REPO_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from benchmark.kvarn_utils import (KVarNLayout, dequant_record,  # noqa: E402
-                                   pack_dpas_k4v4, swizzle_record_dpas_k4v4,
-                                   unpack_dpas_k4v4)
+from benchmark.kvarn_utils import (  # noqa: E402
+    KVarNLayout,
+    dequant_record,
+    pack_dpas_k4v4,
+    pack_dpas_kv,
+    swizzle_record_dpas_k4v4,
+    swizzle_record_dpas_kv,
+    unpack_dpas_k4v4,
+    unpack_dpas_kv,
+)
+
 
 COMPACT_STRIDE = 35072
 PADDED_STRIDE = 65536
+
+
+@pytest.mark.parametrize("value_bits,stride", [(2, 26880), (4, 35072)])
+def test_dpas_payload_matches_independent_coordinate_mapping(
+    value_bits, stride
+):
+    """Each logical V code occupies the declared lane, byte, and bit field."""
+    generator = torch.Generator().manual_seed(20260913)
+    qk = torch.randint(
+        0, 16, (256, 128), generator=generator, dtype=torch.uint8
+    )
+    qv = torch.randint(
+        0, 1 << value_bits, (128, 256), generator=generator, dtype=torch.uint8
+    )
+    k_bytes, v_bytes = pack_dpas_kv(qk, qv, value_bits)
+    assert k_bytes.numel() == 16384
+    assert v_bytes.numel() == 4096 * value_bits
+    assert torch.equal(k_bytes, pack_dpas_k4v4(qk, qv)[0])
+    token, dim = torch.meshgrid(
+        torch.arange(128), torch.arange(256), indexing="ij"
+    )
+    lane = 2 * (dim % 8) + token % 2
+    slot = 16 * ((dim % 32) // 16) + 2 * ((token % 16) // 2) + ((dim % 16) // 8)
+    lane_offset = (
+        (((token // 64 * 8 + dim // 32) * 4 + (token % 64) // 16) * 16) + lane
+    ) * (4 * value_bits)
+    per_byte = 8 // value_bits
+    actual = (
+        v_bytes[lane_offset + slot // per_byte]
+        >> ((slot % per_byte) * value_bits)
+    ) & ((1 << value_bits) - 1)
+    assert torch.equal(actual.to(torch.uint8), qv)
+    actual_k, actual_v = unpack_dpas_kv(k_bytes, v_bytes, value_bits)
+    assert torch.equal(actual_k, qk)
+    assert torch.equal(actual_v, qv)
+    layout = KVarNLayout(value_bits=value_bits, record_stride=stride)
+    assert layout.tile_bytes == stride
+    assert layout.v_s_col_offset == 17664 + 4096 * value_bits
+    assert layout.tile_bytes_aligned * 4 == stride * 4
+
+
+def test_k4v2_swizzle_preserves_metadata_and_rejects_out_of_range_codes():
+    layout = KVarNLayout(value_bits=2, record_stride=26880)
+    generator = torch.Generator().manual_seed(20260914)
+    record = torch.randint(
+        0, 256, (26880,), generator=generator, dtype=torch.uint8
+    )
+    output = swizzle_record_dpas_kv(record, layout)
+    assert torch.equal(output[16384:17664], record[16384:17664])
+    assert torch.equal(output[25856:], record[25856:])
+    qk = torch.zeros((256, 128), dtype=torch.uint8)
+    qv = torch.full((128, 256), 4, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="bit width"):
+        pack_dpas_kv(qk, qv, 2)
+    with pytest.raises(ValueError, match="active KVarN record"):
+        _ = KVarNLayout(value_bits=2, record_stride=26872).tile_bytes_aligned
 
 
 def _put_half(record: torch.Tensor, offset: int, values: torch.Tensor) -> None:

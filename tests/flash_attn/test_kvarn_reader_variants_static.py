@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).parents[2]
 MAINLOOP = (
     REPO_ROOT / "csrc/xpu/attn/xe_2/collective/kvarn_decode_mainloop.hpp"
@@ -17,10 +16,12 @@ DISPATCH = (REPO_ROOT / "csrc/xpu/attn/xe_2/kvarn_decode_xe2.cpp").read_text()
 def test_id18_composes_prefetch_and_record_cursor() -> None:
     assert "kKVarNDecodeKernel = 18" in DISPATCH
     assert "only the qualified KVarN decoder (18) is supported" in DISPATCH
-    assert (
-        "KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig::run(queue, args)"
-        in DISPATCH
-    )
+    compact_dispatch = "".join(DISPATCH.split())
+    for value_bits in (2, 4):
+        assert (
+            f"KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig<{value_bits}>"
+            "::run(queue,args)" in compact_dispatch
+        )
     assert "using Mainloop =" in CONFIG
     assert "KVarNDecodeFwdMainloop<" in CONFIG
     assert "prefetch_dpas_v_half_l1" in MAINLOOP

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 namespace {
 
@@ -44,7 +45,16 @@ inline std::uint8_t pack_q4_pair(float x0, float x1, float lo, float scale) {
   return static_cast<std::uint8_t>(q0 | (q1 << 4));
 }
 
+template <int ValueBits>
 class KVarNBalancedWriterKernel {
+  static_assert(ValueBits == 2 || ValueBits == 4);
+  static constexpr int kVSColOffset =
+      kVPackedOffset + kHeadDim * kGroup * ValueBits / 8;
+  static constexpr int kVSRowOffset = kVSColOffset + kHeadDim * 2;
+  static constexpr int kVZpOffset = kVSRowOffset + kGroup * 2;
+  static constexpr int kRecordBytes = kVZpOffset + kGroup * 2;
+  static constexpr int kValueRows = ValueBits == 2 ? kGroup / 2 : kGroup;
+
  public:
   KVarNBalancedWriterKernel(
       const float* key_balanced,
@@ -76,8 +86,8 @@ class KVarNBalancedWriterKernel {
   operator()(sycl::nd_item<1> item) const {
     const int64_t work_row = item.get_group(0);
     const int lane = item.get_local_id(0);
-    const int row_kind = static_cast<int>(work_row % (kHeadDim + kGroup));
-    const int64_t tile = work_row / (kHeadDim + kGroup);
+    const int row_kind = static_cast<int>(work_row % (kHeadDim + kValueRows));
+    const int64_t tile = work_row / (kHeadDim + kValueRows);
     if (tile >= tiles_) return;
 
     const int64_t block = block_ids_[tile / kKvHeads];
@@ -90,7 +100,12 @@ class KVarNBalancedWriterKernel {
     if (row_kind < kHeadDim) {
       write_key_row(record, tile, row_kind, lane, sg);
     } else {
-      write_value_row(record, tile, row_kind - kHeadDim, lane, sg);
+      if constexpr (ValueBits == 2) {
+        int const pair = row_kind - kHeadDim;
+        write_value_pair(record, tile, (pair / 2) * 4 + pair % 2, lane, sg);
+      } else {
+        write_value_row(record, tile, row_kind - kHeadDim, lane, sg);
+      }
     }
   }
 
@@ -221,6 +236,73 @@ class KVarNBalancedWriterKernel {
     }
   }
 
+  template <typename Subgroup>
+  void write_value_pair(
+      std::uint8_t* record,
+      int64_t tile,
+      int token,
+      int lane,
+      const Subgroup& sg) const {
+    // Consecutive groups of four DPAS slots combine tokens t and t+2.
+    // One workgroup owns both rows so each packed byte has one writer.
+    const float* rows[2] = {
+        value_balanced_ + tile * kGroup * kHeadDim + token * kHeadDim,
+        value_balanced_ + tile * kGroup * kHeadDim + (token + 2) * kHeadDim};
+    float lo[2], scale[2];
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      float lane_lo = std::numeric_limits<float>::infinity();
+      float lane_hi = -std::numeric_limits<float>::infinity();
+#pragma unroll
+      for (int channel = lane; channel < kHeadDim; channel += kSubgroup) {
+        lane_lo = sycl::fmin(lane_lo, rows[row][channel]);
+        lane_hi = sycl::fmax(lane_hi, rows[row][channel]);
+      }
+      lo[row] = sycl::reduce_over_group(sg, lane_lo, sycl::minimum<float>());
+      float hi = sycl::reduce_over_group(sg, lane_hi, sycl::maximum<float>());
+      scale[row] = sycl::fmax((hi - lo[row]) / 3.0f, 1.0e-10f);
+    }
+#pragma unroll
+    for (int pair = lane; pair < kHeadDim / 2; pair += kSubgroup) {
+      int const tile_d = pair / 16;
+      int const half_d = (pair % 16) / 8;
+      int const dim_lane = pair % 8;
+      int const dim = tile_d * 32 + half_d * 16 + dim_lane;
+      int const packed_lane = dim_lane * 2 + token % 2;
+      int const offset =
+          (((token / 64 * 8 + tile_d) * 4 + (token % 64) / 16) * 16 +
+           packed_lane) *
+              8 +
+          half_d * 4 + (token % 16) / 4;
+      std::uint8_t packed = 0;
+#pragma unroll
+      for (int field = 0; field < 4; ++field) {
+        int const row = field / 2;
+        float const x = sycl::fmin(
+            sycl::fmax(
+                (rows[row][dim + 8 * (field % 2)] - lo[row]) / scale[row],
+                0.0f),
+            3.0f);
+        // round_to_even_q4 retains the shared tie rule; x is already in [0,3].
+        packed |= static_cast<std::uint8_t>(round_to_even_q4(x) << (field * 2));
+      }
+      record[kVPackedOffset + offset] = packed;
+    }
+    if (lane == 0) {
+      auto* k_s_row = reinterpret_cast<sycl::half*>(record + kKSRowOffset);
+      auto* v_s_row = reinterpret_cast<sycl::half*>(record + kVSRowOffset);
+      auto* v_zp = reinterpret_cast<sycl::half*>(record + kVZpOffset);
+#pragma unroll
+      for (int row = 0; row < 2; ++row) {
+        int const t = token + row * 2;
+        k_s_row[t] = sycl::half(key_sinkhorn_col_[tile * kGroup + t]);
+        float const sink = value_sinkhorn_row_[tile * kGroup + t];
+        v_s_row[t] = sycl::half(sink * scale[row]);
+        v_zp[t] = sycl::half(sink * lo[row]);
+      }
+    }
+  }
+
   const float* key_balanced_;
   const float* key_sinkhorn_col_;
   const float* key_sinkhorn_row_;
@@ -260,15 +342,20 @@ void kvarn_pack_balanced_kv_xe2(
     const at::Tensor& value_sinkhorn_row,
     const at::Tensor& block_ids,
     at::Tensor& packed_cache,
-    bool dpas_layout) {
+    bool dpas_layout,
+    int64_t value_bits) {
+  TORCH_CHECK(value_bits == 2 || value_bits == 4, "value_bits must be 2 or 4");
+  int const record_bytes = kRecordBytes + (value_bits - 4) * 4096;
   TORCH_CHECK(dpas_layout, "kvarn_pack_balanced_kv requires xe2_dpas layout");
   TORCH_CHECK(
       packed_cache.is_xpu() && packed_cache.scalar_type() == at::kByte,
       "packed_cache must be uint8 on XPU");
   TORCH_CHECK(
       packed_cache.dim() == 3 && packed_cache.size(1) == kKvHeads &&
-          packed_cache.size(2) >= kRecordBytes,
-      "packed_cache must have shape [blocks, 4, record_bytes>=35072]");
+          packed_cache.size(2) >= record_bytes,
+      "packed_cache must have shape [blocks, 4, record_bytes>=",
+      record_bytes,
+      "]");
   TORCH_CHECK(packed_cache.is_contiguous(), "packed_cache must be contiguous");
   TORCH_CHECK(
       packed_cache.size(2) % 4 == 0,
@@ -309,24 +396,32 @@ void kvarn_pack_balanced_kv_xe2(
   // outside this operator's contract because they would create multiple
   // workgroups writing the same cache record.
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  const int64_t rows = tiles * (kHeadDim + kGroup);
-  queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(
-        sycl::nd_range<1>(rows * kSubgroup, kSubgroup),
-        KVarNBalancedWriterKernel(
-            key_balanced.data_ptr<float>(),
-            key_sinkhorn_col.data_ptr<float>(),
-            key_sinkhorn_row.data_ptr<float>(),
-            value_balanced.data_ptr<float>(),
-            value_sinkhorn_col.data_ptr<float>(),
-            value_sinkhorn_row.data_ptr<float>(),
-            block_ids.data_ptr<int64_t>(),
-            packed_cache.data_ptr<std::uint8_t>(),
-            tiles,
-            packed_cache.size(0),
-            packed_cache.stride(1),
-            packed_cache.size(2)));
-  });
+  auto launch = [&](auto bits) {
+    constexpr int ValueBits = decltype(bits)::value;
+    const int64_t rows =
+        tiles * (kHeadDim + (ValueBits == 2 ? kGroup / 2 : kGroup));
+    queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(
+          sycl::nd_range<1>(rows * kSubgroup, kSubgroup),
+          KVarNBalancedWriterKernel<ValueBits>(
+              key_balanced.data_ptr<float>(),
+              key_sinkhorn_col.data_ptr<float>(),
+              key_sinkhorn_row.data_ptr<float>(),
+              value_balanced.data_ptr<float>(),
+              value_sinkhorn_col.data_ptr<float>(),
+              value_sinkhorn_row.data_ptr<float>(),
+              block_ids.data_ptr<int64_t>(),
+              packed_cache.data_ptr<std::uint8_t>(),
+              tiles,
+              packed_cache.size(0),
+              packed_cache.stride(1),
+              packed_cache.size(2)));
+    });
+  };
+  if (value_bits == 2)
+    launch(std::integral_constant<int, 2>{});
+  else
+    launch(std::integral_constant<int, 4>{});
 
   const auto current_stream =
       c10::xpu::getCurrentXPUStream(packed_cache.device().index());
