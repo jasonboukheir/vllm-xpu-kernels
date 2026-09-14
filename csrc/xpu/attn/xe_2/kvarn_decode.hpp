@@ -461,6 +461,143 @@ struct KVarNReduceSplitOutputHadamardSpecializedKernel {
   }
 };
 
+/** Four columns per thread for the measured sixteen-split output path. */
+template <int KVWorkUnitTokens>
+struct KVarNReduceSplit16FourColumnOutputHadamardKernel {
+  using Element = cutlass::half_t;
+  using Params =
+      typename KVarNReduceSplitOutputHadamardKernel<KVWorkUnitTokens>::Params;
+  static constexpr int kThreads = 64;
+  static_assert(cute::intel::sg_size == 16);
+
+  struct SharedStorage {
+    cutlass::Array<float, 16> split_weights;
+    cutlass::Array<float, 256> output_row;
+  };
+  static constexpr int SharedStorageSize = sizeof(SharedStorage);
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* shared_storage) {
+    using namespace sycl::ext::oneapi::this_work_item;
+    int const head = int(BlockIdxY());
+    int const batch = int(BlockIdxZ());
+    int const thread = int(ThreadIdxX());
+    auto workgroup = get_work_group<3>();
+    auto subgroup = get_sub_group();
+    auto& storage = *reinterpret_cast<SharedStorage*>(shared_storage);
+    int const kv_tiles =
+        cute::ceil_div(params.seq_lens[batch], KVWorkUnitTokens);
+    int const active_splits =
+        cute::ceil_div(kv_tiles, params.kv_tiles_per_split);
+    float const invalid_lse =
+        cutlass::platform::numeric_limits<float>::lowest();
+    int const stats_offset = (batch * 24 + head) * 16 + thread;
+    float const local_lse = thread < active_splits
+                                ? params.softmax_lse_accum[stats_offset]
+                                : invalid_lse;
+    // Only the first subgroup writes weights, and it owns all sixteen LSEs.
+    float const max_lse =
+        sycl::reduce_over_group(subgroup, local_lse, sycl::maximum<>());
+    constexpr float kLog2e = 1.4426950408889634f;
+    if (thread < 16) {
+      storage.split_weights[thread] =
+          local_lse > invalid_lse
+              ? sycl::native::exp2((local_lse - max_lse) * kLog2e)
+              : 0.0f;
+    }
+    sycl::group_barrier(workgroup);
+
+    float values[4] = {};
+    float denominator = 0.0f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int split = 0; split < 16; ++split) {
+      float const weight = storage.split_weights[split];
+      if (weight <= 0.0f) continue;
+      int const base = ((batch * 16 + split) * 24 + head) * 256 + thread;
+      CUTLASS_PRAGMA_UNROLL
+      for (int column = 0; column < 4; ++column) {
+        values[column] +=
+            static_cast<float>(params.partial_output[base + column * 64]) *
+            weight;
+      }
+      denominator += weight;
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int column = 0; column < 4; ++column) {
+      // Preserve the reducer's first fp16 rounding boundary.
+      values[column] = static_cast<float>(
+          static_cast<Element>(values[column] / denominator));
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int stage = 0; stage < 4; ++stage) {
+      int const span = 1 << stage;
+      CUTLASS_PRAGMA_UNROLL
+      for (int column = 0; column < 4; ++column) {
+        float const partner =
+            sycl::permute_group_by_xor(subgroup, values[column], span);
+        values[column] = (thread & span) ? partner - values[column]
+                                         : values[column] + partner;
+      }
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int column = 0; column < 4; ++column) {
+      storage.output_row[thread + column * 64] = values[column];
+    }
+    sycl::group_barrier(workgroup);
+
+    // Only stages 4 and 5 cross subgroups. Each thread owns two disjoint
+    // butterfly pairs; both rounds finish before the next stage reads them.
+    CUTLASS_PRAGMA_UNROLL
+    for (int stage = 4; stage < 6; ++stage) {
+      int const span = 1 << stage;
+      CUTLASS_PRAGMA_UNROLL
+      for (int pair_thread = thread; pair_thread < 128; pair_thread += 64) {
+        int const pair = pair_thread / span;
+        int const offset = pair_thread - pair * span;
+        int const low = pair * 2 * span + offset;
+        int const high = low + span;
+        float const a = storage.output_row[low];
+        float const b = storage.output_row[high];
+        storage.output_row[low] = a + b;
+        storage.output_row[high] = a - b;
+      }
+      sycl::group_barrier(workgroup);
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int column = 0; column < 4; ++column) {
+      values[column] = storage.output_row[thread + column * 64];
+    }
+    // Stages 6 and 7 exchange the four columns held by this thread.
+    CUTLASS_PRAGMA_UNROLL
+    for (int pair = 0; pair < 2; ++pair) {
+      float const a = values[pair * 2];
+      float const b = values[pair * 2 + 1];
+      values[pair * 2] = a + b;
+      values[pair * 2 + 1] = a - b;
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int pair = 0; pair < 2; ++pair) {
+      float const a = values[pair];
+      float const b = values[pair + 2];
+      values[pair] = a + b;
+      values[pair + 2] = a - b;
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int column = 0; column < 4; ++column) {
+      int const offset = (batch * 24 + head) * 256 + thread + column * 64;
+      Element const transformed =
+          static_cast<Element>(values[column] * (1.0f / 16.0f));
+      if (params.write_bf16_output) {
+        using BFloat16 = sycl::ext::oneapi::bfloat16;
+        reinterpret_cast<BFloat16*>(params.output)[offset] =
+            static_cast<BFloat16>(static_cast<float>(transformed));
+      } else {
+        reinterpret_cast<Element*>(params.output)[offset] = transformed;
+      }
+    }
+  }
+};
+
 /** Concrete, intentionally narrow native decode configuration.
  *
  * This is kept separate from PagedDecodeConfig because K and V are not
@@ -789,7 +926,8 @@ struct KVarNDecodeD256G128DpasQ6PrefetchRecordCursorConfig {
             break;
           case 16:
             launch_output_hadamard_reducer<
-                ReductionSplitOutputHadamardSpecializedKernel<16>>(
+                KVarNReduceSplit16FourColumnOutputHadamardKernel<
+                    KVWorkUnitTokens>>(
                 queue, reduce_hadamard_params, params.kernel.shape.batch);
             break;
           case 32:
