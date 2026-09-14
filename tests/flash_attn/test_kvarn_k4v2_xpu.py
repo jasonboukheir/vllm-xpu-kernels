@@ -250,6 +250,108 @@ def test_ragged_decode_and_fp16_tail_match_independent_attention(
     torch.testing.assert_close(legacy, actual, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("bits", [2, 4])
+@pytest.mark.parametrize("splits", [1, 24, 32])
+def test_resident_pages_and_offset_tail_views_match_independent_attention(
+    bits, splits
+):
+    """Cover both page halves, head/dimension tiles and scalar fallbacks."""
+    layout, _, natural, packed = _fixture(bits, 18688 + 4096 * bits)
+    gen = torch.Generator().manual_seed(98002)
+    query = (torch.randn(4, 24, 256, generator=gen) / 2).half()
+    tail_k = (torch.randn(3, 128, 4, 256, generator=gen) / 2).half()
+    tail_v = (torch.randn(3, 128, 4, 256, generator=gen) / 2).half()
+    pages = [[(3 * p + b) % 5 for p in range(33)] for b in range(4)]
+    lengths = [127, 257, 4001, 4223]
+    # Deliberately permute physical blocks and resident slot ownership.
+    slots = [2, -1, 0, 1, -1]
+    device_args = (
+        query.xpu(),
+        packed.xpu(),
+        torch.tensor(pages, dtype=torch.int32, device="xpu"),
+        torch.tensor(lengths, dtype=torch.int32, device="xpu"),
+        torch.tensor(slots, dtype=torch.int32, device="xpu"),
+    )
+    records = [
+        [dequant_record(natural[p, h], layout) for h in range(4)]
+        for p in range(5)
+    ]
+    expected = torch.empty_like(query)
+    for b in range(4):
+        for h in range(24):
+            hk = h // 6
+            key = torch.cat(
+                [
+                    tail_k[slots[p], :, hk]
+                    if slots[p] >= 0
+                    else records[p][hk][0].half()
+                    for p in pages[b]
+                ]
+            )[: lengths[b]].float()
+            value = torch.cat(
+                [
+                    tail_v[slots[p], :, hk]
+                    if slots[p] >= 0
+                    else records[p][hk][1].half()
+                    for p in pages[b]
+                ]
+            )[: lengths[b]].float()
+            expected[b, h] = (
+                (query[b, h].float() @ key.T / 16).softmax(-1) @ value
+            ).half()
+
+    reference = None
+    # Offset32 is still64-byte aligned; offset1 forces scalar loading.
+    # Mixed pairs prove K and V choose their paths independently.
+    for key_offset, value_offset in [(0, 0), (32, 32), (1, 0), (0, 1), (1, 1)]:
+        buffers = []
+        views = []
+        for cpu, offset in [(tail_k, key_offset), (tail_v, value_offset)]:
+            backing = torch.full(
+                (cpu.numel() + 64,), 23.0, dtype=torch.float16, device="xpu"
+            )
+            view = backing[offset : offset + cpu.numel()].view_as(cpu)
+            assert view.is_contiguous()
+            assert view.data_ptr() % 64 == (offset * 2) % 64
+            view.copy_(cpu)
+            buffers.append((backing, backing.clone()))
+            views.append(view)
+        scratch = (
+            torch.full(
+                (4, 24 * splits, 256),
+                float("nan"),
+                dtype=torch.float16,
+                device="xpu",
+            ),
+            torch.full((4, 24, splits), float("nan"), device="xpu"),
+            torch.full((4, 24, splits), float("nan"), device="xpu"),
+        )
+        actual = torch.full_like(query, float("nan"), device="xpu")
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            *device_args,
+            *views,
+            *scratch,
+            actual,
+            max(lengths),
+            1 / 16,
+            False,
+            False,
+            splits,
+            18,
+            True,
+            bits,
+        )
+        output = actual.cpu()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, rtol=0.006, atol=0.002)
+        if reference is None:
+            reference = output
+        else:
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        for backing, before in buffers:
+            torch.testing.assert_close(backing, before, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "bits,stride", [(3, 35072), (2, 26876), (2, 26882), (4, 26880)]
 )
