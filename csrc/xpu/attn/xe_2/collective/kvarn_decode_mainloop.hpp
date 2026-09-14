@@ -562,6 +562,64 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
   KVarNDecodeFwdMainloop(Params const& params_, SharedStorage& storage)
       : Base(params_.base, storage.base), params(params_) {}
 
+  template <class Fragment>
+  CUTLASS_DEVICE void load_tail_k_fragment(
+      Fragment& dst,
+      int slot,
+      int kv_head,
+      int logical_tile,
+      int dim_tile,
+      int thread) const {
+    auto const* page = params.tail.key +
+                       std::int64_t(slot) * params.tail.slot_stride +
+                       std::int64_t(kv_head) * params.tail.head_stride;
+    auto surface = make_tensor(
+        make_gmem_ptr(page),
+        make_layout(
+            make_shape(128, 256),
+            make_stride(int(params.tail.token_stride), _1{})));
+    auto coordinates = make_identity_tensor(make_shape(128, 256));
+    auto tile = local_tile(
+        coordinates,
+        select<1, 2>(TileShapeQK{}),
+        make_coord(logical_tile & 1, dim_tile / 64));
+    typename Base::TiledCopyK block_copy{surface};
+    auto thread_copy = block_copy.get_slice(thread);
+    auto source = thread_copy.partition_S(tile);
+    auto loaded = thread_copy.partition_sg_fragment_D(tile);
+    copy(block_copy, source, loaded);
+    reorder(loaded, dst);
+  }
+
+  template <class Fragment>
+  CUTLASS_DEVICE void load_tail_v_fragment(
+      Fragment& dst,
+      int slot,
+      int kv_head,
+      int logical_tile,
+      int value_tile,
+      int thread) const {
+    auto const* page = params.tail.value +
+                       std::int64_t(slot) * params.tail.slot_stride +
+                       std::int64_t(kv_head) * params.tail.head_stride;
+    auto surface = make_tensor(
+        make_gmem_ptr(page),
+        make_layout(
+            make_shape(256, 128),
+            make_stride(_1{}, int(params.tail.token_stride))));
+    auto coordinates = make_identity_tensor(make_shape(256, 128));
+    auto tile = local_tile(
+        coordinates,
+        select<1, 2>(TileShapePV{}),
+        make_coord(value_tile / get<1>(TileShapePV{}), logical_tile & 1));
+    typename Base::TiledCopyV block_copy{surface};
+    auto thread_copy = block_copy.get_slice(thread);
+    auto source = thread_copy.partition_S(tile);
+    auto loaded = thread_copy.partition_sg_fragment_D(tile);
+    copy(block_copy, source, loaded);
+    reorder(loaded, dst);
+  }
+
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
     return args.kvarn.cache != nullptr && args.seq_lens != nullptr &&
            args.tail.block_to_slot != nullptr && args.tail.key != nullptr &&
@@ -650,6 +708,18 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
     // Legacy single-split scheduler orders grid.z batch-major:
     //   flat = batch * num_kv_heads + kv_head.
     int kv_head = int(BlockIdxZ()) % 4;
+
+    // The binding requires contiguous half [slots,128,4,256] pools, so
+    // width/pitch and every slot/head offset meet the block-2D contract.
+    // A contiguous offset view can still have an unaligned base: retain
+    // scalar loads for that input, independently for K and V. K4V4 keeps
+    // its existing fragment loader and generated load path.
+    bool const block_tail_k =
+        ValueBits == 2 &&
+        (reinterpret_cast<std::uintptr_t>(params.tail.key) & 63) == 0;
+    bool const block_tail_v =
+        ValueBits == 2 &&
+        (reinterpret_cast<std::uintptr_t>(params.tail.value) & 63) == 0;
 
     // ID20 keeps only page-wide metadata live across the sequential K64 loop.
     using KDimMetadataFragment = decltype(reduce<0>(tSrQ, sycl::plus<void>{}));
@@ -780,8 +850,12 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
                   query_value * dim_scale);
             }
           }
-          loader.fill_k_fragment(
-              tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+          if (slot >= 0 && block_tail_k) {
+            load_tail_k_fragment(tSrK, slot, kv_head, k_tile, d_tile, thr_id);
+          } else {
+            loader.fill_k_fragment(
+                tSrK, rec, slot, kv_head, k_tile, qk_token_sg, d_tile);
+          }
           cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
         }
       }
@@ -946,14 +1020,24 @@ struct KVarNDecodeFwdMainloop : DecodeFwdMainloop<
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int vv = 0; vv < VTiles; ++vv) {
-          loader.fill_v_fragment(
-              tArV,
-              rec,
-              slot,
-              kv_head,
-              k_tile,
-              pv_token_sg,
-              vv * get<1>(TileShapePV{}));
+          if (block_tail_v) {
+            load_tail_v_fragment(
+                tArV,
+                slot,
+                kv_head,
+                k_tile,
+                vv * get<1>(TileShapePV{}),
+                thr_id);
+          } else {
+            loader.fill_v_fragment(
+                tArV,
+                rec,
+                slot,
+                kv_head,
+                k_tile,
+                pv_token_sg,
+                vv * get<1>(TileShapePV{}));
+          }
           cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
         }
       }
