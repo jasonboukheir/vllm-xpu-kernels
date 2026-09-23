@@ -39,6 +39,22 @@ Kernels are written in SYCL/DPC++ and leverage [oneDNN](https://github.com/oneap
 | **GEMM** | Grouped GEMM |
 | **Misc** | TopK per row, memory utilities |
 
+The Xe2 KVarN writer, decoder and materializers support compact K4V4 and
+K4V2 records at head dimension 256 and group size 128. Their `value_bits`
+argument defaults to 4 for existing callers; pass 2 for K4V2. Key precision
+stays at four bits. The native DPAS layout and natural layout are distinct,
+and callers must pass the matching `dpas_layout` value to every consumer.
+
+| Compact format | Record bytes per KV head | V payload bytes |
+| --- | ---: | ---: |
+| K4V4/G128 | 35,072 | 16,384 |
+| K4V2/G128 | 26,880 | 8,192 |
+
+K4V2 needs the matching vLLM cache configuration and width-aware dispatch;
+select `--kv-cache-dtype kvarn_k4v2_g128_compact` in the paired vLLM fork.
+The reduced record size describes attention storage, not total model VRAM.
+Model accuracy and serving performance require workload-specific evaluation.
+
 ## Requirements
 
 - **Python**: 3.9 – 3.12
