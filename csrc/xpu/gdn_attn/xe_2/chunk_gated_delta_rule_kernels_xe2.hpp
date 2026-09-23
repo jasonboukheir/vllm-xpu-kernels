@@ -1212,6 +1212,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       }
 
       if (!has_prev_state) {
+        // Publish O2 across subgroups before the fresh-state output GEMM.
+        sycl::group_barrier(item.get_group());
         for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
           Tensor gO_C =
               local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
