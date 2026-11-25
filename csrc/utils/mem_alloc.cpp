@@ -12,7 +12,7 @@
 #include <optional>
 #include <sstream>
 
-#include <torch/extension.h>
+#include "vmm.h"
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
@@ -504,6 +504,14 @@ PyMODINIT_FUNC PyInit_xpumem_allocator(void) {
   PyObject* module = PyModule_Create(&xpumem_allocator_module);
   if (!module) {
     return NULL;
+  }
+  try {
+    auto parent = pybind11::reinterpret_borrow<pybind11::module_>(module);
+    xpu_vmm::register_bindings(parent);
+  } catch (const std::exception& e) {
+    Py_DECREF(module);
+    PyErr_SetString(PyExc_ImportError, e.what());
+    return nullptr;
   }
   return module;
 }
